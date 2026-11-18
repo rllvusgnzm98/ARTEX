@@ -38,7 +38,7 @@ var reasonHint = map[harness.TerminalReason]string{
 	harness.ReasonBlockingLimit:     "上下文长度达到硬上限，请求在发出前被拦截；应收窄意图粒度或压缩工具返回",
 	harness.ReasonPromptTooLong:     "提示词过长且上下文压缩重试已经用尽，无法继续执行",
 	harness.ReasonImageError:        "当前模型不支持本轮多模态内容；请切换支持视觉的模型或避免工具返回图片",
-	harness.ReasonStopHookPrevented: "Stop 钩子阻止本轮结束，随后未能继续；请检查任务 Guard 规则是否过严",
+	harness.ReasonStopHookPrevented: "Stop 钩子阻止继续：可能是任务 Guard，或无边际进展的止损让出槽位（不是目标失败）",
 	harness.ReasonHookStopped:       "工具或钩子主动停止继续执行，例如越界目标或禁用命令；请检查最后一条 tool_result 的拦截说明",
 	harness.ReasonAbortedStreaming:  "运行在模型输出流式生成阶段被取消",
 	harness.ReasonAbortedTools:      "运行在工具执行阶段被取消",

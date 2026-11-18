@@ -1006,13 +1006,14 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	workCtx = intercept.WithTaskContext(workCtx, t.ID, label, taskEmit)
 	// nudges 有意建在 model_error 重跑循环之外:空转续跑的上限是「这条意图」的总量，
 	// 重跑一轮不该把额度清零重来。
-	hooks := steerHooks{
+	loss := agent.NewStopLossMonitor(agent.DefaultStopLossPolicy())
+	hooks := agent.WrapStopLoss(steerHooks{
 		inner:  t.Guard.Hooks(),
 		drain:  func() (string, bool) { return e.drainSteer(iid) },
 		nudges: &atomic.Int64{},
 		limit:  e.emptyTurnNudgeLimit(),
 		label:  label,
-	}
+	}, loss)
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)
 	var reason harness.TerminalReason
@@ -1130,18 +1131,18 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	if err != nil {
 		log.Printf("[worker %s] intent %d: %v", name, intent.ID, err)
 	}
-	// terminal分流：撞步数上限 ≠ 完成。max_turns→exhausted（规划者据此知道这个方向
-	// 试过但没真正做完、需换角度，而非当成已覆盖永久跳过）；出错→blocked；正常→done。
-	state := "done"
+	// terminal分流：撞步数上限 / 墙钟安全上限 / 止损让出槽位 ≠ 完成，也 ≠ 目标失败。
+	// max_turns 或 MaxDuration 到点、以及无新事实/无新资产/重复命令的止损 → exhausted
+	//（规划者据此知道这个方向试过但没有边际进展、需换角度，而非当成已覆盖永久跳过或目标失败）；
+	// 出错→blocked；正常→done。
+	state := agent.IntentStateAfterRun(reason, err, loss.Verdict())
 	switch {
-	case err != nil:
-		state = "blocked"
-	case reason == harness.ReasonMaxTurns:
-		state = "exhausted"
+	case state == "exhausted" && loss.Fired():
+		log.Printf("[worker %s] intent %d 止损让出槽位(exhausted，%s)，写回 %s；不记目标失败", name, intent.ID, loss.Verdict().Kind, wrote)
+	case reason == harness.ReasonMaxTurns && state == "exhausted":
 		log.Printf("[worker %s] intent %d 撞步数上限(exhausted)，本次写回 %s", name, intent.ID, wrote)
-	case reason == harness.ReasonTimeout:
-		state = "exhausted"
-		log.Printf("[worker %s] intent %d 运行超时(exhausted)，收尾后写回 %s", name, intent.ID, wrote)
+	case reason == harness.ReasonTimeout && state == "exhausted":
+		log.Printf("[worker %s] intent %d 运行超时(exhausted，墙钟安全上限)，收尾后写回 %s", name, intent.ID, wrote)
 	}
 	if state == "blocked" && isTaskLLMChainExhausted(err) {
 		_ = t.Store.SetIntentBlockedReason(intent.ID, db.IntentBlockedLLMQuota)
@@ -1235,8 +1236,21 @@ func sleepCtx(ctx context.Context, d time.Duration) (done bool) {
 }
 
 func (e *Engine) claimNext(t *Task, name string) *db.Node {
-	fr, _ := t.Store.Frontier(20)
+	fr, err := t.Store.Frontier(20)
+	if err != nil || len(fr) == 0 {
+		return nil
+	}
+	// Prefer confirmed-reachable-undelivered next hops. Graph read errors
+	// fail-soft and keep the store's original frontier order.
+	var assets *db.AssetStore
+	if e.m != nil {
+		assets = e.m.assets
+	}
+	fr = agent.OrderClaimSlotsFromGraph(fr, agent.LoadSlotGraph(t.Store, assets))
 	for _, in := range fr {
+		if in == nil {
+			continue
+		}
 		if ok, _ := t.Store.ClaimIntent(in.ID, name); ok {
 			return in
 		}
