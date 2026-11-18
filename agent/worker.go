@@ -141,9 +141,12 @@ func (w *Worker) SetConstraintInject(fn func() bool) { w.injectConstraints = fn 
 // wantConstraints reports whether constraint injection is enabled (default yes).
 func (w *Worker) wantConstraints() bool { return w.injectConstraints == nil || w.injectConstraints() }
 
-// SetRunTimeout configures the per-intent wall-clock budget for the main
-// exploration (0 = unlimited). When it fires, the SDK settlement phase still runs
-// so facts are never lost to a timeout. Safe to call before Execute.
+// SetRunTimeout configures the per-intent wall-clock SAFETY CEILING for the main
+// exploration (0 = unlimited). The default 20 minutes (run_seconds=1200) is a cap,
+// not the primary "stop when the clock hits 20m" policy — stop-loss may end the
+// run earlier when there are no new facts/assets or a command is repeated.
+// When the ceiling does fire, the SDK settlement phase still runs so facts are
+// never lost to a timeout. Safe to call before Execute.
 func (w *Worker) SetRunTimeout(run time.Duration) {
 	w.runTimeout = run
 }
@@ -240,7 +243,9 @@ const workerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 - **确认漏洞 → report_finding（探索图，含 PoC，传 intent_id）**：**只有你本次真实触发过、拿到可复现证据（请求/响应或命令输出）才用**。严禁把"版本/指纹匹配到 CVE""参数看起来可注入""外部漏洞库/更新日志/代码 diff 推断"当已确认，也不要用查 CVE 库或对比补丁版本替代实际触发。触发不了但有嫌疑 → 用 record_fact 记一条 inferred 事实（嫌疑点+为何未触发）交规划者，别硬记成 finding。
 
 
-完成本意图后用一句话总结你做了什么、写回了哪些事实。`
+完成本意图后用一句话总结你做了什么、写回了哪些事实。
+
+**止损（安全上限不是默认停法）**：单次 run_seconds（默认 20 分钟）只是墙钟安全上限，不是到点才停的策略。若连续探测没有新事实也没有新资产，或重复同一命令，执行层会提前止损并让出槽位；不要把这次止损写成目标失败。`
 
 // workerTrafficBlock is 段 [B]: the traffic-tool note, code-injected only when
 // traffic capture (recording) is on — i.e. the traffic_* tools actually exist.
@@ -472,6 +477,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		MaxTokens:     w.maxTokens(),                          // 0 = 不发上限,由服务端默认值决定
 	}
 	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
+		AttachStopLossWrites(hooks, func() (WriteCounts, bool) { return tsx.Writes(), true })
 		opts.Hooks = hooks
 	}
 	if w.tx != nil { // persist raw LLM conversation; one file per worked intent

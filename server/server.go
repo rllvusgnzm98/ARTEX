@@ -306,8 +306,9 @@ func (s *Server) agentMaxTurns(key string) int {
 	return a.MaxTurns
 }
 
-// agentRunSeconds returns the configured wall-clock run budget (seconds) for an
-// agent key (0 = unlimited; 1200 fallback when no DB or no row, matching schema).
+// agentRunSeconds returns the configured wall-clock SAFETY CEILING (seconds) for
+// an agent key (0 = unlimited; 1200 fallback when no DB or no row, matching schema).
+// 1200 (20 minutes) is a cap, not the default "stop when the clock hits 20m" policy.
 func (s *Server) agentRunSeconds(key string) int {
 	if s.m.pg == nil {
 		return 1200

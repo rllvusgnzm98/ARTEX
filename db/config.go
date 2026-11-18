@@ -447,7 +447,7 @@ type Agent struct {
 	Enabled          bool   `json:"enabled"`
 	LLMProfileID     *int64 `json:"llm_profile_id"`    // 绑定的 LLM 配置;nil=跟随任务/会话 pin,再回退全局激活
 	MaxTurns         int    `json:"max_turns"`         // 单次运行最大轮次;0=不限制
-	RunSecs          int    `json:"run_seconds"`       // worker 单次运行墙钟上限(秒);0=不限制
+	RunSecs          int    `json:"run_seconds"`       // worker 单次运行墙钟安全上限(秒)，不是默认到点才停的策略;0=不限制
 	WebSearch        bool   `json:"web_search"`        // 是否启用网络搜索(受系统全局开关门控)
 	InteractiveShell bool   `json:"interactive_shell"` // 是否启用交互式 shell(持久 PTY 会话工具族)
 	WrapupPrompt     string `json:"wrapup_prompt"`     // 收尾提示词(超时/步数耗尽时的 settlement 提示);空=用代码内置默认
