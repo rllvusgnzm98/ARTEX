@@ -1969,6 +1969,7 @@ func (s *Server) pgLLMPoolReset(w http.ResponseWriter, r *http.Request) {
 			s.llmHealth.Reset(id)
 		}
 	}
+	releaseAllTaskSupply() // 人工恢复供应后解除冻结，允许重新派工
 	writeJSON(w, 200, s.llmPoolStatus())
 }
 

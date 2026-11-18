@@ -68,6 +68,12 @@ func (e *taskLLMError) Error() string {
 
 func (e *taskLLMError) Unwrap() error { return e.cause }
 
+// Is reports a chain-exhausted router error as agent.ErrProviderChainExhausted
+// so settlement can freeze the scene without treating it as a target failure.
+func (e *taskLLMError) Is(target error) bool {
+	return e != nil && e.chainExhausted && target == agent.ErrProviderChainExhausted
+}
+
 func isTaskLLMRuntimeError(err error) bool {
 	var target *taskLLMError
 	return errors.As(err, &target)
