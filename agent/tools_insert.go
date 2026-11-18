@@ -655,8 +655,9 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		t.searchAllWorkerTraces(), t.getWorkerTrace(),
 		// node_detail：worker 拿到 intent_id/节点 id 后可查该节点完整详情（配合上面的回看）。
 		t.nodeDetail(),
-		// 以下工具仍【不给】worker，只留给 planner/main（读上下文、跨 work 复盘是规划职责，
-		// worker 只做单条意图的执行与写回）：list_facts / list_companies / list_worker_traces。
+		// 读侧闭环：worker 必须能读回已确认事实与企业范围，避免后续工人靠盲扫补上下文。
+		// list_worker_traces 仍不给 worker（v2 已补回 search/get_worker_trace/node_detail，不再改它）。
+		t.listFacts(), t.listCompanies(),
 	}
 }
 
