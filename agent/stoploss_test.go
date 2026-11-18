@@ -234,6 +234,57 @@ func TestStopLossHookWriteResetsIdleWindow(t *testing.T) {
 	}
 }
 
+func TestStopLossHookFiresAfterWriteThenFullIdleWindow(t *testing.T) {
+	// After one successful write, idling for a full window of distinct
+	// probes must still fire no-progress. The write resets the window; it
+	// does not permanently disable no-progress for the rest of the run.
+	mon := NewStopLossMonitor(tightPolicy())
+	hooks := WrapStopLoss(nil, mon)
+	hooks.PostToolUse(context.Background(), "record_fact", []byte(`{"summary":"edge reachable"}`), []byte(`{"id":1}`), false)
+	a, _ := jsonCmd(`{"command":"probe edge.example.test:443"}`)
+	b, _ := jsonCmd(`{"command":"probe app.example.test:443"}`)
+	hooks.PostToolUse(context.Background(), "Bash", a, []byte("ok"), false)
+	if mon.Fired() {
+		t.Fatalf("write + fewer than one idle window must not fire, got %+v", mon.Verdict())
+	}
+	hooks.PostToolUse(context.Background(), "Bash", b, []byte("ok"), false)
+	v := mon.Verdict()
+	if !mon.Fired() || v.Kind != StopLossNoProgress {
+		t.Fatalf("idleLimit distinct probes after a write must fire no-progress, got %+v", v)
+	}
+	if v.TargetFailureWrites != 0 {
+		t.Fatalf("stop-loss must not write target failure: %+v", v)
+	}
+}
+
+func TestStopLossHookFiresAfterWriteThenFullIdleWindowWithCumulativeSnapshot(t *testing.T) {
+	// Production AttachStopLossWrites overlays ToolSet.Writes(), which is a
+	// whole-run total. After one fact write the snapshot stays at Facts=1
+	// during later probes; no-progress must still fire on the idle window,
+	// using a delta against the post-write baseline rather than the total.
+	mon := NewStopLossMonitor(tightPolicy())
+	writes := WriteCounts{}
+	mon.SetWriteSnapshot(func() (WriteCounts, bool) { return writes, true })
+	hooks := WrapStopLoss(nil, mon)
+
+	writes.Facts = 1 // Writes() already includes this write when PostToolUse runs
+	hooks.PostToolUse(context.Background(), "record_fact", []byte(`{"summary":"edge reachable"}`), []byte(`{"id":1}`), false)
+	a, _ := jsonCmd(`{"command":"probe edge.example.test:443"}`)
+	b, _ := jsonCmd(`{"command":"probe app.example.test:443"}`)
+	hooks.PostToolUse(context.Background(), "Bash", a, []byte("ok"), false)
+	if mon.Fired() {
+		t.Fatalf("cumulative snapshot must not fire before a full idle window, got %+v", mon.Verdict())
+	}
+	hooks.PostToolUse(context.Background(), "Bash", b, []byte("ok"), false)
+	v := mon.Verdict()
+	if !mon.Fired() || v.Kind != StopLossNoProgress {
+		t.Fatalf("cumulative Writes() snapshot must not block no-progress after a full idle window, got %+v", v)
+	}
+	if v.TargetFailureWrites != 0 {
+		t.Fatalf("stop-loss must not write target failure: %+v", v)
+	}
+}
+
 func TestStopLossHookMissingFingerprintFailSoft(t *testing.T) {
 	mon := NewStopLossMonitor(tightPolicy())
 	hooks := WrapStopLoss(nil, mon)

@@ -83,8 +83,10 @@ func (p StopLossPolicy) repeatLimit() int {
 }
 
 // ProgressSignals is the observed run progress used by Evaluate.
-// Missing-signal flags must stay false when a source cannot be read; Evaluate
-// then fail-softs (no hard stop, no target-failure write).
+// NewFacts, NewAssets, and NewFindings are writes in the current idle
+// window (since the last successful write, or the start of the run), not
+// whole-run totals. Missing-signal flags must stay false when a source
+// cannot be read; Evaluate then fail-softs (no hard stop, no target-failure write).
 type ProgressSignals struct {
 	FactsKnown    bool
 	AssetsKnown   bool
@@ -127,10 +129,13 @@ func (v StopLossVerdict) Message() string {
 // only if no earlier stop-loss fired: a run with progress continues until the
 // cap, and a stalled run stops well before 20 minutes.
 //
-// Missing signals fail-soft: unknown facts/assets do not trigger no-progress
-// stop; unknown commands do not trigger a repeat stop. The ceiling still
-// applies when elapsed is known. This function never writes goal or target
-// state.
+// No-progress is judged against the idle window: IdleProbes counts consecutive
+// probes since the last successful write, and New* counts only writes in that
+// same window. A successful write resets the window; whole-run cumulative
+// New*==0 is not a gate. Missing signals fail-soft: unknown facts/assets do
+// not trigger no-progress stop; unknown commands do not trigger a repeat stop.
+// The ceiling still applies when elapsed is known. This function never writes
+// goal or target state.
 func EvaluateStopLoss(p StopLossPolicy, sig ProgressSignals) StopLossVerdict {
 	v := StopLossVerdict{}
 	if sig.CommandsKnown && sig.RepeatCount >= p.repeatLimit() {
@@ -173,20 +178,22 @@ func IntentStateAfterRun(reason harness.TerminalReason, runErr error, loss StopL
 // StopLossMonitor observes tool use during a run and decides stop-loss.
 // It is safe for concurrent hook calls.
 type StopLossMonitor struct {
-	mu        sync.Mutex
-	policy    StopLossPolicy
-	started   time.Time
-	writes    func() (WriteCounts, bool)
-	verdict   StopLossVerdict
-	factsOK   bool
-	assetsOK  bool
-	cmdsOK    bool
-	newFacts  int
-	newAssets int
-	newFinds  int
-	idle      int
-	repeats   map[string]int
-	maxRepeat int
+	mu            sync.Mutex
+	policy        StopLossPolicy
+	started       time.Time
+	writes        func() (WriteCounts, bool)
+	writeBaseline WriteCounts
+	baselineSet   bool
+	verdict       StopLossVerdict
+	factsOK       bool
+	assetsOK      bool
+	cmdsOK        bool
+	newFacts      int
+	newAssets     int
+	newFinds      int
+	idle          int
+	repeats       map[string]int
+	maxRepeat     int
 }
 
 // NewStopLossMonitor starts observing from now.
@@ -203,13 +210,23 @@ func NewStopLossMonitor(p StopLossPolicy) *StopLossMonitor {
 
 // SetWriteSnapshot optionally supplies ToolSet.Writes as a ground-truth
 // snapshot. A false ok marks fact/asset signals unknown (fail-soft).
+// The first readable snapshot becomes the idle-window baseline so later
+// Evaluate calls use a delta since the last successful write, not whole-run
+// totals.
 func (m *StopLossMonitor) SetWriteSnapshot(fn func() (WriteCounts, bool)) {
 	if m == nil {
 		return
 	}
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.writes = fn
-	m.mu.Unlock()
+	if fn == nil {
+		return
+	}
+	if w, ok := fn(); ok {
+		m.writeBaseline = w
+		m.baselineSet = true
+	}
 }
 
 // ObserveTool records one completed tool call. Empty tool names and
@@ -224,18 +241,15 @@ func (m *StopLossMonitor) ObserveTool(name string, input []byte, isErr bool) {
 		// Missing tool identity: do not increment idle or treat as a repeat.
 		return
 	}
+	// A snapshot increase is a successful write even if the tool name is
+	// not one we classify as write-back. Catch it before counting this
+	// event so the new idle window starts cleanly.
+	m.noteSnapshotWritesLocked()
 	if isWriteBackTool(name) && !isErr {
-		switch name {
-		case "record_fact":
-			m.newFacts++
-			m.idle = 0
-		case "insert_assets":
-			m.newAssets++
-			m.idle = 0
-		case "report_finding", "add_finding":
-			m.newFinds++
-			m.idle = 0
-		}
+		// Start a new idle window. Do not carry whole-run New* into it:
+		// no-progress is "idleProbeLimit consecutive probes with no new
+		// write since the last successful one", not "the run never wrote".
+		m.resetIdleWindowLocked()
 	}
 	if isProbeTool(name) {
 		fp, ok := commandFingerprint(name, input)
@@ -249,6 +263,52 @@ func (m *StopLossMonitor) ObserveTool(name string, input []byte, isErr bool) {
 			m.maxRepeat = m.repeats[fp]
 		}
 	}
+}
+
+// resetIdleWindowLocked starts a new idle window after a successful write.
+func (m *StopLossMonitor) resetIdleWindowLocked() {
+	m.idle = 0
+	m.newFacts = 0
+	m.newAssets = 0
+	m.newFinds = 0
+	if m.writes == nil {
+		return
+	}
+	if w, ok := m.writes(); ok {
+		m.writeBaseline = w
+		m.baselineSet = true
+	}
+}
+
+// noteSnapshotWritesLocked folds ToolSet.Writes into the current window.
+// The first readable snapshot is only a baseline (pre-existing totals are
+// not "new"). A later increase is treated as a successful write and resets
+// the idle window.
+func (m *StopLossMonitor) noteSnapshotWritesLocked() {
+	if m.writes == nil {
+		return
+	}
+	w, ok := m.writes()
+	if !ok {
+		return
+	}
+	if !m.baselineSet {
+		m.writeBaseline = w
+		m.baselineSet = true
+		return
+	}
+	if w.Facts > m.writeBaseline.Facts ||
+		w.Assets > m.writeBaseline.Assets ||
+		w.Findings > m.writeBaseline.Findings {
+		m.resetIdleWindowLocked()
+	}
+}
+
+func writeDelta(current, baseline int) int {
+	if current < baseline {
+		return 0
+	}
+	return current - baseline
 }
 
 func (m *StopLossMonitor) signalsLocked() ProgressSignals {
@@ -269,9 +329,14 @@ func (m *StopLossMonitor) signalsLocked() ProgressSignals {
 			sig.FactsKnown = false
 			sig.AssetsKnown = false
 		} else {
-			sig.NewFacts = w.Facts
-			sig.NewAssets = w.Assets
-			sig.NewFindings = w.Findings
+			if !m.baselineSet {
+				m.writeBaseline = w
+				m.baselineSet = true
+			}
+			// Delta since the last successful write, not whole-run totals.
+			sig.NewFacts = writeDelta(w.Facts, m.writeBaseline.Facts)
+			sig.NewAssets = writeDelta(w.Assets, m.writeBaseline.Assets)
+			sig.NewFindings = writeDelta(w.Findings, m.writeBaseline.Findings)
 			sig.FactsKnown = true
 			sig.AssetsKnown = true
 		}
@@ -350,7 +415,9 @@ func WrapStopLoss(inner harness.HookRunner, mon *StopLossMonitor) harness.HookRu
 }
 
 // AttachStopLossWrites supplies ToolSet.Writes as the ground-truth snapshot
-// for fact/asset signals. A false ok fail-softs those signals.
+// for fact/asset signals. Counts are applied as a delta against the last
+// successful write (or the snapshot at attach time), not as whole-run totals.
+// A false ok fail-softs those signals.
 func AttachStopLossWrites(hooks harness.HookRunner, fn func() (WriteCounts, bool)) {
 	h, ok := hooks.(stopLossHooks)
 	if !ok || h.mon == nil {
