@@ -405,6 +405,30 @@ func RenderWorkerEntrySeed(seed WorkerEntrySeed) string {
 	return b.String()
 }
 
+// graphIncompleteReader is the first-class compaction-failure signal
+// LoadWorkerEntrySeed reads. ExplorationStore implements it.
+type graphIncompleteReader interface {
+	GraphIncompleteReason() (string, error)
+}
+
+// attachStoredGraphIncomplete reads the first-class compaction-failure signal
+// written after empty-response retries are exhausted, and sets CompressErr so
+// BuildWorkerEntrySeed / RenderWorkerEntrySeed reuse the existing
+// 【图谱不完整】 marker. It does not invent a second flag or wording.
+func attachStoredGraphIncomplete(g *EntryGraph, src graphIncompleteReader) {
+	if g == nil || g.CompressErr != nil || src == nil {
+		return
+	}
+	reason, err := src.GraphIncompleteReason()
+	if err != nil {
+		g.CompressErr = err
+		return
+	}
+	if strings.TrimSpace(reason) != "" {
+		g.CompressErr = fmt.Errorf("%s", strings.TrimSpace(reason))
+	}
+}
+
 // LoadWorkerEntrySeed prefetches the exploration graph for a claimed intent.
 // Compression and listing errors fail soft. This function only reads.
 func LoadWorkerEntrySeed(ts *db.ExplorationStore, as *db.AssetStore, intent *db.Node) WorkerEntrySeed {
@@ -420,6 +444,7 @@ func LoadWorkerEntrySeed(ts *db.ExplorationStore, as *db.AssetStore, intent *db.
 	if _, _, err := loadColdGraph(ts); err != nil {
 		g.CompressErr = err
 	}
+	attachStoredGraphIncomplete(&g, ts)
 
 	var prefetchErr error
 	collect := func(err error) {
