@@ -80,7 +80,7 @@ var errWorkControlConflict = errors.New("work control conflict")
 // In particular, a quota error after partial streaming advances the task cursor
 // for the next LLM call but must not replay this whole intent on the backup.
 func retryableWorkerModelError(reason harness.TerminalReason, err error) bool {
-	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err)
+	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err) && !agent.IsSupplyFailure(err)
 }
 
 // Engine drives the event-driven exploration loop with real LLM agents
@@ -838,6 +838,10 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		if e.isSettling(t.ID) {
 			return
 		}
+		// 供应故障冻结：不规划、不把中断写成任务完成，现场等待恢复或人工。
+		if taskSupplyFrozen(t) {
+			return
+		}
 		// goalless（人工直投）分支：任务已无 open 目标时 planner 不跑——跑了会重判
 		// met→cancelExec 杀掉用户经主 agent 直投的意图。是否结束改由 frontier 决定：
 		// 还有 open/running 意图 → 保持 running、静默等待；意图已全部跑干 → 落 done。
@@ -947,6 +951,12 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 				return
 			}
 			continue // 任务已终态(done/failed/timeout):停止领取遗留意图,别在完成后空跑 frontier
+		}
+		if taskSupplyFrozen(t) {
+			if sleepCtx(ctx, 1000*time.Millisecond) {
+				return
+			}
+			continue // 供应故障冻结：不领取、不空转派工
 		}
 		if !e.beginTaskOperation(t.ID) {
 			return
@@ -1130,6 +1140,22 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	if err != nil {
 		log.Printf("[worker %s] intent %d: %v", name, intent.ID, err)
+	}
+	// 供应故障（403/402/额度耗尽/轮询链耗尽）≠ 目标失败，也 ≠ 任务完成。
+	// 意图回场为 open，现场冻结，等待恢复或人工；不标 blocked/done，不唤醒规划者收场。
+	settle := agent.SettleWorkerRun(reason, err)
+	if settle.SupplyFailure {
+		if parkErr := transitionIntentState(t.Store, intent.ID, "running", settle.IntentState); parkErr != nil {
+			log.Printf("[worker %s] task %s 意图 #%d 供应故障回场失败: %v", name, t.ID, intent.ID, parkErr)
+		}
+		if settle.FreezeScene {
+			applySupplyHold(t)
+			e.emitActivity(t, db.Activity{Worker: "system", Kind: "text", IsError: true,
+				Summary: agent.SupplyFreezeSummary(), Detail: fmt.Sprintf("%s: %v", settle.Signal, err)})
+			log.Printf("[worker %s] task %s 意图 #%d 供应故障，现场冻结（%s），不记目标失败、不标 blocked/done；写回 %s", name, t.ID, intent.ID, settle.Signal, wrote)
+		}
+		e.touch(t.ID)
+		return true
 	}
 	// terminal分流：撞步数上限 / 墙钟安全上限 / 止损让出槽位 ≠ 完成，也 ≠ 目标失败。
 	// max_turns 或 MaxDuration 到点、以及无新事实/无新资产/重复命令的止损 → exhausted

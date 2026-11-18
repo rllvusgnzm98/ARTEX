@@ -1072,6 +1072,7 @@ func (m *Manager) ReplaceTaskLLMProfiles(id string, profileIDs []int64, activePr
 		return 0, nil
 	}
 	if task, ok := m.Task(id); ok {
+		releaseTaskSupply(task.ID) // 链条已改：解除本进程供应冻结，允许重新派工
 		reopened, reopenErr := task.Store.ReopenIntentsByBlockedReason(pgdb.IntentBlockedLLMQuota)
 		if reopenErr != nil {
 			return reopened, reopenErr
