@@ -19,6 +19,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -178,8 +179,17 @@ func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
 	if len(blocks) == 0 {
 		return // this batch has no ≥2 connected/shared-parent block — nothing to fold (§7)
 	}
+	var emptyExhausted, compressedOK bool
 	for _, b := range blocks {
-		c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, nil))
+		switch c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, nil)) {
+		case foldEmptyExhausted:
+			emptyExhausted = true
+		case foldOK:
+			compressedOK = true
+		}
+	}
+	if err := syncGraphIncompleteSignal(ts, emptyExhausted, compressedOK); err != nil {
+		log.Printf("[compaction] graph incomplete signal exp=%d: %v", ts.ID(), err)
 	}
 	// A minor may have pushed the segment count over M → merge in the same run.
 	if ad, e := ts.ActiveDigests(); e == nil && len(ad) >= c.m {
@@ -244,25 +254,49 @@ func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
 	if err := ts.SupersedeDigests(stale); err != nil {
 		log.Printf("[compaction] supersede exp=%d: %v", ts.ID(), err)
 	}
+	var emptyExhausted, compressedOK bool
 	for _, b := range toCreate {
-		c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, active))
+		switch c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, active)) {
+		case foldEmptyExhausted:
+			emptyExhausted = true
+		case foldOK:
+			compressedOK = true
+		}
+	}
+	if err := syncGraphIncompleteSignal(ts, emptyExhausted, compressedOK); err != nil {
+		log.Printf("[compaction] graph incomplete signal exp=%d: %v", ts.ID(), err)
 	}
 }
+
+// foldResult is the outcome of one foldBlock attempt. Only foldEmptyExhausted
+// writes the fail-soft 图谱不完整 signal; only foldOK may clear it. Neither
+// path writes node or goal state on a failed compression.
+type foldResult int
+
+const (
+	foldSkipped foldResult = iota
+	foldOK
+	foldEmptyExhausted
+	foldFailed
+)
 
 // foldBlock compresses one block and writes its digest — with a commit-time
 // liveness recheck (§ concurrency): between grouping and write the graph may have
 // changed, so any member that has since gone hot (revived) is dropped from the
 // covers set. If the block dissolves below K it is skipped.
-func (c *Compactor) foldBlock(ctx context.Context, ts *db.ExplorationStore, g *coldGraph, b block, nodeByID map[int64]*db.Node, cvers map[int64]int, generation int) {
+func (c *Compactor) foldBlock(ctx context.Context, ts *db.ExplorationStore, g *coldGraph, b block, nodeByID map[int64]*db.Node, cvers map[int64]int, generation int) foldResult {
 	body, err := c.compress(ctx, g, b, nodeByID)
 	if err != nil {
 		log.Printf("[compaction] compress exp=%d block=%v: %v", ts.ID(), b.Members, err)
-		return
+		if isEmptyCompressionErr(err) {
+			return foldEmptyExhausted
+		}
+		return foldFailed
 	}
 	// Re-read fresh state and drop any member that revived while we compressed.
 	fresh, _, err := loadColdGraph(ts)
 	if err != nil {
-		return
+		return foldFailed
 	}
 	freshHot := fresh.hotSet()
 	members := make([]int64, 0, len(b.Members))
@@ -272,13 +306,15 @@ func (c *Compactor) foldBlock(ctx context.Context, ts *db.ExplorationStore, g *c
 		}
 	}
 	if len(members) < c.params.K {
-		return // block revived out from under us — leave those nodes hot, don't fold
+		return foldSkipped // block revived out from under us — leave those nodes hot, don't fold
 	}
 	final := block{Members: members, Anchors: b.Anchors}
 	payload := digestPayload(body, final, nodeByID, generation, blockSignature(final, cvers))
 	if _, err := ts.AddDigest(payload, members); err != nil {
 		log.Printf("[compaction] add digest exp=%d: %v", ts.ID(), err)
+		return foldFailed
 	}
+	return foldOK
 }
 
 // generationFor computes a digest's重摘代次 (§1): 1 for a fresh fold; for a major
@@ -509,24 +545,89 @@ func buildCompressionInput(g *coldGraph, b block, nodeByID map[int64]*db.Node) s
 	return sb.String()
 }
 
+// compressEmptyRetries is how many extra attempts follow the first empty
+// response, empty body, or no-choices result. The attempt cap is therefore
+// 1 + compressEmptyRetries (three attempts total). Other errors are not retried.
+const compressEmptyRetries = 2
+
+// errCompressEmptyBody is returned when the model completed but produced no body text.
+var errCompressEmptyBody = errors.New("empty body from model")
+
+// isEmptyCompressionErr reports the retryable empty-response class: empty body,
+// empty response, or no choices. Matching is by errors.Is and by the phrases
+// used by the LLM SDK (for example "openai: empty response (no choices; ...)").
+func isEmptyCompressionErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errCompressEmptyBody) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "empty body") ||
+		strings.Contains(s, "empty response") ||
+		strings.Contains(s, "no choices")
+}
+
+// graphIncompleteStore is the first-class 图谱不完整 signal LoadWorkerEntrySeed
+// later reads. ExplorationStore implements it; tests use an in-memory stand-in.
+type graphIncompleteStore interface {
+	SetGraphIncomplete(reason string) error
+	ClearGraphIncomplete() error
+}
+
+// syncGraphIncompleteSignal records or clears the fail-soft signal after a
+// compaction run. Exhausted empty-response retries set it; a successful
+// compression in a run with no such exhaustion clears it. Reused unchanged
+// digests (no new LLM call) do not clear or set the signal. The signal column
+// is the only write; nodes and goal state are not touched.
+func syncGraphIncompleteSignal(ts graphIncompleteStore, emptyExhausted, compressedOK bool) error {
+	if ts == nil {
+		return nil
+	}
+	if emptyExhausted {
+		return ts.SetGraphIncomplete("graph_compress")
+	}
+	if compressedOK {
+		return ts.ClearGraphIncomplete()
+	}
+	return nil
+}
+
 // compress runs the §4 body LLM call on one block. Uses the same model the agent
-// runs on; thinking disabled (a pure summarization step).
+// runs on; thinking disabled (a pure summarization step). Empty response, empty
+// body, and no choices are retried up to compressEmptyRetries extra times.
 func (c *Compactor) compress(ctx context.Context, g *coldGraph, b block, nodeByID map[int64]*db.Node) (string, error) {
+	if c == nil || c.prov == nil {
+		return "", fmt.Errorf("compactor provider missing")
+	}
 	req := llm.CompletionRequest{
 		System:    []string{compressionSystemPrompt},
 		Messages:  []llm.Message{llm.UserText(buildCompressionInput(g, b, nodeByID))},
 		MaxTokens: 1500,
 		Thinking:  "disabled",
 	}
-	msg, _, _, err := c.prov.Complete(ctx, req)
-	if err != nil {
-		return "", err
+	var lastErr error
+	for attempt := 0; attempt <= compressEmptyRetries; attempt++ {
+		msg, _, _, err := c.prov.Complete(ctx, req)
+		if err == nil {
+			if body := strings.TrimSpace(msg.Text()); body != "" {
+				return body, nil
+			}
+			err = errCompressEmptyBody
+		}
+		lastErr = err
+		if !isEmptyCompressionErr(err) {
+			return "", err
+		}
+		if attempt == compressEmptyRetries {
+			break
+		}
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 	}
-	body := strings.TrimSpace(msg.Text())
-	if body == "" {
-		return "", fmt.Errorf("empty body from model")
-	}
-	return body, nil
+	return "", lastErr
 }
 
 // compressionSystemPrompt is the §4 body prompt.
