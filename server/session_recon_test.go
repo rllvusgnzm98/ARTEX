@@ -189,6 +189,90 @@ func TestSessionReconWritesAssetsFactsAndEntrySeed(t *testing.T) {
 	}
 }
 
+func TestSessionReconFactsNotPreseededWithoutDerivedFromOrAnchor(t *testing.T) {
+	pg := openIntranetTestDB(t)
+	task, err := pg.CreateTask("foothold recon fixture", "read confirmed hosts", nil, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	t.Cleanup(func() { _ = pg.DeleteTask(task.ID) })
+
+	assets := pg.Assets()
+	if _, err := assets.AddAgentScope(task.ID, "cidr", "192.168.1.0/24", "fixture in-scope", "manual"); err != nil {
+		t.Fatalf("seed task_scope: %v", err)
+	}
+
+	store := db.NewSessionStore(pg, []byte("recon-fixture-master-key"))
+	ctx := context.Background()
+	sessID, err := store.Create(ctx, &db.SessionRecord{
+		Kind: "http_php", URL: "http://192.168.1.10/s.php", Lang: "php",
+		Status: db.SessionAlive, CreatedByTask: task.ID,
+		Secret: json.RawMessage(`{"url":"http://192.168.1.10/s.php"}`),
+	})
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Delete(context.Background(), sessID) })
+
+	s := &Server{
+		m:         &Manager{pg: pg, assets: assets},
+		sessStore: store,
+		sessReg:   session.NewRegistry(),
+		ctx:       ctx,
+	}
+	s.sessReg.Add(&reconFixtureSession{id: sessID})
+
+	es := pg.Exploration(task.ExplorationID)
+	intentID, err := es.AddIntent(map[string]any{"summary": "continue from confirmed hosts"}, 5, nil, "planner")
+	if err != nil {
+		t.Fatalf("AddIntent: %v", err)
+	}
+
+	runCtx := agent.WithRunInfo(ctx, agent.RunInfo{
+		TaskID: task.ID, ExplorationID: task.ExplorationID, IntentID: intentID,
+	})
+	tool := s.sessionReconTool()
+	in, _ := json.Marshal(map[string]any{"session_id": sessID})
+	res, err := tool.Call(runCtx, in, &actool.ToolContext{})
+	if err != nil {
+		t.Fatalf("session_recon: %v", err)
+	}
+	out := toolResultJSON(t, res)
+	factRaw, ok := out["fact_id"]
+	if !ok {
+		t.Fatalf("应写回 fact: %v", out)
+	}
+	factID := int64(factRaw.(float64))
+
+	// 新开意图既无 derived_from 边，也无资产锚点：进场预塞不得看到上述侦察事实。
+	// 规划器本刀不改，不会自动挂边。
+	isolatedID, err := es.AddIntent(map[string]any{"summary": "unrelated new intent"}, 5, nil, "planner")
+	if err != nil {
+		t.Fatalf("isolated intent: %v", err)
+	}
+	isolated, err := es.GetNode(isolatedID)
+	if err != nil || isolated == nil {
+		t.Fatalf("GetNode isolated intent: %v", err)
+	}
+	if len(isolated.Anchors) != 0 {
+		t.Fatalf("夹具意图不应带资产锚点, anchors=%v", isolated.Anchors)
+	}
+
+	seed := agent.LoadWorkerEntrySeed(es, assets, isolated)
+	if len(seed.Writes) != 0 {
+		t.Fatalf("进场预塞必须只读, writes=%v", seed.Writes)
+	}
+	for _, f := range seed.ConfirmedFacts {
+		if f.ID == factID || strings.Contains(f.Summary, "内网被动侦察") || strings.Contains(f.Detail, "192.168.1.10") || strings.Contains(f.Summary, "session") {
+			t.Fatalf("无 derived_from、无资产锚点的新意图不应预塞侦察 fact %d: %+v", factID, seed.ConfirmedFacts)
+		}
+	}
+	prompt := agent.RenderWorkerEntrySeed(seed)
+	if strings.Contains(prompt, "内网被动侦察") {
+		t.Fatalf("RenderWorkerEntrySeed 不应包含侦察摘要:\n%s", prompt)
+	}
+}
+
 func toolResultJSON(t *testing.T, res actool.Result) map[string]any {
 	t.Helper()
 	if res.IsError {
