@@ -149,22 +149,52 @@ func (s *Server) tunnelTools() []actool.CoreTool {
 func (s *Server) tunnelProbeTool() actool.CoreTool {
 	return actool.Build(actool.Spec{
 		Name: "tunnel_probe",
-		Description: "【隧道·probe】检查平台回连地址与端口池是否已配置，并确认立足点会话存在，给出适配器选型建议（chisel 或 suo5）。" +
-			"本刀不向真实目标发探测包。起隧道前先跑这个。",
+		Description: "【隧道·probe】检查平台回连地址与端口池是否已配置；或对已登记隧道做环回晋升探活。" +
+			"传入 tunnel_id 时只拨 127.0.0.1 上的 ListenPort/消费入口：入口可连才把 deploying 晋升为 alive。" +
+			"本刀不向真实目标发探测包。",
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"session_id": map[string]any{"type": "integer", "description": "立足点会话 id"},
+				"session_id": map[string]any{"type": "integer", "description": "立足点会话 id（选型探测时用）"},
+				"tunnel_id":  map[string]any{"type": "integer", "description": "已登记隧道 id；传入则做环回晋升探活"},
 			},
-			"required": []any{"session_id"},
 		},
 		ReadOnly:    func(json.RawMessage) bool { return true },
 		Permissions: sessionPerm,
 		Run: func(ctx context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
 			var a struct {
 				SessionID int64 `json:"session_id"`
+				TunnelID  int64 `json:"tunnel_id"`
 			}
 			_ = json.Unmarshal(in, &a)
+			if a.TunnelID > 0 {
+				if s.tunnels == nil || s.tunnels.mgr == nil {
+					return actool.Errorf("隧道运行时未就绪"), nil
+				}
+				rec, err := s.tunnels.mgr.PromoteIfEntryReady(ctx, a.TunnelID)
+				if rec == nil && err != nil {
+					return actool.Errorf(err.Error()), nil
+				}
+				if rec == nil {
+					return actool.Errorf("隧道不存在"), nil
+				}
+				out := map[string]any{
+					"tunnel_id": rec.ID,
+					"state":     rec.State,
+					"note":      "只拨环回地址；消费入口可连才晋升 alive。口令不在此回显。",
+				}
+				if rec.Error != "" {
+					out["error"] = rec.Error
+				}
+				var p tunnel.Plan
+				if json.Unmarshal(rec.DeployParams, &p) == nil {
+					out["reconnect"] = tunnel.ReconnectInfo(&p)
+				}
+				if err != nil {
+					out["probe_error"] = err.Error()
+				}
+				return jsonResult(out)
+			}
 			if _, err := s.lookupSession(a.SessionID); err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
@@ -173,7 +203,7 @@ func (s *Server) tunnelProbeTool() actool.CoreTool {
 				"session_id":        a.SessionID,
 				"port_range":        config.TunnelPortRange(),
 				"suggested_adapter": "chisel",
-				"note":              "本刀不向真实目标发探测包。能 TCP 回连平台时建议 adapter=chisel；出网受限时可显式 adapter=suo5。外部二进制按需，非默认必装。",
+				"note":              "本刀不向真实目标发探测包。能 TCP 回连平台时建议 adapter=chisel。外部二进制按需，非默认必装。本刀不装配独立 suo5 计划。",
 			}
 			if cbErr != nil {
 				out["callback_configured"] = false
@@ -190,9 +220,10 @@ func (s *Server) tunnelProbeTool() actool.CoreTool {
 func (s *Server) tunnelDeployTool() actool.CoreTool {
 	return actool.Build(actool.Spec{
 		Name: "tunnel_deploy",
-		Description: "【隧道·deploy】按计划登记并进程内拉起一条 socks 或 portfwd 隧道（adapter=chisel|suo5，默认 chisel）。" +
-			"二进制按需（ARTEX_CHISEL_PATH / ARTEX_SUO5_PATH 或 data/tools 下的同名文件），缺失则台账标 error，非默认必装。" +
-			"只对环回入口做健康检查，不向真实目标打洞。用完请 tunnel_teardown。",
+		Description: "【隧道·deploy】按计划登记并进程内拉起平台侧 server（默认 adapter=chisel）。" +
+			"二进制按需（ARTEX_CHISEL_PATH 或 data/tools/chisel），缺失则台账标 error，非默认必装。" +
+			"ListenPort 就绪后若消费入口尚未可连，台账保持 deploying，并返回 ClientArgs 等回连信息（不含口令）；" +
+			"立足点回连后用 tunnel_probe 在环回入口可连时晋升 alive。不自动向真实目标打洞。adapter=suo5 本刀拒绝（不把 chisel ServerArgs 交给 suo5）。用完请 tunnel_teardown。",
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -227,8 +258,18 @@ func (s *Server) tunnelDeployTool() actool.CoreTool {
 			if adapter != tunnel.AdapterChisel && adapter != tunnel.AdapterSuo5 {
 				return actool.Errorf(fmt.Sprintf("adapter 非法：%q（chisel|suo5）", a.Adapter)), nil
 			}
-			if adapter == tunnel.AdapterSuo5 && kind != tunnel.KindSocks {
-				return actool.Errorf("suo5 适配器只支持 kind=socks；portfwd 请用 chisel"), nil
+			if adapter == tunnel.AdapterSuo5 {
+				msg := "拒绝将 chisel 计划或 ServerArgs 交给 suo5 执行；本刀不装配独立 suo5 计划（无默认 payload 目录或配方）"
+				if s.tunnels != nil && s.tunnels.mgr != nil {
+					rec, _ := s.tunnels.mgr.Deploy(ctx, &tunnel.Plan{Adapter: tunnel.AdapterSuo5, Kind: kind, TaskID: agent.RunInfoFrom(ctx).TaskID, ViaSessionID: a.SessionID})
+					if rec != nil {
+						return jsonResult(map[string]any{
+							"tunnel_id": rec.ID, "kind": rec.Kind, "adapter": rec.Adapter,
+							"state": rec.State, "error": rec.Error, "note": msg,
+						})
+					}
+				}
+				return actool.Errorf(msg), nil
 			}
 			cbHost, err := callbackHost()
 			if err != nil {
@@ -271,7 +312,6 @@ func (s *Server) tunnelDeployTool() actool.CoreTool {
 			if err != nil {
 				return actool.Errorf("计划生成失败：" + err.Error()), nil
 			}
-			plan.Adapter = adapter
 			if s.tunnels.mgr == nil {
 				return actool.Errorf("隧道运行时未就绪"), nil
 			}
@@ -287,10 +327,16 @@ func (s *Server) tunnelDeployTool() actool.CoreTool {
 				"kind":      rec.Kind,
 				"adapter":   rec.Adapter,
 				"state":     rec.State,
-				"note":      "用完请 tunnel_teardown。外部二进制按需，非默认必装；本刀只对环回入口探活。",
+				"note":      "用完请 tunnel_teardown。外部二进制按需，非默认必装。平台侧 ListenPort 就绪后，若消费入口未可连则保持 deploying，请用返回的回连信息在立足点拉起 client，再用 tunnel_probe 晋升。口令不在此回显。",
 			}
 			if rec.Error != "" {
 				out["error"] = rec.Error
+			}
+			var stored tunnel.Plan
+			if json.Unmarshal(rec.DeployParams, &stored) == nil {
+				out["reconnect"] = tunnel.ReconnectInfo(&stored)
+			} else {
+				out["reconnect"] = tunnel.ReconnectInfo(plan)
 			}
 			if plan.Kind == tunnel.KindSocks && plan.SocksPort > 0 {
 				addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(plan.SocksPort))
@@ -299,9 +345,6 @@ func (s *Server) tunnelDeployTool() actool.CoreTool {
 			} else if plan.Kind == tunnel.KindPortfwd {
 				out["forward_addr"] = net.JoinHostPort("127.0.0.1", strconv.Itoa(plan.LocalPort))
 				out["forward_to"] = net.JoinHostPort(plan.TargetHost, strconv.Itoa(plan.TargetPort))
-			}
-			if derr != nil {
-				return jsonResult(out)
 			}
 			return jsonResult(out)
 		},
