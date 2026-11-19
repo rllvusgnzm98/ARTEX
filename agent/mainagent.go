@@ -33,6 +33,7 @@ type MainAgent struct {
 	nonStreamingFn  func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
 	noaEnabledFn    func() bool                            // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn     func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
+	uaFn            func(taskID int64) string              // 按任务稳定 UA → WebFetch 请求头；nil = 官方默认
 }
 
 // SetNoaEnabled wires a resolver deciding whether runs use the experimental noa
@@ -73,6 +74,16 @@ func (m *MainAgent) compactionWindow() int {
 // SetProxy points the main agent's WebFetch at the recording proxy plus the CA
 // cert it trusts to verify HTTPS through it (empty addr = direct).
 func (m *MainAgent) SetProxy(addr, caCert string) { m.proxyAddr, m.proxyCACert = addr, caCert }
+
+// SetUAResolver 接入按任务稳定分配的客户端 UA，供 WebFetch 请求头与 worker 共用。
+func (m *MainAgent) SetUAResolver(fn func(taskID int64) string) { m.uaFn = fn }
+
+func (m *MainAgent) uaForTask(taskID int64) string {
+	if m.uaFn == nil {
+		return ""
+	}
+	return m.uaFn(taskID)
+}
 
 // SetWebSearch selects the web_search backend for the main agent (off by default).
 func (m *MainAgent) SetWebSearch(o WebSearchOpts) { m.webSearch = o }
@@ -164,6 +175,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		NonStreaming: m.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:    m.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
 	}
+	AttachStableWebFetch(&opts, m.uaForTask(taskID))
 	if m.tx != nil { // persist raw human↔AI conversation; one accumulating file per segment
 		opts.Transcript = m.tx
 		// Segment 0 keeps the legacy "exp%d-main" name so existing transcripts still

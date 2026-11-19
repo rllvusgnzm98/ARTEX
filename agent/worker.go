@@ -564,7 +564,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		NonStreaming:  w.nonStreaming(),                       // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:     w.maxTokens(),                          // 0 = 不发上限,由服务端默认值决定
 	}
-	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
+	AttachStableWebFetch(&opts, w.uaForTask(taskID)) // 官方 WebFetch 请求头用本任务稳定 UA，回包走 untrusted-data
+	if hooks != nil {                                // typed-nil guard: only set when concrete (avoids harness panic)
 		AttachStopLossWrites(hooks, func() (WriteCounts, bool) { return tsx.Writes(), true })
 		opts.Hooks = hooks
 	}
