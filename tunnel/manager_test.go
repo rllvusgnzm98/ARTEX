@@ -8,7 +8,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -398,4 +400,170 @@ func pickUpstreamFor(recs []*db.TunnelRecord, globalProxy string) string {
 		return "socks5://" + addr
 	}
 	return globalProxy
+}
+
+func parsePlan(t *testing.T, rec *db.TunnelRecord) Plan {
+	t.Helper()
+	var p Plan
+	if rec == nil {
+		t.Fatal("nil record")
+	}
+	if err := json.Unmarshal(rec.DeployParams, &p); err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	return p
+}
+
+func TestReconnectInfoOmitsCredentials(t *testing.T) {
+	p := Plan{
+		Kind: KindSocks, AuthUser: "artex", AuthPass: "fixture-pass",
+		ListenPort: 20001, SocksPort: 20801,
+		ClientArgs: []string{"client", "http://127.0.0.1:20001", "R:127.0.0.1:20801:socks"},
+	}
+	raw, err := json.Marshal(ReconnectInfo(&p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(raw)
+	if strings.Contains(s, "fixture-pass") || strings.Contains(s, p.AuthPass) {
+		t.Fatalf("回连信息不得含口令: %s", s)
+	}
+	if !strings.Contains(s, "client_args") || !strings.Contains(s, "listen_addr") {
+		t.Fatalf("应含 client_args 与 listen_addr: %s", s)
+	}
+}
+
+func TestDeployListenOnlyStaysDeployingUntilEntryReady(t *testing.T) {
+	ctx := context.Background()
+	store := newMemStore()
+	m, err := NewManager(Options{Store: store, DataDir: t.TempDir(), ChiselPath: buildStub(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Starter = deferEntryStarter
+	socks, listen := freeListenPort(t), freeListenPort(t)
+	rec, err := m.Deploy(ctx, socksPlan(61, socks, listen))
+	if err != nil {
+		t.Fatalf("Deploy: %v rec=%+v", err, rec)
+	}
+	t.Cleanup(func() { _ = m.Teardown(context.Background(), rec.ID) })
+	if rec.State != db.TunnelDeploying {
+		t.Fatalf("只听 ListenPort 时应保持 deploying, got %+v", rec)
+	}
+	p := parsePlan(t, rec)
+	if p.ServerPID <= 0 || !processAlive(p.ServerPID) {
+		t.Fatal("不得在消费入口未就绪时回滚杀掉 server")
+	}
+	if !listenReady(&p) {
+		t.Fatal("ListenPort 应已可连")
+	}
+	if entryReady(&p) {
+		t.Fatal("此时 SocksPort 不应可连")
+	}
+	if got := pickUpstreamFor([]*db.TunnelRecord{rec}, "http://global"); got != "http://global" {
+		t.Fatalf("socks 未就绪时不得被 pickUpstream 选中: %q", got)
+	}
+
+	time.Sleep(2200 * time.Millisecond)
+	if !processAlive(p.ServerPID) {
+		t.Fatal("超时后仍不得回滚杀掉只听 ListenPort 的 server")
+	}
+	still, _ := store.Get(ctx, rec.ID)
+	if still == nil || still.State != db.TunnelDeploying {
+		t.Fatalf("超时后应仍为 deploying: %+v", still)
+	}
+
+	held, err := m.PromoteIfEntryReady(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("入口未就绪时 Promote 不应报错: %v", err)
+	}
+	if held == nil || held.State != db.TunnelDeploying {
+		t.Fatalf("入口未就绪不得晋升: %+v", held)
+	}
+
+	if err := syscall.Kill(p.ServerPID, syscall.SIGUSR1); err != nil {
+		t.Fatalf("SIGUSR1: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !entryReady(&p) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !entryReady(&p) {
+		t.Fatal("SIGUSR1 后 SocksPort 应可连")
+	}
+	pending, _ := store.Get(ctx, rec.ID)
+	if got := pickUpstreamFor([]*db.TunnelRecord{pending}, "http://global"); got != "http://global" {
+		t.Fatalf("未晋升前即入口已起也不得被选中: %q", got)
+	}
+
+	got, err := m.PromoteIfEntryReady(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("Promote: %v", err)
+	}
+	if got == nil || got.State != db.TunnelAlive {
+		t.Fatalf("入口就绪后应晋升 alive: %+v", got)
+	}
+	want := "socks5://" + net.JoinHostPort("127.0.0.1", itoa(socks))
+	if up := pickUpstreamFor([]*db.TunnelRecord{got}, "http://global"); up != want {
+		t.Fatalf("晋升后 pickUpstream=%q, want %q", up, want)
+	}
+}
+
+func TestReconcileOrphansDoesNotKillListenOnlyServer(t *testing.T) {
+	ctx := context.Background()
+	store := newMemStore()
+	m, err := NewManager(Options{Store: store, DataDir: t.TempDir(), ChiselPath: buildStub(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Starter = deferEntryStarter
+	rec, err := m.Deploy(ctx, socksPlan(62, freeListenPort(t), freeListenPort(t)))
+	if err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Teardown(context.Background(), rec.ID) })
+	p := parsePlan(t, rec)
+	// 伪装成误标 alive，对账必须降为 deploying 且不得杀进程。
+	if err := store.UpdateState(ctx, rec.ID, db.TunnelAlive, ""); err != nil {
+		t.Fatal(err)
+	}
+	m2, err := NewManager(Options{Store: store, DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2.ReconcileOrphans(ctx)
+	got, _ := store.Get(ctx, rec.ID)
+	if got == nil || got.State != db.TunnelDeploying {
+		t.Fatalf("只听 ListenPort 的活 server 不得继续装活，也不得标成无进程的 error: %+v", got)
+	}
+	if !processAlive(p.ServerPID) {
+		t.Fatal("对账不得杀掉只听 ListenPort 的活 server")
+	}
+}
+
+func TestDeployRejectsSuo5WithoutUsingChiselArgs(t *testing.T) {
+	ctx := context.Background()
+	m, err := NewManager(Options{Store: newMemStore(), DataDir: t.TempDir(), ChiselPath: buildStub(t), Suo5Path: buildStub(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := m.Deploy(ctx, &Plan{
+		Kind: KindSocks, Adapter: AdapterSuo5, TaskID: 63,
+		ListenPort: 20001, SocksPort: 20801,
+		ServerArgs: []string{"server", "--host", "0.0.0.0", "-p", "20001", "--reverse", "--authfile", "x"},
+	})
+	if err == nil {
+		t.Fatal("suo5 应被明确拒绝")
+	}
+	if rec == nil || rec.State != db.TunnelError {
+		t.Fatalf("应记录 error 台账: %+v", rec)
+	}
+	if rec.RemotePID != 0 {
+		t.Fatalf("不得拉起进程: %+v", rec)
+	}
+	var p Plan
+	_ = json.Unmarshal(rec.DeployParams, &p)
+	if p.ServerPID != 0 && processAlive(p.ServerPID) {
+		t.Fatalf("不得 exec suo5/chisel 参数: pid=%d", p.ServerPID)
+	}
 }

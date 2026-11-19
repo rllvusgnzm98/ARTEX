@@ -1,7 +1,8 @@
 // manager.go 进程内适配器拉起：在平台侧 exec 已解析的 chisel/suo5（或测试 stub）
 // 二进制，只对 127.0.0.1/::1 入口做健康检查，成功则台账标 alive 并回写 pid/端口。
 // 二进制缺失时明确失败、state=error、不拉起进程。失败按计划层回滚，不留孤儿。
-// 不对非环回地址建连，不向真实目标打洞，不投递或不在目标侧拉起 client。
+// 拉起后先探 127.0.0.1:ListenPort；消费入口未就绪时保持 deploying，不杀 server。
+// 不对非环回地址建连，不向真实目标打洞，本刀不自动经会话拉起 client。
 package tunnel
 
 import (
@@ -171,6 +172,10 @@ func (m *Manager) Deploy(ctx context.Context, p *Plan) (*db.TunnelRecord, error)
 	if p.Adapter == "" {
 		p.Adapter = AdapterChisel
 	}
+	if p.Adapter == AdapterSuo5 {
+		msg := "拒绝将 chisel 计划或 ServerArgs 交给 suo5 执行；本刀不装配独立 suo5 计划（无默认 payload 目录或配方）"
+		return m.recordDeployError(ctx, p, msg)
+	}
 	if p.Kind == KindSocks && p.SocksPort <= 0 || p.Kind == KindPortfwd && p.LocalPort <= 0 {
 		return nil, fmt.Errorf("计划缺收入口端口（socks_port/local_port)")
 	}
@@ -201,7 +206,8 @@ func (m *Manager) Deploy(ctx context.Context, p *Plan) (*db.TunnelRecord, error)
 	if err != nil {
 		return nil, fmt.Errorf("台账落库失败: %w", err)
 	}
-	if err := m.deployLocal(ctx, id, bin, p); err != nil {
+	entryUp, err := m.deployLocal(ctx, id, bin, p)
+	if err != nil {
 		m.rollback(ctx, id, p, err.Error())
 		rec, _ = m.store.Get(ctx, id)
 		if rec == nil {
@@ -209,21 +215,49 @@ func (m *Manager) Deploy(ctx context.Context, p *Plan) (*db.TunnelRecord, error)
 		}
 		return rec, err
 	}
-	if err := m.store.UpdateState(ctx, id, db.TunnelAlive, ""); err != nil {
-		log.Printf("[tunnel] 状态回写失败(id=%d): %v", id, err)
+	if entryUp {
+		if err := m.store.UpdateState(ctx, id, db.TunnelAlive, ""); err != nil {
+			log.Printf("[tunnel] 状态回写失败(id=%d): %v", id, err)
+		}
+	} else {
+		// 平台侧 ListenPort 已起，环回 socks/forward 尚未可连：保持 deploying，不杀进程，不成为上游。
+		if err := m.store.UpdateState(ctx, id, db.TunnelDeploying, "平台侧监听已就绪，等待环回入口；立足点回连后可用 tunnel_probe 晋升"); err != nil {
+			log.Printf("[tunnel] 状态回写失败(id=%d): %v", id, err)
+		}
 	}
 	m.notifyState(p.TaskID)
 	rec, _ = m.store.Get(ctx, id)
 	return rec, nil
 }
 
-func (m *Manager) deployLocal(ctx context.Context, id int64, bin string, p *Plan) error {
+func (m *Manager) recordDeployError(ctx context.Context, p *Plan, msg string) (*db.TunnelRecord, error) {
+	rec := &db.TunnelRecord{
+		TaskID: p.TaskID, Kind: p.Kind, Adapter: p.Adapter,
+		ListenHost: p.ListenHost, ListenPort: p.ListenPort,
+		TargetHost: p.TargetHost, TargetPort: p.TargetPort,
+		ViaSessionID: p.ViaSessionID, State: db.TunnelError, Error: msg,
+	}
+	raw, _ := json.Marshal(p)
+	rec.DeployParams = raw
+	id, err := m.store.Create(ctx, rec)
+	if err != nil {
+		return nil, fmt.Errorf("台账落库失败: %w", err)
+	}
+	m.notifyState(p.TaskID)
+	rec, _ = m.store.Get(ctx, id)
+	if rec == nil {
+		rec = &db.TunnelRecord{ID: id, State: db.TunnelError, Error: msg, TaskID: p.TaskID, Adapter: p.Adapter}
+	}
+	return rec, fmt.Errorf("%s", msg)
+}
+
+func (m *Manager) deployLocal(ctx context.Context, id int64, bin string, p *Plan) (entryUp bool, err error) {
 	if p.AuthFile != "" {
 		if err := os.MkdirAll(filepath.Dir(p.AuthFile), 0o700); err != nil {
-			return fmt.Errorf("层 server_process: authfile 目录失败: %w", err)
+			return false, fmt.Errorf("层 server_process: authfile 目录失败: %w", err)
 		}
 		if err := os.WriteFile(p.AuthFile, []byte(p.AuthfileContent()), 0o600); err != nil {
-			return fmt.Errorf("层 server_process: authfile 写入失败: %w", err)
+			return false, fmt.Errorf("层 server_process: authfile 写入失败: %w", err)
 		}
 	}
 	start := m.Starter
@@ -232,10 +266,10 @@ func (m *Manager) deployLocal(ctx context.Context, id int64, bin string, p *Plan
 	}
 	cmd, err := start(ctx, bin, p)
 	if err != nil {
-		return fmt.Errorf("层 server_process: 启动失败: %w", err)
+		return false, fmt.Errorf("层 server_process: 启动失败: %w", err)
 	}
 	if cmd.Process == nil {
-		return fmt.Errorf("层 server_process: 启动后无进程")
+		return false, fmt.Errorf("层 server_process: 启动后无进程")
 	}
 	p.ServerPID = cmd.Process.Pid
 	m.mu.Lock()
@@ -247,27 +281,38 @@ func (m *Manager) deployLocal(ctx context.Context, id int64, bin string, p *Plan
 	}
 	go func() { _ = cmd.Wait() }()
 
-	if err := waitLoopbackEntry(ctx, p, entryDialWait); err != nil {
-		return fmt.Errorf("层 verify: %w", err)
+	// 先证明平台侧 ListenPort 已起。失败才回滚杀进程。
+	if err := waitLoopbackListen(ctx, p, entryDialWait); err != nil {
+		return false, fmt.Errorf("层 server_listen: %w", err)
 	}
 	if p.ServerPID > 0 && !processAlive(p.ServerPID) {
-		return fmt.Errorf("层 server_process: 进程启动后已退出（pid %d）", p.ServerPID)
+		return false, fmt.Errorf("层 server_process: 进程启动后已退出（pid %d）", p.ServerPID)
 	}
-	return nil
+	// socks/forward 可能要等立足点 client 回连；未就绪时保持 deploying，不杀 server。
+	return entryReady(p), nil
 }
 
-func defaultStart(_ context.Context, bin string, p *Plan) (*exec.Cmd, error) {
-	args := p.ServerArgs
-	if p.Adapter == AdapterSuo5 && len(args) == 0 {
-		// 不向非环回地址传连接参数。测试 stub 只靠环境变量绑环回端口。
-		args = []string{"--stub"}
+func defaultStart(ctx context.Context, bin string, p *Plan) (*exec.Cmd, error) {
+	return startAdapter(ctx, bin, p, nil)
+}
+
+// deferEntryStarter 让测试 stub 只先绑 ListenPort，消费入口稍后由 SIGUSR1 再绑。
+func deferEntryStarter(ctx context.Context, bin string, p *Plan) (*exec.Cmd, error) {
+	return startAdapter(ctx, bin, p, []string{"ARTEX_TUNNEL_STUB_DEFER_ENTRY=1"})
+}
+
+func startAdapter(_ context.Context, bin string, p *Plan, extraEnv []string) (*exec.Cmd, error) {
+	if p != nil && p.Adapter == AdapterSuo5 {
+		return nil, fmt.Errorf("拒绝用 chisel ServerArgs 或空参数启动 suo5")
 	}
+	args := p.ServerArgs
 	cmd := exec.Command(bin, args...)
 	cmd.Env = append(os.Environ(),
 		"ARTEX_TUNNEL_STUB_SOCKS="+strconv.Itoa(p.SocksPort),
 		"ARTEX_TUNNEL_STUB_LISTEN="+strconv.Itoa(p.ListenPort),
 		"ARTEX_TUNNEL_STUB_LOCAL="+strconv.Itoa(p.LocalPort),
 	)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	if p.ServerLog != "" {
 		if err := os.MkdirAll(filepath.Dir(p.ServerLog), 0o700); err == nil {
 			if f, err := os.OpenFile(p.ServerLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
@@ -281,7 +326,15 @@ func defaultStart(_ context.Context, bin string, p *Plan) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-// entryAddr 平台回环上的隧道入口（socks 或 portfwd 本地口）。只返回 127.0.0.1。
+// listenAddr 是平台侧 server 的环回探活地址（ListenPort）。只返回 127.0.0.1。
+func listenAddr(p *Plan) (string, error) {
+	if p == nil || p.ListenPort <= 0 {
+		return "", fmt.Errorf("计划缺 ListenPort")
+	}
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(p.ListenPort)), nil
+}
+
+// entryAddr 平台回环上的消费入口（socks 或 portfwd 本地口）。只返回 127.0.0.1。
 func entryAddr(p *Plan) (string, error) {
 	port := p.SocksPort
 	if p.Kind == KindPortfwd {
@@ -315,11 +368,7 @@ func dialLoopback(addr string, timeout time.Duration) error {
 	return nil
 }
 
-func waitLoopbackEntry(ctx context.Context, p *Plan, budget time.Duration) error {
-	addr, err := entryAddr(p)
-	if err != nil {
-		return err
-	}
+func waitLoopbackAddr(ctx context.Context, addr string, budget time.Duration, what string) error {
 	deadline := time.Now().Add(budget)
 	var last error
 	for time.Now().Before(deadline) {
@@ -336,7 +385,96 @@ func waitLoopbackEntry(ctx context.Context, p *Plan, budget time.Duration) error
 	if last == nil {
 		last = fmt.Errorf("超时")
 	}
-	return fmt.Errorf("环回入口 %s 在 %v 内未就绪: %w", addr, budget, last)
+	return fmt.Errorf("环回%s %s 在 %v 内未就绪: %w", what, addr, budget, last)
+}
+
+func waitLoopbackListen(ctx context.Context, p *Plan, budget time.Duration) error {
+	addr, err := listenAddr(p)
+	if err != nil {
+		return err
+	}
+	return waitLoopbackAddr(ctx, addr, budget, "监听")
+}
+
+func listenReady(p *Plan) bool {
+	addr, err := listenAddr(p)
+	if err != nil {
+		return false
+	}
+	return dialLoopback(addr, time.Second) == nil
+}
+
+func entryReady(p *Plan) bool {
+	addr, err := entryAddr(p)
+	if err != nil {
+		return false
+	}
+	return dialLoopback(addr, time.Second) == nil
+}
+
+// ReconnectInfo 返回给 worker 的回连信息（ClientArgs / 监听地址）。不含口令。
+func ReconnectInfo(p *Plan) map[string]any {
+	if p == nil {
+		return map[string]any{}
+	}
+	info := map[string]any{
+		"client_args": p.ClientArgs,
+		"auth":        "经 AUTH 环境变量注入，不进命令行，也不在本输出中回显",
+	}
+	if addr, err := listenAddr(p); err == nil {
+		info["listen_addr"] = addr
+	}
+	if p.PlatformAddr != "" {
+		info["platform_addr"] = p.PlatformAddr
+	}
+	if addr, err := entryAddr(p); err == nil {
+		if p.Kind == KindPortfwd {
+			info["forward_addr"] = addr
+		} else {
+			info["socks_addr"] = addr
+		}
+	}
+	return info
+}
+
+// PromoteIfEntryReady 在环回消费入口已可连时把 deploying 晋升为 alive 并通知 taskProxy。
+// 入口未就绪则保持 deploying，不杀平台侧 server。只拨 127.0.0.1。
+func (m *Manager) PromoteIfEntryReady(ctx context.Context, id int64) (*db.TunnelRecord, error) {
+	rec, err := m.store.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if rec == nil {
+		return nil, fmt.Errorf("隧道 %d 不存在", id)
+	}
+	if rec.State == db.TunnelStopped {
+		return rec, fmt.Errorf("隧道 %d 已停止", id)
+	}
+	if rec.State == db.TunnelError {
+		return rec, fmt.Errorf("隧道 %d 处于 error：%s", id, rec.Error)
+	}
+	var p Plan
+	if err := json.Unmarshal(rec.DeployParams, &p); err != nil {
+		return rec, fmt.Errorf("deploy_params 解析失败: %w", err)
+	}
+	if p.ServerPID > 0 && !processAlive(p.ServerPID) {
+		_ = m.store.UpdateState(ctx, id, db.TunnelError, "平台侧进程已不在，不能再当作存活上游")
+		m.notifyState(rec.TaskID)
+		return m.store.Get(ctx, id)
+	}
+	if !listenReady(&p) {
+		return rec, nil
+	}
+	if !entryReady(&p) {
+		return rec, nil
+	}
+	if rec.State != db.TunnelAlive {
+		if err := m.store.UpdateState(ctx, id, db.TunnelAlive, ""); err != nil {
+			return rec, err
+		}
+		m.notifyState(rec.TaskID)
+	}
+	return m.store.Get(ctx, id)
 }
 
 func (m *Manager) rollback(ctx context.Context, id int64, p *Plan, reason string) {
@@ -390,7 +528,8 @@ func (m *Manager) Teardown(ctx context.Context, id int64) error {
 }
 
 // ReconcileOrphans 平台重启后调用：deploying/alive 行若 pid 已死，标 error，
-// 绝不把死进程继续当成 alive。pid 仍在且环回入口可连则重新纳入本进程台账。
+// 绝不把死进程继续当成 alive。pid 仍在且仅 ListenPort 可连时保持 deploying，
+// 不得杀掉仍在监听的平台侧 server，也不得在 socks/forward 未就绪时装活为上游。
 func (m *Manager) ReconcileOrphans(ctx context.Context) {
 	recs, err := m.store.ListActive(ctx)
 	if err != nil {
@@ -412,35 +551,24 @@ func (m *Manager) ReconcileOrphans(ctx context.Context) {
 			m.notifyState(r.TaskID)
 			continue
 		}
-		if err := dialLoopbackMust(p); err != nil {
-			if processAlive(p.ServerPID) && serverCmdlineMatches(&p) {
-				if proc, e := os.FindProcess(p.ServerPID); e == nil {
-					_ = proc.Kill()
-				}
-			}
-			_ = m.store.UpdateState(ctx, r.ID, db.TunnelError, "平台重启后环回入口不可连: "+err.Error())
-			m.notifyState(r.TaskID)
-			continue
-		}
-		// 进程仍在且入口可连：纳入句柄，必要时把 deploying 提升为 alive。
 		if proc, err := os.FindProcess(p.ServerPID); err == nil {
 			m.mu.Lock()
 			m.procs[r.ID] = &exec.Cmd{Process: proc}
 			m.mu.Unlock()
 		}
-		if r.State == db.TunnelDeploying {
-			_ = m.store.UpdateState(ctx, r.ID, db.TunnelAlive, "")
+		if listenReady(&p) && entryReady(&p) {
+			if r.State != db.TunnelAlive {
+				_ = m.store.UpdateState(ctx, r.ID, db.TunnelAlive, "")
+				m.notifyState(r.TaskID)
+			}
+			continue
+		}
+		// 进程仍在：即使消费入口未起（只听 ListenPort），也不得杀掉，更不得装活为上游。
+		if r.State == db.TunnelAlive {
+			_ = m.store.UpdateState(ctx, r.ID, db.TunnelDeploying, "重启对账：平台侧仍在，环回消费入口未就绪，降为 deploying")
 			m.notifyState(r.TaskID)
 		}
 	}
-}
-
-func dialLoopbackMust(p Plan) error {
-	addr, err := entryAddr(&p)
-	if err != nil {
-		return err
-	}
-	return dialLoopback(addr, time.Second)
 }
 
 // OccupiedPorts 汇总未终结隧道占用的平台端口。
