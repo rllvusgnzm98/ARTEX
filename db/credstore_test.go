@@ -4,8 +4,11 @@ package db
 // CRUD 走现有 PG-gated skip 模式（无库即跳）。测试只用明显假数据。
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -135,7 +138,8 @@ func TestCredentialStoreCRUD(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	// 关库必须在删行之后：t.Cleanup 后注册先执行，避免 defer Close 抢在 Cleanup Delete 前面。
+	t.Cleanup(func() { d.Close() })
 	store := NewCredentialStore(d, []byte("test-jwt-key-material-32bytes!!!"))
 	ctx := context.Background()
 
@@ -186,6 +190,14 @@ func TestCredentialStoreCRUD(t *testing.T) {
 	if err != nil || len(list) != 1 || list[0].ID != id {
 		t.Fatalf("ListByTask = %v, %v", list, err)
 	}
+	// 函数体内删除第二行，避免只靠 Cleanup（若 Close 过早会删失败并留行）。
+	if err := store.Delete(ctx, oid); err != nil {
+		t.Fatalf("Delete other: %v", err)
+	}
+	left, err := store.Get(ctx, oid)
+	if err != nil || left != nil {
+		t.Fatalf("第二行删除后 Get 应为 (nil,nil), got %v, %v", left, err)
+	}
 
 	if err := store.SetVerified(ctx, id, true); err != nil {
 		t.Fatal(err)
@@ -201,5 +213,76 @@ func TestCredentialStoreCRUD(t *testing.T) {
 	got, err = store.Get(ctx, id)
 	if err != nil || got != nil {
 		t.Fatalf("删除后 Get 应为 (nil,nil), got %v, %v", got, err)
+	}
+}
+
+func TestListSkipsUndecryptableRows(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	t.Cleanup(func() { d.Close() })
+	ctx := context.Background()
+	good := NewCredentialStore(d, []byte("test-jwt-key-material-32bytes!!!"))
+	other := NewCredentialStore(d, []byte("another-master-key-32bytes!!!!"))
+
+	gid, err := good.Create(ctx, &CredentialRecord{TaskID: 999999011, Username: "fixture-admin", CredType: "password", Secret: fixturePass, Source: "fixture source"})
+	if err != nil {
+		t.Fatalf("Create good: %v", err)
+	}
+	t.Cleanup(func() { _ = good.Delete(context.Background(), gid) })
+	bid, err := other.Create(ctx, &CredentialRecord{TaskID: 999999012, Username: "other", CredType: "password", Secret: "fixture-other-key", Source: "t"})
+	if err != nil {
+		t.Fatalf("Create other: %v", err)
+	}
+	t.Cleanup(func() { _ = other.Delete(context.Background(), bid) })
+
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(prev)
+
+	all, err := good.ListAll(ctx)
+	if err != nil {
+		t.Fatalf("ListAll 不得因单行解密失败而失败: %v", err)
+	}
+	foundGood, foundBad := false, false
+	for _, r := range all {
+		if r.ID == gid {
+			foundGood = true
+			if r.Secret != fixturePass {
+				t.Fatalf("可解行应完整返回: %+v", r)
+			}
+		}
+		if r.ID == bid {
+			foundBad = true
+		}
+	}
+	if !foundGood {
+		t.Fatal("ListAll 应含可解行")
+	}
+	if foundBad {
+		t.Fatal("ListAll 不得返回无法解密的行")
+	}
+
+	same, err := good.ListByTask(ctx, 999999012)
+	if err != nil {
+		t.Fatalf("ListByTask 不得因单行解密失败而失败: %v", err)
+	}
+	if len(same) != 0 {
+		t.Fatalf("不可解任务列表应跳过该行: %+v", same)
+	}
+
+	logs := buf.String()
+	if strings.Contains(logs, fixturePass) || strings.Contains(logs, "fixture-other-key") || strings.Contains(logs, secretPrefix) {
+		t.Fatalf("跳过日志不得含口令或密文: %s", logs)
+	}
+	if !strings.Contains(logs, "skip credential") || !strings.Contains(logs, strconv.FormatInt(bid, 10)) {
+		t.Fatalf("日志应只记无法解密的 credential id: %s", logs)
+	}
+
+	got, err := good.Get(ctx, bid)
+	if err == nil || got != nil {
+		t.Fatalf("Get(id) 对无法解密的单行仍应返回错误, got %v, %v", got, err)
 	}
 }

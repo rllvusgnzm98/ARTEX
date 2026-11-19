@@ -135,3 +135,72 @@ func TestCredentialToolsListRedactsReuseIncludesSecret(t *testing.T) {
 		t.Fatalf("活动日志清洗后不得含明文: %s", redacted)
 	}
 }
+
+func TestIntranetListCredentialsSkipsUndecryptable(t *testing.T) {
+	pg := openIntranetTestDB(t)
+	goodKey := []byte("intranet-test-master-key")
+	cs := db.NewCredentialStore(pg, goodKey)
+	other := db.NewCredentialStore(pg, []byte("another-master-key-32bytes!!!!"))
+	s := &Server{credStore: cs}
+	ctx := context.Background()
+
+	gid, err := cs.Create(ctx, &db.CredentialRecord{
+		TaskID: 980041, Username: "fixture-admin", CredType: "password",
+		Secret: credFixturePass, Source: "fixture source",
+	})
+	if err != nil {
+		t.Fatalf("Create good: %v", err)
+	}
+	t.Cleanup(func() { _ = cs.Delete(context.Background(), gid) })
+	bid, err := other.Create(ctx, &db.CredentialRecord{
+		TaskID: 980042, Username: "other", CredType: "password",
+		Secret: "fixture-other-key", Source: "t",
+	})
+	if err != nil {
+		t.Fatalf("Create other: %v", err)
+	}
+	t.Cleanup(func() { _ = other.Delete(context.Background(), bid) })
+
+	all := doListItems(t, s.intranetListCredentials, "/api/credentials")
+	var foundGood, foundBad bool
+	raw, _ := json.Marshal(all)
+	if strings.Contains(string(raw), credFixturePass) || strings.Contains(string(raw), "fixture-other-key") {
+		t.Fatalf("列表不得含明文 secret: %s", raw)
+	}
+	for _, it := range all {
+		m, _ := it.(map[string]any)
+		id, _ := m["id"].(float64)
+		if int64(id) == gid {
+			foundGood = true
+			if _, ok := m["secret"]; ok {
+				t.Fatalf("可解行仍不得含 secret 字段: %s", raw)
+			}
+			if m["secret_masked"] == nil || m["secret_masked"] == credFixturePass {
+				t.Fatalf("可解行应含脱敏字段: %#v", m)
+			}
+		}
+		if int64(id) == bid {
+			foundBad = true
+		}
+	}
+	if !foundGood {
+		t.Fatalf("GET /api/credentials 应含可解行, body=%s", raw)
+	}
+	if foundBad {
+		t.Fatal("无法解密的行不得出现在列表中")
+	}
+
+	byTask := doListItems(t, s.intranetListCredentials, "/api/credentials?task_id=980041")
+	if len(byTask) != 1 {
+		t.Fatalf("按 task 过滤应只返回可解行: %v", byTask)
+	}
+	taskRaw, _ := json.Marshal(byTask)
+	if strings.Contains(string(taskRaw), credFixturePass) {
+		t.Fatalf("按 task 过滤不得含明文: %s", taskRaw)
+	}
+
+	skipped := doListItems(t, s.intranetListCredentials, "/api/credentials?task_id=980042")
+	if len(skipped) != 0 {
+		t.Fatalf("仅有不可解行的任务应返回空列表而非 500: %v", skipped)
+	}
+}

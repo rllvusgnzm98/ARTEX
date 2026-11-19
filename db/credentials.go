@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"time"
 )
 
@@ -147,11 +148,17 @@ RETURNING id`,
 const credentialCols = `id, task_id, COALESCE(host_asset_id,0), username, cred_type, secret,
 	domain, source, verified, created_at`
 
-func (s *CredentialStore) scan(row interface{ Scan(...any) error }) (*CredentialRecord, error) {
+func (s *CredentialStore) scanMeta(row interface{ Scan(...any) error }) (CredentialRecord, string, error) {
 	var r CredentialRecord
 	var enc string
-	if err := row.Scan(&r.ID, &r.TaskID, &r.HostAssetID, &r.Username, &r.CredType, &enc,
-		&r.Domain, &r.Source, &r.Verified, &r.CreatedAt); err != nil {
+	err := row.Scan(&r.ID, &r.TaskID, &r.HostAssetID, &r.Username, &r.CredType, &enc,
+		&r.Domain, &r.Source, &r.Verified, &r.CreatedAt)
+	return r, enc, err
+}
+
+func (s *CredentialStore) scan(row interface{ Scan(...any) error }) (*CredentialRecord, error) {
+	r, enc, err := s.scanMeta(row)
+	if err != nil {
 		return nil, err
 	}
 	plain, err := s.decrypt(enc)
@@ -160,6 +167,22 @@ func (s *CredentialStore) scan(row interface{ Scan(...any) error }) (*Credential
 	}
 	r.Secret = plain
 	return &r, nil
+}
+
+// appendListed 把一行加入列表。单行解密失败则跳过并只记 credential id，
+// 不中断整个列表，也不把 secret/密文/口令写入日志。扫描错误仍返回。
+func (s *CredentialStore) appendListed(out []*CredentialRecord, row interface{ Scan(...any) error }) ([]*CredentialRecord, error) {
+	r, enc, err := s.scanMeta(row)
+	if err != nil {
+		return out, err
+	}
+	plain, err := s.decrypt(enc)
+	if err != nil {
+		log.Printf("[credentials] skip credential %d: decrypt failed", r.ID)
+		return out, nil
+	}
+	r.Secret = plain
+	return append(out, &r), nil
 }
 
 // Get 取一条（含解密 secret）；不存在返回 (nil, nil)。
@@ -182,17 +205,17 @@ func (s *CredentialStore) ListByTask(ctx context.Context, taskID int64) ([]*Cred
 	defer rows.Close()
 	out := []*CredentialRecord{}
 	for rows.Next() {
-		r, err := s.scan(rows)
+		out, err = s.appendListed(out, rows)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, r)
 	}
 	return out, rows.Err()
 }
 
 // ListAll 取全部凭据（按 id 升序，含解密 secret）——控制台跨任务视图用。
 // 调用方必须走 PublicCredential 脱敏，secret 不明文出接口。
+// 单行解密失败（例如 jwt.key 已轮换）跳过该行，不让整表列表失败。
 func (s *CredentialStore) ListAll(ctx context.Context) ([]*CredentialRecord, error) {
 	rows, err := s.d.QueryContext(ctx,
 		`SELECT `+credentialCols+` FROM credentials ORDER BY id`)
@@ -202,11 +225,10 @@ func (s *CredentialStore) ListAll(ctx context.Context) ([]*CredentialRecord, err
 	defer rows.Close()
 	out := []*CredentialRecord{}
 	for rows.Next() {
-		r, err := s.scan(rows)
+		out, err = s.appendListed(out, rows)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, r)
 	}
 	return out, rows.Err()
 }
