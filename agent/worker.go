@@ -85,6 +85,10 @@ type Worker struct {
 	// maxTokensFn resolves the per-reply output cap in tokens, on the same
 	// per-run basis. nil or 0 = send no cap and let the endpoint decide.
 	maxTokensFn func() int
+	// taskProxyFn, when set, resolves the task's own MITM instance. Empty addr
+	// falls back to proxyAddr/proxyCACert so tasks cannot stomp a shared upstream.
+	taskProxyFn func(taskID int64) (addr, caCert string)
+
 	// intranetFn resolves whether a task is in its intranet phase (存在存活立足点
 	// 会话)。为 true 时 worker 系统提示追加 worker.intranet 短纪律变体。
 	// 每次 run 现查,会话状态变化即时生效;nil = 外网(默认)。
@@ -203,6 +207,23 @@ func (w *Worker) compactionWindow() int {
 // traffic through, plus the CA cert path WebFetch trusts to verify HTTPS through
 // that MITM proxy. Empty addr disables the hint.
 func (w *Worker) SetProxy(addr, caCert string) { w.proxyAddr, w.proxyCACert = addr, caCert }
+
+// SetTaskProxyResolver installs the per-task proxy resolver: each run asks it
+// for the task's own MITM instance; empty result falls back to SetProxy.
+func (w *Worker) SetTaskProxyResolver(fn func(taskID int64) (addr, caCert string)) {
+	w.taskProxyFn = fn
+}
+
+// proxyForTask picks the egress proxy for one run: the task's own MITM instance
+// when the resolver binds one; otherwise the global SetProxy value.
+func (w *Worker) proxyForTask(taskID int64) (addr, caCert string) {
+	if w.taskProxyFn != nil {
+		if a, c := w.taskProxyFn(taskID); a != "" {
+			return a, c
+		}
+	}
+	return w.proxyAddr, w.proxyCACert
+}
 
 // SetWebSearch selects the web_search backend for this worker (off by default).
 func (w *Worker) SetWebSearch(o WebSearchOpts) { w.webSearch = o }
@@ -432,7 +453,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
 	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
-	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir, w.intranetForTask(taskID))
+	proxyAddr, proxyCA := w.proxyForTask(taskID)
+	sysBody := workerSystem(proxyAddr, proxyCA, w.workDir, runDir, w.intranetForTask(taskID))
 	if w.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
 	}
@@ -479,8 +501,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		// WebFetch 走记录代理，其 HTTP 与 curl 一样被留痕；载入代理 CA 让经 MITM
 		// 重签的 HTTPS 证书能【正常校验通过】（而非关掉校验）。proxy 空则直连。
 		EnableWebFetch: true,
-		WebFetchProxy:  w.proxyAddr,
-		WebFetchCACert: w.proxyCACert,
+		WebFetchProxy:  proxyAddr,
+		WebFetchCACert: proxyCA,
 		// 联网搜索(可选)。ddgs 无需 key；brave-free 需 BraveKey；tavily 需 TavilyKey。
 		// WebSearchProxy 是独立的出口代理(http/https/socks5)，与记录流量的 MITM 代理无关；空则直连。
 		EnableWebSearch:       w.webSearch.Enabled,
@@ -492,7 +514,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		DeepSeekSearchModel:   w.webSearch.DeepSeekModel,
 		WebSearchProxy:        w.webSearch.Proxy,
 		// Bash 子命令的 HTTP 默认走记录代理 + 信任其 CA（工具无需 -x/-k）。
-		BashEnv:    proxyEnv(w.proxyAddr, w.proxyCACert),
+		BashEnv:    proxyEnv(proxyAddr, proxyCA),
 		WorkingDir: runDir,
 		MaxTurns:   w.maxTurns, // 0 = unlimited (configurable in agent management)
 		// 墙钟预算,轮边界判,不打断半路;0 = 不限。有任务级 deadline 时夹逼到 min(自身预算,

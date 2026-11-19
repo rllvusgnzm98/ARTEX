@@ -26,6 +26,7 @@ import (
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/artex/report"
 	"github.com/Autumn-27/artex/session"
+	"github.com/Autumn-27/artex/stage"
 	"github.com/Autumn-27/artex/traffic"
 	"github.com/Autumn-27/norma/llm"
 	actool "github.com/Autumn-27/norma/tool"
@@ -49,6 +50,10 @@ type Server struct {
 
 	sessReg   *session.Registry // 立足点会话注册表；nil = DB 未就绪
 	sessStore *db.SessionStore  // 会话落库访问层（secret AES-GCM，密钥由 jwtKey 派生）
+
+	stage      *stage.Manager   // 受管文件投递；nil = 未就绪（启动失败降级）
+	tunnels    *tunnelRuntime   // 隧道台账运行时；nil = 未就绪
+	tunnelLive tunnelLiveLister // 内网变体/拓扑用的台账读口；nil-safe
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
@@ -156,6 +161,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
 	s.initSideQuestions()
+	s.initStage(dataDir) // 受管文件投递暂存；失败降级为关闭，不影响启动
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
 	s.applyRetryPolicy()
@@ -233,6 +239,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		s.seedPythonInterpreter()     // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
 		s.initSessions()              // 立足点会话：Registry + 启动恢复与陈旧探活
 		s.seedSessionTools()          // register_session / session_recon 默认绑 worker
+		s.initTunnels(dataDir)        // 隧道台账（本刀不拉起外部适配器进程）
+		s.seedTunnelTools()           // tunnel_list/probe/deploy/teardown 默认绑 worker
+		s.seedStageShareTool()        // stage_share 默认绑 worker
 		go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
 		// 与触发器的业务节奏不同，且两者失败互不牵连——推送卡住不该影响 agent 触发。
@@ -937,6 +946,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/sessions/{id}/write", s.intranetWriteFile)
 	mux.HandleFunc("DELETE /api/sessions/{id}", s.intranetDeleteSession)
 	mux.HandleFunc("GET /api/intranet/topology", s.intranetTopology)
+	mux.HandleFunc("GET /api/tunnels", s.intranetListTunnels)
+	mux.HandleFunc("POST /api/tunnels/{id}/teardown", s.intranetTeardownTunnel)
+	mux.HandleFunc("POST /api/stage", s.stageCreate)
+	mux.HandleFunc("GET /api/stage", s.stageList)
+	mux.HandleFunc("DELETE /api/stage/{token}", s.stageDelete)
 
 	mux.HandleFunc("GET /api/intercept/pending", s.interceptListPending)
 	mux.HandleFunc("GET /api/intercept/pending/{id}", s.interceptGetOne)
@@ -957,6 +971,7 @@ func (s *Server) Handler() http.Handler {
 	api := cors(s.requireAuth(mux))
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
+	root.HandleFunc("GET /s/{token}/{name}", s.stageDownload) // token 路径，无 JWT
 	root.Handle("/", s.webuiHandler())
 	return root
 }

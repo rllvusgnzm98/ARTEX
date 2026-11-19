@@ -20,7 +20,7 @@ func defaultEnabledSet() map[string]bool {
 // intercept_enabled_tools 从未写入时的回落来源；本用例不碰数据库。
 func TestDefaultEnabledToolsIncludeSessionTools(t *testing.T) {
 	got := defaultEnabledSet()
-	for _, want := range []string{"register_session", "session_recon"} {
+	for _, want := range []string{"register_session", "session_recon", "tunnel_deploy", "tunnel_teardown"} {
 		if !got[want] {
 			t.Errorf("无已保存设置时，默认拦截工具清单应包含 %s，实际 %v", want, defaultEnabledTools)
 		}
@@ -73,13 +73,13 @@ func TestGetEnabledToolsUsesDefaultsOnlyWhenUnset(t *testing.T) {
 	for _, n := range tools {
 		got[n] = true
 	}
-	for _, want := range []string{"register_session", "session_recon"} {
+	for _, want := range []string{"register_session", "session_recon", "tunnel_deploy", "tunnel_teardown"} {
 		if !got[want] {
 			t.Errorf("无已保存设置时 GetEnabledTools 应含 %s，实际 %v", want, tools)
 		}
 	}
-	if !ic.IsToolEnabled("register_session") || !ic.IsToolEnabled("session_recon") {
-		t.Errorf("无已保存设置时 IsToolEnabled 应对会话工具为 true")
+	if !ic.IsToolEnabled("register_session") || !ic.IsToolEnabled("session_recon") || !ic.IsToolEnabled("tunnel_deploy") || !ic.IsToolEnabled("tunnel_teardown") {
+		t.Errorf("无已保存设置时 IsToolEnabled 应对会话工具与 tunnel_deploy/tunnel_teardown 为 true")
 	}
 
 	// 已保存清单缺少这两项时，必须原样返回，不得悄悄并入新默认值。
@@ -94,8 +94,8 @@ func TestGetEnabledToolsUsesDefaultsOnlyWhenUnset(t *testing.T) {
 	if len(gotList) != 2 || gotList[0] != "Bash" || gotList[1] != "Write" {
 		t.Fatalf("已保存设置不得被默默改写: %v", gotList)
 	}
-	if ic.IsToolEnabled("register_session") || ic.IsToolEnabled("session_recon") {
-		t.Fatalf("已保存清单未包含会话工具时，不应因新默认值被启用")
+	if ic.IsToolEnabled("register_session") || ic.IsToolEnabled("session_recon") || ic.IsToolEnabled("tunnel_deploy") || ic.IsToolEnabled("tunnel_teardown") {
+		t.Fatalf("已保存清单未包含会话工具或 tunnel_deploy/tunnel_teardown 时，不应因新默认值被启用")
 	}
 
 	raw, ok, err := d.GetSetting(key)

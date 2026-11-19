@@ -1424,3 +1424,29 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_task ON sessions(created_by_task);
+
+-- =====================================================================
+-- 隧道台账（PR-G, 只追加 IF NOT EXISTS）
+-- =====================================================================
+-- 受管 socks/portfwd 台账。deploy_params 存完整部署计划 JSON,供回滚与上游选择。
+-- 外部适配器按需,不作为默认必装。
+CREATE TABLE IF NOT EXISTS tunnels (
+    id             BIGSERIAL PRIMARY KEY,
+    task_id        BIGINT NOT NULL DEFAULT 0,
+    kind           TEXT NOT NULL CHECK(kind IN ('socks','portfwd')),
+    adapter        TEXT NOT NULL DEFAULT 'chisel',
+    listen_host    TEXT NOT NULL DEFAULT '',
+    listen_port    INT  NOT NULL DEFAULT 0,
+    target_host    TEXT NOT NULL DEFAULT '',
+    target_port    INT  NOT NULL DEFAULT 0,
+    via_session_id BIGINT NOT NULL DEFAULT 0,
+    remote_pid     INT  NOT NULL DEFAULT 0,
+    deploy_params  JSONB NOT NULL DEFAULT '{}',
+    state          TEXT NOT NULL DEFAULT 'deploying'
+                   CHECK(state IN ('deploying','alive','error','stopped')),
+    last_check     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    error          TEXT NOT NULL DEFAULT '',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_tunnels_task ON tunnels(task_id);
+CREATE INDEX IF NOT EXISTS idx_tunnels_state ON tunnels(state);

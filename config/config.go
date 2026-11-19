@@ -26,8 +26,11 @@ type Database struct {
 
 // Config is the on-disk config file shape.
 type Config struct {
-	Database Database `json:"database"`
-	SkillDir string   `json:"skill_dir"`
+	Database           Database `json:"database"`
+	SkillDir           string   `json:"skill_dir"`
+	CallbackAddr       string   `json:"callback_addr"`
+	TunnelPortRange    string   `json:"tunnel_port_range"`
+	TaskProxyPortRange string   `json:"task_proxy_port_range"`
 }
 
 // BaseDir is the directory that anchors all runtime artifacts (config.json and
@@ -189,4 +192,50 @@ func Redact(dsn string) string {
 		}
 	}
 	return fmt.Sprintf("%s", u.String())
+}
+
+// CallbackAddr resolves the platform callback address:
+//
+//	env ARTEX_CALLBACK_ADDR  >  config file (callback_addr)
+//
+// 隧道回连平台时使用；未设置时部署工具应明确报错，不阻断平台启动。
+func CallbackAddr() string {
+	if v := strings.TrimSpace(os.Getenv("ARTEX_CALLBACK_ADDR")); v != "" {
+		return v
+	}
+	return strings.TrimSpace(Load().CallbackAddr)
+}
+
+// TunnelPortRange resolves the tunnel port pool ("min-max"):
+//
+//	env ARTEX_TUNNEL_PORT_RANGE  >  config file  >  "20000-21000"
+func TunnelPortRange() string {
+	if v := strings.TrimSpace(os.Getenv("ARTEX_TUNNEL_PORT_RANGE")); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(Load().TunnelPortRange); v != "" {
+		return v
+	}
+	return "20000-21000"
+}
+
+// TaskProxyEnabled reports whether per-task MITM instances are on.
+// Default on; env ARTEX_TASK_PROXY=off/0/false disables (worker then keeps
+// using the single global recording proxy).
+func TaskProxyEnabled() bool {
+	v := strings.TrimSpace(os.Getenv("ARTEX_TASK_PROXY"))
+	return !(strings.EqualFold(v, "off") || v == "0" || strings.EqualFold(v, "false"))
+}
+
+// TaskProxyPortRange resolves the per-task MITM port pool ("min-max"):
+//
+//	env ARTEX_TASK_PROXY_PORT_RANGE  >  config file  >  "21100-21199"
+func TaskProxyPortRange() string {
+	if v := strings.TrimSpace(os.Getenv("ARTEX_TASK_PROXY_PORT_RANGE")); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(Load().TaskProxyPortRange); v != "" {
+		return v
+	}
+	return "21100-21199"
 }

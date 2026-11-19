@@ -449,11 +449,13 @@ func (s *Server) intranetDeleteSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "id": id, "was_live": inReg})
 }
 
+// GET /api/tunnels?task_id= 由 intranetListTunnels 实现（本刀已接线）。
+// legacy stub:
 // GET /api/tunnels?task_id= — 台账全量(含 stopped,全字段);
 // 传 task_id 时只留本任务的隧道,不传保持全局视图(兼容旧前端)。
 // 注意:deploy_params 含隧道 auth token(平台自造一次性令牌),仅 JWT 后可见。
 
-// topoTunnel 是拓扑组装可选的隧道边。本刀没有隧道台账，调用方传 nil。
+// topoTunnel 是拓扑组装可选的隧道边。台账未就绪或查找失败时调用方传 nil。
 type topoTunnel struct {
 	ID           int64
 	Kind         string
@@ -500,7 +502,7 @@ func segmentOf(ip, cSegment string) string {
 	return (&net.IPNet{IP: parsed.Mask(net.CIDRMask(48, 128)), Mask: net.CIDRMask(48, 128)}).String()
 }
 
-// buildTopology 纯组装:ip 资产 + 会话主机去重为 nodes。tunnels 本刀为空。
+// buildTopology 纯组装:ip 资产 + 会话主机去重为 nodes。tunnels 为追加边，不得丢掉资产或会话。
 func buildTopology(assets []*db.Asset, recs []*db.SessionRecord, tunnels []topoTunnel, callbackHost string) map[string]any {
 	nodes := map[string]*topoNode{}
 	for _, a := range assets {
@@ -674,7 +676,8 @@ func (s *Server) intranetTopology(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	recs = filterSessionsByTask(recs, taskID)
-	writeJSON(w, 200, buildTopology(assets, recs, nil, ""))
+	tuns := collectTopoTunnels(r.Context(), s.tunnelLive, taskID)
+	writeJSON(w, 200, buildTopology(assets, recs, tuns, callbackHostForTopo()))
 }
 
 // taskIntranet 判定任务是否处于内网期(worker.intranet 短纪律变体的开关):
@@ -685,13 +688,38 @@ func (s *Server) taskIntranet(taskID int64) bool {
 	if taskID <= 0 {
 		return false
 	}
+	ctx := context.Background()
+	if s != nil && s.ctx != nil {
+		ctx = s.ctx
+	}
 	if s != nil && s.sessStore != nil {
-		ctx := s.ctx
-		if ctx == nil {
-			ctx = context.Background()
-		}
 		recs, err := s.sessStore.List(ctx, db.SessionAlive)
 		if hasLiveTaskSession(recs, err, taskID) {
+			return true
+		}
+	}
+	// 隧道台账未接线或查找失败：保持外网变体（nil-safe）。
+	if s != nil && s.tunnelLive != nil {
+		recs, err := s.tunnelLive.ListByTask(ctx, taskID)
+		if hasLiveTaskTunnel(recs, err) {
+			return true
+		}
+	}
+	return false
+}
+
+// tunnelLiveLister 是内网变体/拓扑用的最小台账读口（*tunnelRuntime / *db.TunnelStore 满足）。
+type tunnelLiveLister interface {
+	ListByTask(ctx context.Context, taskID int64) ([]*db.TunnelRecord, error)
+}
+
+// hasLiveTaskTunnel 查找失败或无存活隧道一律视为外网。
+func hasLiveTaskTunnel(recs []*db.TunnelRecord, err error) bool {
+	if err != nil {
+		return false
+	}
+	for _, r := range recs {
+		if r != nil && r.State == db.TunnelAlive {
 			return true
 		}
 	}

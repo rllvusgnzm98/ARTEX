@@ -327,6 +327,17 @@ func (t *Traffic) SetUpstreamProxy(raw string) error {
 	return nil
 }
 
+// UpstreamProxy returns the current egress proxy URL ("" = direct dial).
+// Observability/test hook for the per-instance hot-swappable upstream.
+// Per-task MITM instances each have their own Traffic, so SetUpstreamProxy
+// on one task cannot stomp another task's upstream.
+func (t *Traffic) UpstreamProxy() string {
+	if u := t.upstream.Load(); u != nil {
+		return u.String()
+	}
+	return ""
+}
+
 // ValidateProxyURL parses and checks a proxy URL (http/https/socks5, optional
 // user:pass), returning the parsed URL. Exposed so callers can validate a global
 // proxy before persisting it even when the traffic proxy itself is disabled.
@@ -368,7 +379,15 @@ func (t *Traffic) Close() error {
 		t.closeOnce.Do(func() { close(t.closed) })
 	}
 	t.reaping.Wait()
-	return t.db.Close()
+	// Release the MITM listen port so per-task instances can be rebuilt.
+	var err error
+	if t.proxy != nil {
+		err = t.proxy.Close()
+	}
+	if derr := t.db.Close(); err == nil {
+		err = derr
+	}
+	return err
 }
 
 // stopping reports whether Close has been called. A nil channel (the zero value)

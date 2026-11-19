@@ -85,7 +85,7 @@ func TestBuildTopology(t *testing.T) {
 	topo := buildTopology(assets, recs, nil, "")
 
 	nodes := topo["nodes"].([]*topoNode)
-	// 2 资产 + 1 合成 sess（无资产关联的 10.0.9.9）；本刀无隧道，不造 platform 节点。
+	// 2 资产 + 1 合成 sess（无资产关联的 10.0.9.9）；无隧道时不造 platform 节点。
 	if len(nodes) != 3 {
 		t.Fatalf("节点数应为 3: %d", len(nodes))
 	}
@@ -112,7 +112,7 @@ func TestBuildTopology(t *testing.T) {
 		t.Errorf("无隧道时不应出现 platform 节点")
 	}
 	if edges := topo["edges"].([]topoEdge); len(edges) != 0 {
-		t.Errorf("本刀无隧道，边应为空: %+v", edges)
+		t.Errorf("无隧道时边应为空: %+v", edges)
 	}
 	segs := topo["segments"].([]topoSegment)
 	if len(segs) != 3 {
@@ -226,4 +226,30 @@ func TestIntranetListSessionsTaskFilter(t *testing.T) {
 		t.Fatalf("全局视图应至少 2 条: %d", len(all))
 	}
 	expectBadTaskID(t, s.intranetListSessions, "/api/sessions?task_id=abc")
+}
+
+func TestBuildTopologyAppendsTunnelNodes(t *testing.T) {
+	assets := []*db.Asset{{ID: 1, IP: "10.0.0.5", CSegment: "10.0.0.0/24"}}
+	recs := []*db.SessionRecord{
+		{ID: 11, HostAssetID: 1, URL: "http://10.0.0.5/s.php", Status: db.SessionAlive, CreatedByTask: 3},
+	}
+	tuns := []topoTunnel{{
+		ID: 77, Kind: "socks", ViaSessionID: 11, State: db.TunnelAlive,
+	}}
+	topo := buildTopology(assets, recs, tuns, "203.0.113.1")
+	nodes := topo["nodes"].([]*topoNode)
+	byID := map[string]*topoNode{}
+	for _, n := range nodes {
+		byID[n.ID] = n
+	}
+	if byID["asset-1"] == nil || !byID["asset-1"].HasSession {
+		t.Fatalf("追加隧道后不得丢掉资产/会话节点: %+v", nodes)
+	}
+	if byID["platform"] == nil {
+		t.Fatal("有隧道边时应出现 platform 节点")
+	}
+	edges := topo["edges"].([]topoEdge)
+	if len(edges) != 1 || edges[0].From != "platform" || edges[0].To != "asset-1" || edges[0].Kind != "socks" {
+		t.Fatalf("隧道边不符合预期: %+v", edges)
+	}
 }
