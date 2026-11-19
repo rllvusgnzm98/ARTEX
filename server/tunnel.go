@@ -1,6 +1,6 @@
 // tunnel.go 装配隧道台账与默认工具（list / probe / deploy / teardown）。
-// 本刀登记计划与台账、热切换每任务 MITM 上游；默认路径不拉起真实
-// chisel/suo5 进程，不对真实目标打洞。外部二进制按需，非默认必装。
+// 进程内拉起适配器（chisel/suo5 路径按需解析）；只对环回入口探活，
+// 不对真实目标打洞。外部二进制按需，非默认必装。
 package server
 
 import (
@@ -21,10 +21,11 @@ import (
 	actool "github.com/Autumn-27/norma/tool"
 )
 
-// tunnelRuntime 是本刀的台账运行时（无进程看护、无健康巡检、无真实适配器拉起）。
+// tunnelRuntime 是本刀的台账运行时，内嵌进程内 Manager（本地拉起/环回探活/回收）。
 type tunnelRuntime struct {
 	store   *db.TunnelStore
 	dataDir string
+	mgr     *tunnel.Manager
 }
 
 func (rt *tunnelRuntime) ListByTask(ctx context.Context, taskID int64) ([]*db.TunnelRecord, error) {
@@ -45,10 +46,28 @@ func (s *Server) initTunnels(dataDir string) {
 	if s.m == nil || s.m.PG() == nil {
 		return
 	}
-	rt := &tunnelRuntime{store: db.NewTunnelStore(s.m.PG()), dataDir: dataDir}
+	store := db.NewTunnelStore(s.m.PG())
+	mgr, err := tunnel.NewManager(tunnel.Options{
+		Store:      store,
+		ChiselPath: tunnel.ResolveChiselPath(dataDir),
+		Suo5Path:   tunnel.ResolveSuo5Path(dataDir),
+		DataDir:    dataDir,
+	})
+	if err != nil {
+		log.Printf("[tunnel] Manager 初始化失败（台账仍可用）: %v", err)
+		rt := &tunnelRuntime{store: store, dataDir: dataDir}
+		s.tunnels = rt
+		s.tunnelLive = rt
+		return
+	}
+	mgr.OnListenStart = registerManagedPort
+	mgr.OnListenStop = unregisterManagedPort
+	mgr.OnStateChange = s.m.RefreshTaskProxy
+	mgr.ReconcileOrphans(s.ctx)
+	rt := &tunnelRuntime{store: store, dataDir: mgr.PlanDataDir(), mgr: mgr}
 	s.tunnels = rt
 	s.tunnelLive = rt
-	log.Printf("[tunnel] 隧道台账已就绪（端口池 %s；外部适配器按需，本刀默认不拉起进程）", config.TunnelPortRange())
+	log.Printf("[tunnel] 隧道台账已就绪（端口池 %s；适配器按需进程内拉起，仅环回探活）", config.TunnelPortRange())
 }
 
 func callbackHost() (string, error) {
@@ -93,6 +112,9 @@ func (s *Server) occupiedPorts(ctx context.Context) (map[int]bool, error) {
 }
 
 func (s *Server) teardownTunnel(ctx context.Context, id int64) error {
+	if s.tunnels != nil && s.tunnels.mgr != nil {
+		return s.tunnels.mgr.Teardown(ctx, id)
+	}
 	if s.tunnels == nil || s.tunnels.store == nil {
 		return fmt.Errorf("隧道台账未就绪")
 	}
@@ -168,9 +190,9 @@ func (s *Server) tunnelProbeTool() actool.CoreTool {
 func (s *Server) tunnelDeployTool() actool.CoreTool {
 	return actool.Build(actool.Spec{
 		Name: "tunnel_deploy",
-		Description: "【隧道·deploy】按计划登记一条 socks 或 portfwd 台账（adapter=chisel|suo5，默认 chisel）。" +
-			"本刀写入计划与台账，不拉起外部适配器进程、不对真实目标打洞。台账 state=error 并注明原因；" +
-			"用完请 tunnel_teardown。不要用裸 Bash 自起隧道进程。",
+		Description: "【隧道·deploy】按计划登记并进程内拉起一条 socks 或 portfwd 隧道（adapter=chisel|suo5，默认 chisel）。" +
+			"二进制按需（ARTEX_CHISEL_PATH / ARTEX_SUO5_PATH 或 data/tools 下的同名文件），缺失则台账标 error，非默认必装。" +
+			"只对环回入口做健康检查，不向真实目标打洞。用完请 tunnel_teardown。",
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -250,33 +272,25 @@ func (s *Server) tunnelDeployTool() actool.CoreTool {
 				return actool.Errorf("计划生成失败：" + err.Error()), nil
 			}
 			plan.Adapter = adapter
-			params, _ := json.Marshal(plan)
-			note := "本刀只登记计划与台账，不拉起外部适配器进程（chisel/suo5 按需，非默认必装）。"
-			id, err := s.tunnels.store.Create(ctx, &db.TunnelRecord{
-				TaskID:       ri.TaskID,
-				Kind:         plan.Kind,
-				Adapter:      adapter,
-				ListenHost:   plan.ListenHost,
-				ListenPort:   plan.ListenPort,
-				TargetHost:   plan.TargetHost,
-				TargetPort:   plan.TargetPort,
-				ViaSessionID: a.SessionID,
-				State:        db.TunnelError,
-				DeployParams: params,
-				Error:        note,
-			})
-			if err != nil {
-				return actool.Errorf("台账写入失败：" + err.Error()), nil
+			if s.tunnels.mgr == nil {
+				return actool.Errorf("隧道运行时未就绪"), nil
 			}
-			if s.m != nil {
-				s.m.RefreshTaskProxy(ri.TaskID)
+			rec, derr := s.tunnels.mgr.Deploy(ctx, plan)
+			if rec == nil && derr != nil {
+				return actool.Errorf("部署失败：" + derr.Error()), nil
+			}
+			if rec == nil {
+				return actool.Errorf("部署失败：无台账行"), nil
 			}
 			out := map[string]any{
-				"tunnel_id": id,
-				"kind":      plan.Kind,
-				"adapter":   adapter,
-				"state":     db.TunnelError,
-				"note":      note + " 用完请 tunnel_teardown。",
+				"tunnel_id": rec.ID,
+				"kind":      rec.Kind,
+				"adapter":   rec.Adapter,
+				"state":     rec.State,
+				"note":      "用完请 tunnel_teardown。外部二进制按需，非默认必装；本刀只对环回入口探活。",
+			}
+			if rec.Error != "" {
+				out["error"] = rec.Error
 			}
 			if plan.Kind == tunnel.KindSocks && plan.SocksPort > 0 {
 				addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(plan.SocksPort))
@@ -285,6 +299,9 @@ func (s *Server) tunnelDeployTool() actool.CoreTool {
 			} else if plan.Kind == tunnel.KindPortfwd {
 				out["forward_addr"] = net.JoinHostPort("127.0.0.1", strconv.Itoa(plan.LocalPort))
 				out["forward_to"] = net.JoinHostPort(plan.TargetHost, strconv.Itoa(plan.TargetPort))
+			}
+			if derr != nil {
+				return jsonResult(out)
 			}
 			return jsonResult(out)
 		},
@@ -348,9 +365,8 @@ func (s *Server) tunnelListTool() actool.CoreTool {
 
 func (s *Server) tunnelTeardownTool() actool.CoreTool {
 	return actool.Build(actool.Spec{
-		Name: "tunnel_teardown",
-		Description: "【隧道·teardown】回收一条隧道：台账标 stopped，并刷新该任务 MITM 上游。" +
-			"用完必须调这个。本刀不杀外部进程（默认路径未曾拉起）。",
+		Name:        "tunnel_teardown",
+		Description: "【隧道·teardown】回收一条隧道：杀掉本平台拉起的适配器进程，台账标 stopped，并刷新该任务 MITM 上游。用完必须调这个。",
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
