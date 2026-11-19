@@ -181,7 +181,7 @@ func (s *Server) tunnelProbeTool() actool.CoreTool {
 				out := map[string]any{
 					"tunnel_id": rec.ID,
 					"state":     rec.State,
-					"note":      "只拨环回地址；消费入口可连才晋升 alive。口令不在此回显。",
+					"note":      "只拨环回地址；消费入口可连才晋升 alive。回连所需 AUTH 字段在 reconnect 中，不写入日志或列表。",
 				}
 				if rec.Error != "" {
 					out["error"] = rec.Error
@@ -189,6 +189,9 @@ func (s *Server) tunnelProbeTool() actool.CoreTool {
 				var p tunnel.Plan
 				if json.Unmarshal(rec.DeployParams, &p) == nil {
 					out["reconnect"] = tunnel.ReconnectInfo(&p)
+					if p.StatusNote != "" {
+						out["status"] = p.StatusNote
+					}
 				}
 				if err != nil {
 					out["probe_error"] = err.Error()
@@ -327,7 +330,7 @@ func (s *Server) tunnelDeployTool() actool.CoreTool {
 				"kind":      rec.Kind,
 				"adapter":   rec.Adapter,
 				"state":     rec.State,
-				"note":      "用完请 tunnel_teardown。外部二进制按需，非默认必装。平台侧 ListenPort 就绪后，若消费入口未可连则保持 deploying，请用返回的回连信息在立足点拉起 client，再用 tunnel_probe 晋升。口令不在此回显。",
+				"note":      "用完请 tunnel_teardown。外部二进制按需，非默认必装。平台侧 ListenPort 就绪后，若消费入口未可连则保持 deploying；请用 reconnect 中的 AUTH / client_args 在立足点拉起 client，再用 tunnel_probe 晋升。",
 			}
 			if rec.Error != "" {
 				out["error"] = rec.Error
@@ -335,6 +338,9 @@ func (s *Server) tunnelDeployTool() actool.CoreTool {
 			var stored tunnel.Plan
 			if json.Unmarshal(rec.DeployParams, &stored) == nil {
 				out["reconnect"] = tunnel.ReconnectInfo(&stored)
+				if stored.StatusNote != "" {
+					out["status"] = stored.StatusNote
+				}
 			} else {
 				out["reconnect"] = tunnel.ReconnectInfo(plan)
 			}
@@ -378,26 +384,21 @@ func (s *Server) tunnelListTool() actool.CoreTool {
 			}
 			out := []map[string]any{}
 			for _, r := range recs {
+				row := tunnel.PublicTunnelRecord(r)
+				row["tunnel_id"] = r.ID
+				if r.LastCheck.IsZero() {
+					delete(row, "last_check")
+				} else {
+					row["last_check"] = r.LastCheck.Format("2006-01-02 15:04:05")
+				}
 				var p tunnel.Plan
 				_ = json.Unmarshal(r.DeployParams, &p)
-				row := map[string]any{
-					"tunnel_id":      r.ID,
-					"kind":           r.Kind,
-					"adapter":        r.Adapter,
-					"state":          r.State,
-					"listen_port":    r.ListenPort,
-					"via_session_id": r.ViaSessionID,
-					"last_check":     r.LastCheck.Format("2006-01-02 15:04:05"),
-				}
 				if r.Kind == tunnel.KindSocks && p.SocksPort > 0 {
 					row["socks_addr"] = net.JoinHostPort("127.0.0.1", strconv.Itoa(p.SocksPort))
 				}
 				if r.Kind == tunnel.KindPortfwd {
 					row["forward_addr"] = net.JoinHostPort("127.0.0.1", strconv.Itoa(p.LocalPort))
 					row["target"] = net.JoinHostPort(r.TargetHost, strconv.Itoa(r.TargetPort))
-				}
-				if r.Error != "" {
-					row["error"] = r.Error
 				}
 				out = append(out, row)
 			}
@@ -470,8 +471,10 @@ func (s *Server) intranetListTunnels(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "隧道台账读取失败: "+err.Error())
 		return
 	}
-	items := []*db.TunnelRecord{}
-	items = append(items, recs...)
+	items := []map[string]any{}
+	for _, rec := range recs {
+		items = append(items, tunnel.PublicTunnelRecord(rec))
+	}
 	writeJSON(w, 200, map[string]any{"items": items})
 }
 

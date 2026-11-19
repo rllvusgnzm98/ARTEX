@@ -414,22 +414,42 @@ func parsePlan(t *testing.T, rec *db.TunnelRecord) Plan {
 	return p
 }
 
-func TestReconnectInfoOmitsCredentials(t *testing.T) {
+func TestReconnectInfoIncludesAUTHFields(t *testing.T) {
 	p := Plan{
 		Kind: KindSocks, AuthUser: "artex", AuthPass: "fixture-pass",
 		ListenPort: 20001, SocksPort: 20801,
 		ClientArgs: []string{"client", "http://127.0.0.1:20001", "R:127.0.0.1:20801:socks"},
 	}
-	raw, err := json.Marshal(ReconnectInfo(&p))
+	info := ReconnectInfo(&p)
+	if info["auth_user"] != "artex" || info["auth_pass"] != "fixture-pass" {
+		t.Fatalf("worker 结果必须含 auth_user/auth_pass: %#v", info)
+	}
+	if info["AUTH"] != "artex:fixture-pass" {
+		t.Fatalf("worker 结果必须含可写入 AUTH 环境变量的值, got %#v", info["AUTH"])
+	}
+	if _, ok := info["client_args"]; !ok {
+		t.Fatal("应含 client_args")
+	}
+}
+
+func TestPublicTunnelRecordOmitsPassword(t *testing.T) {
+	p := Plan{Kind: KindSocks, AuthUser: "artex", AuthPass: "fixture-pass", StatusNote: WaitingEntryNote, SocksPort: 20801}
+	raw, _ := json.Marshal(p)
+	rec := &db.TunnelRecord{ID: 7, Kind: KindSocks, State: db.TunnelDeploying, Error: "", DeployParams: raw}
+	item := PublicTunnelRecord(rec)
+	b, err := json.Marshal(item)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := string(raw)
-	if strings.Contains(s, "fixture-pass") || strings.Contains(s, p.AuthPass) {
-		t.Fatalf("回连信息不得含口令: %s", s)
+	s := string(b)
+	if strings.Contains(s, "fixture-pass") || strings.Contains(s, "auth_pass") || strings.Contains(s, "deploy_params") {
+		t.Fatalf("列表不得含口令或完整 deploy_params: %s", s)
 	}
-	if !strings.Contains(s, "client_args") || !strings.Contains(s, "listen_addr") {
-		t.Fatalf("应含 client_args 与 listen_addr: %s", s)
+	if item["error"] != nil {
+		t.Fatalf("deploying 提示不得占用 error: %#v", item["error"])
+	}
+	if item["status"] != WaitingEntryNote && item["note"] != WaitingEntryNote {
+		t.Fatalf("等待说明应在 note/status: %#v", item)
 	}
 }
 
@@ -442,7 +462,9 @@ func TestDeployListenOnlyStaysDeployingUntilEntryReady(t *testing.T) {
 	}
 	m.Starter = deferEntryStarter
 	socks, listen := freeListenPort(t), freeListenPort(t)
-	rec, err := m.Deploy(ctx, socksPlan(61, socks, listen))
+	plan := socksPlan(61, socks, listen)
+	plan.AuthUser, plan.AuthPass = "artex", "fixture-pass"
+	rec, err := m.Deploy(ctx, plan)
 	if err != nil {
 		t.Fatalf("Deploy: %v rec=%+v", err, rec)
 	}
@@ -450,7 +472,24 @@ func TestDeployListenOnlyStaysDeployingUntilEntryReady(t *testing.T) {
 	if rec.State != db.TunnelDeploying {
 		t.Fatalf("只听 ListenPort 时应保持 deploying, got %+v", rec)
 	}
+	if rec.Error != "" {
+		t.Fatalf("等待入口的说明不得写入 error 列: %q", rec.Error)
+	}
 	p := parsePlan(t, rec)
+	if p.StatusNote != WaitingEntryNote {
+		t.Fatalf("等待说明应在 status_note: %q", p.StatusNote)
+	}
+	info := ReconnectInfo(&p)
+	if info["auth_user"] != "artex" || info["auth_pass"] != "fixture-pass" || info["AUTH"] != "artex:fixture-pass" {
+		t.Fatalf("Deploy 后 reconnect 必须含 AUTH 字段: %#v", info)
+	}
+	listed, err := json.Marshal(PublicTunnelRecord(rec))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(listed), "fixture-pass") {
+		t.Fatalf("列表不得回显口令: %s", listed)
+	}
 	if p.ServerPID <= 0 || !processAlive(p.ServerPID) {
 		t.Fatal("不得在消费入口未就绪时回滚杀掉 server")
 	}
@@ -536,8 +575,19 @@ func TestReconcileOrphansDoesNotKillListenOnlyServer(t *testing.T) {
 	if got == nil || got.State != db.TunnelDeploying {
 		t.Fatalf("只听 ListenPort 的活 server 不得继续装活，也不得标成无进程的 error: %+v", got)
 	}
+	if got.Error != "" {
+		t.Fatalf("对账降级说明不得占用 error 列: %q", got.Error)
+	}
+	gp := parsePlan(t, got)
+	if gp.StatusNote == "" {
+		t.Fatal("对账降级说明应在 status_note")
+	}
 	if !processAlive(p.ServerPID) {
 		t.Fatal("对账不得杀掉只听 ListenPort 的活 server")
+	}
+	listed, _ := json.Marshal(PublicTunnelRecord(got))
+	if strings.Contains(string(listed), "fixture-pass") {
+		t.Fatalf("列表不得回显口令: %s", listed)
 	}
 }
 

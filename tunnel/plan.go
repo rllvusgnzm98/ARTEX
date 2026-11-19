@@ -44,6 +44,7 @@ type Plan struct {
 	StageToken   string   `json:"stage_token,omitempty"` // 一次性投递条目（用完删）
 	VerifyAddr   string   `json:"verify_addr,omitempty"` // 决定性验证目标 host:port
 	ClientArgs   []string `json:"client_args"`           // chisel client 参数（不含 auth,auth 走 AUTH env)
+	StatusNote   string   `json:"status_note,omitempty"` // 非错误说明（如等待入口）；不得写入 error 列
 	// suo5 适配器字段（omitempty，向后兼容既有 chisel deploy_params):
 	PayloadFile string `json:"payload_file,omitempty"` // 平台侧 payloads 目录里的文件名（suo5.php 等）
 	PayloadName string `json:"payload_name,omitempty"` // 目标侧随机文件名

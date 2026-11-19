@@ -216,12 +216,12 @@ func (m *Manager) Deploy(ctx context.Context, p *Plan) (*db.TunnelRecord, error)
 		return rec, err
 	}
 	if entryUp {
-		if err := m.store.UpdateState(ctx, id, db.TunnelAlive, ""); err != nil {
+		if err := m.setState(ctx, id, db.TunnelAlive, "", "", p); err != nil {
 			log.Printf("[tunnel] 状态回写失败(id=%d): %v", id, err)
 		}
 	} else {
-		// 平台侧 ListenPort 已起，环回 socks/forward 尚未可连：保持 deploying，不杀进程，不成为上游。
-		if err := m.store.UpdateState(ctx, id, db.TunnelDeploying, "平台侧监听已就绪，等待环回入口；立足点回连后可用 tunnel_probe 晋升"); err != nil {
+		// 平台侧 ListenPort 已起，环回入口尚未可连：保持 deploying，说明写入 status_note，不占 error 列。
+		if err := m.setState(ctx, id, db.TunnelDeploying, "", WaitingEntryNote, p); err != nil {
 			log.Printf("[tunnel] 状态回写失败(id=%d): %v", id, err)
 		}
 	}
@@ -412,14 +412,28 @@ func entryReady(p *Plan) bool {
 	return dialLoopback(addr, time.Second) == nil
 }
 
-// ReconnectInfo 返回给 worker 的回连信息（ClientArgs / 监听地址）。不含口令。
+// WaitingEntryNote 是平台侧已起、消费入口尚未可连时的状态说明（写入 status_note，不占 error 列）。
+const WaitingEntryNote = "平台侧监听已就绪，等待环回入口；立足点回连后可用 tunnel_probe 晋升"
+
+// AUTHEnvValue 是 chisel client 读取的 AUTH 环境变量值（user:pass）。
+func AUTHEnvValue(p *Plan) string {
+	if p == nil || (p.AuthUser == "" && p.AuthPass == "") {
+		return ""
+	}
+	return p.AuthUser + ":" + p.AuthPass
+}
+
+// ReconnectInfo 返回给 worker 的完整回连信息，含设置 AUTH 所需字段。
+// 只用于工具结果；日志与列表不得调用此函数或回显口令。
 func ReconnectInfo(p *Plan) map[string]any {
 	if p == nil {
 		return map[string]any{}
 	}
 	info := map[string]any{
 		"client_args": p.ClientArgs,
-		"auth":        "经 AUTH 环境变量注入，不进命令行，也不在本输出中回显",
+		"auth_user":   p.AuthUser,
+		"auth_pass":   p.AuthPass,
+		"AUTH":        AUTHEnvValue(p),
 	}
 	if addr, err := listenAddr(p); err == nil {
 		info["listen_addr"] = addr
@@ -434,7 +448,42 @@ func ReconnectInfo(p *Plan) map[string]any {
 			info["socks_addr"] = addr
 		}
 	}
+	if p.StatusNote != "" {
+		info["status"] = p.StatusNote
+	}
 	return info
+}
+
+// PublicTunnelRecord 是控制台/列表用的脱敏台账行：不含 deploy_params 与口令。
+func PublicTunnelRecord(rec *db.TunnelRecord) map[string]any {
+	if rec == nil {
+		return map[string]any{}
+	}
+	var p Plan
+	_ = json.Unmarshal(rec.DeployParams, &p)
+	out := map[string]any{
+		"id": rec.ID, "task_id": rec.TaskID, "kind": rec.Kind, "adapter": rec.Adapter,
+		"listen_host": rec.ListenHost, "listen_port": rec.ListenPort,
+		"target_host": rec.TargetHost, "target_port": rec.TargetPort,
+		"via_session_id": rec.ViaSessionID, "remote_pid": rec.RemotePID,
+		"state": rec.State, "last_check": rec.LastCheck, "created_at": rec.CreatedAt,
+	}
+	if rec.Error != "" {
+		out["error"] = rec.Error
+	}
+	if p.StatusNote != "" {
+		out["note"] = p.StatusNote
+		out["status"] = p.StatusNote
+	}
+	return out
+}
+
+func (m *Manager) setState(ctx context.Context, id int64, state, errMsg, note string, p *Plan) error {
+	if p != nil {
+		p.StatusNote = note
+		m.saveParams(ctx, id, p)
+	}
+	return m.store.UpdateState(ctx, id, state, errMsg)
 }
 
 // PromoteIfEntryReady 在环回消费入口已可连时把 deploying 晋升为 alive 并通知 taskProxy。
@@ -468,8 +517,8 @@ func (m *Manager) PromoteIfEntryReady(ctx context.Context, id int64) (*db.Tunnel
 	if !entryReady(&p) {
 		return rec, nil
 	}
-	if rec.State != db.TunnelAlive {
-		if err := m.store.UpdateState(ctx, id, db.TunnelAlive, ""); err != nil {
+	if rec.State != db.TunnelAlive || p.StatusNote != "" {
+		if err := m.setState(ctx, id, db.TunnelAlive, "", "", &p); err != nil {
 			return rec, err
 		}
 		m.notifyState(rec.TaskID)
@@ -557,16 +606,18 @@ func (m *Manager) ReconcileOrphans(ctx context.Context) {
 			m.mu.Unlock()
 		}
 		if listenReady(&p) && entryReady(&p) {
-			if r.State != db.TunnelAlive {
-				_ = m.store.UpdateState(ctx, r.ID, db.TunnelAlive, "")
+			if r.State != db.TunnelAlive || p.StatusNote != "" {
+				_ = m.setState(ctx, r.ID, db.TunnelAlive, "", "", &p)
 				m.notifyState(r.TaskID)
 			}
 			continue
 		}
 		// 进程仍在：即使消费入口未起（只听 ListenPort），也不得杀掉，更不得装活为上游。
-		if r.State == db.TunnelAlive {
-			_ = m.store.UpdateState(ctx, r.ID, db.TunnelDeploying, "重启对账：平台侧仍在，环回消费入口未就绪，降为 deploying")
-			m.notifyState(r.TaskID)
+		if r.State == db.TunnelAlive || p.StatusNote != WaitingEntryNote {
+			_ = m.setState(ctx, r.ID, db.TunnelDeploying, "", WaitingEntryNote, &p)
+			if r.State == db.TunnelAlive {
+				m.notifyState(r.TaskID)
+			}
 		}
 	}
 }

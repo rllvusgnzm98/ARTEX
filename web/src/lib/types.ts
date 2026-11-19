@@ -1677,7 +1677,7 @@ export interface SessionReadResult {
   truncated: boolean;
 }
 
-/** GET /api/tunnels 的台账行。state: deploying / alive / error / stopped。 */
+/** GET /api/tunnels 的台账行。state: deploying / alive / error / stopped。列表不含口令。 */
 export interface TunnelRecord {
   id: number | string;
   task_id?: number;
@@ -1689,6 +1689,8 @@ export interface TunnelRecord {
   target_port?: number;
   via_session_id?: number;
   state: string;
+  status?: string;
+  note?: string;
   error?: string;
   created_at?: string;
 }
