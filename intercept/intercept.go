@@ -146,6 +146,7 @@ var defaultEnabledTools = []string{
 	"Write", "Edit", "MultiEdit",
 	"register_session", "session_recon",
 	"tunnel_deploy", "tunnel_teardown",
+	"add_credential",
 }
 
 // New creates an Interceptor backed by d. The rule cache is lazy-loaded on

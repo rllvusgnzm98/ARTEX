@@ -85,7 +85,8 @@ func IsSideEffectTool(name string) bool {
 		"record_fact", "report_finding", "insert_assets", "add_finding",
 		"add_company_scope", "add_task_scope", "set_goals", "set_constraints",
 		"prove_goal", "goal_met", "register_session", "session_recon",
-		"tunnel_deploy", "tunnel_teardown":
+		"tunnel_deploy", "tunnel_teardown",
+		"add_credential":
 		return true
 	default:
 		return false

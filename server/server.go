@@ -48,8 +48,9 @@ type Server struct {
 	skillDir string // root directory for skill subdirectories
 	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
 
-	sessReg   *session.Registry // 立足点会话注册表；nil = DB 未就绪
-	sessStore *db.SessionStore  // 会话落库访问层（secret AES-GCM，密钥由 jwtKey 派生）
+	sessReg   *session.Registry   // 立足点会话注册表；nil = DB 未就绪
+	sessStore *db.SessionStore    // 会话落库访问层（secret AES-GCM，密钥由 jwtKey 派生）
+	credStore *db.CredentialStore // 凭据落库访问层（secret AES-GCM，与 sessions 不同域标签）
 
 	stage      *stage.Manager   // 受管文件投递；nil = 未就绪（启动失败降级）
 	tunnels    *tunnelRuntime   // 隧道台账运行时；nil = 未就绪
@@ -241,6 +242,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		s.seedSessionTools()          // register_session / session_recon 默认绑 worker
 		s.initTunnels(dataDir)        // 隧道台账（本刀不拉起外部适配器进程）
 		s.seedTunnelTools()           // tunnel_list/probe/deploy/teardown 默认绑 worker
+		s.initCredentials()           // 凭据库（secret AES-GCM，jwt.key 域分离）
+		s.seedCredentialTools()       // add_credential / list_credentials / credential_reuse_plan
 		s.seedStageShareTool()        // stage_share 默认绑 worker
 		go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
@@ -945,9 +948,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/sessions/{id}/read", s.intranetReadFile)
 	mux.HandleFunc("POST /api/sessions/{id}/write", s.intranetWriteFile)
 	mux.HandleFunc("DELETE /api/sessions/{id}", s.intranetDeleteSession)
+	mux.HandleFunc("POST /api/sessions/{id}/handoff", s.sessionHandoff)
 	mux.HandleFunc("GET /api/intranet/topology", s.intranetTopology)
 	mux.HandleFunc("GET /api/tunnels", s.intranetListTunnels)
 	mux.HandleFunc("POST /api/tunnels/{id}/teardown", s.intranetTeardownTunnel)
+	mux.HandleFunc("GET /api/credentials", s.intranetListCredentials)
 	mux.HandleFunc("POST /api/stage", s.stageCreate)
 	mux.HandleFunc("GET /api/stage", s.stageList)
 	mux.HandleFunc("DELETE /api/stage/{token}", s.stageDelete)
