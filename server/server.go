@@ -273,7 +273,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	s.restoreTaskRuntimes()
 	go s.reconcileConcurrency()
 	s.startTaskArchiveWorker()
-	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
+	s.wireInterceptReviewer()      // LLM 兜底审批:未命中拦截规则的命令交给模型判定
+	s.registerEgressFingerprints() // 出口敏感指纹(只存哈希);profile/jwt 已就绪后注册
 	return s
 }
 
@@ -505,6 +506,7 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	if t := s.m.ActiveTask(); t != nil {
 		t.Notify()
 	}
+	s.registerEgressFingerprints() // LLM profile 变更时替换 llm_api_key 指纹
 	return nil
 }
 

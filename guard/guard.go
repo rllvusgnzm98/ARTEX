@@ -10,6 +10,7 @@ package guard
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"regexp"
 	"sync"
 	"time"
@@ -34,6 +35,8 @@ type Guard struct {
 	attrib      map[string]int // failure attribution counts (Observer / G5)
 	reg         *hook.Registry
 	interceptor *intercept.Interceptor // optional; nil disables user-configured rules
+	egress      *EgressGuard           // optional; 出口敏感指纹拦截,nil 关闭
+	tarpit      *tarpitState           // optional; tarpit 熔断,nil 关闭
 }
 
 // New creates a Guard without user-configured intercept rules (used for pentest
@@ -74,8 +77,56 @@ func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
 		_ = json.Unmarshal(ev.Input, &in)
 		cmd = in.Text
 	}
+	// preToolUse 顺序: egress → (PR-J 将插 RoE) → tarpit → 现有 intercept。
+	// 本刀不实现 RoE/一键放行。egress 先于 allow 审计,避免命令原文里的秘密落盘。
+	if res, stop := g.checkEgress(ev, cmd); stop {
+		return res
+	}
 	g.record(ev.ToolName, "allow", "", cmd)
+	// PR-J 预留: RoE 三态检查将插在此处(egress 之后、tarpit 之前)。
+	g.checkTarpit(ev)
 	return g.applyIntercept(ctx, ev)
+}
+
+// SetEgress 装配出口审查的敏感指纹集合(server 侧进程内共享一份)。nil = 关闭。
+func (g *Guard) SetEgress(e *EgressGuard) {
+	g.mu.Lock()
+	g.egress = e
+	g.mu.Unlock()
+}
+
+// checkEgress 是 PreToolUse 第一道:对 Bash 类命令全文与 WebFetch 的 url/body
+// 做敏感指纹检查,命中 → deny。审计与文案只记 kind,不回显原文。
+func (g *Guard) checkEgress(ev hook.Event, cmd string) (hook.Result, bool) {
+	g.mu.Lock()
+	e := g.egress
+	g.mu.Unlock()
+	if e == nil {
+		return hook.Result{}, false
+	}
+	var texts []string
+	if cmd != "" {
+		texts = append(texts, cmd)
+	}
+	if ev.ToolName == "WebFetch" {
+		var in struct {
+			URL  string `json:"url"`
+			Body string `json:"body"`
+		}
+		if json.Unmarshal(ev.Input, &in) == nil {
+			texts = append(texts, in.URL, in.Body)
+		}
+	}
+	for _, text := range texts {
+		if text == "" {
+			continue
+		}
+		if kind, hit := e.Check(text); hit {
+			log.Printf("[guard][egress] 命中平台敏感指纹(%s),%s 外发已拦截", kind, ev.ToolName)
+			return g.block(ev.ToolName, systemBlockMessage("操作包含平台敏感信息，禁止外发"), ""), true
+		}
+	}
+	return hook.Result{}, false
 }
 
 // applyIntercept evaluates user-configured intercept rules against the tool call.

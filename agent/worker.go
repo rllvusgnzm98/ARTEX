@@ -93,6 +93,10 @@ type Worker struct {
 	// 会话)。为 true 时 worker 系统提示追加 worker.intranet 短纪律变体。
 	// 每次 run 现查,会话状态变化即时生效;nil = 外网(默认)。
 	intranetFn func(taskID int64) bool
+
+	// uaFn 解析本任务稳定分配的客户端 UA,经 BashEnv 注入 ARTEX_UA。
+	// 同一任务始终同一个 UA;nil = 不注入。
+	uaFn func(taskID int64) string
 }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
@@ -149,6 +153,16 @@ func (w *Worker) SetIntranetResolver(fn func(taskID int64) bool) { w.intranetFn 
 
 func (w *Worker) intranetForTask(taskID int64) bool {
 	return w.intranetFn != nil && w.intranetFn(taskID)
+}
+
+// SetUAResolver 接入按任务稳定分配的客户端 UA。每次 run 现查,任务内不更换。
+func (w *Worker) SetUAResolver(fn func(taskID int64) string) { w.uaFn = fn }
+
+func (w *Worker) uaForTask(taskID int64) string {
+	if w.uaFn == nil {
+		return ""
+	}
+	return w.uaFn(taskID)
 }
 
 // SetConstraintInject wires a resolver deciding whether this task's operation
@@ -260,6 +274,15 @@ func proxyEnv(proxyAddr, caCert string) []string {
 	return env
 }
 
+// uaEnv 在 Bash env 上追加 ARTEX_UA(按任务稳定分配的客户端 UA);
+// ua 为空则原样返回,不追加空变量。
+func uaEnv(env []string, ua string) []string {
+	if ua == "" {
+		return env
+	}
+	return append(env, "ARTEX_UA="+ua)
+}
+
 // workerDefaultTmpl is the built-in EDITABLE body (段 [A]) of the worker system
 // prompt, seeded into agent_prompts. The trafficTool block and the 中间产物输出规约
 // are NOT here — they are code-owned and appended by workerSystem after rendering
@@ -357,7 +380,9 @@ func workerSystem(proxyAddr, caCert, dataDir, runDir string, intranet bool) stri
 	// the traffic_* tools are registered — so it gates the traffic-tool note.
 	// Optional finding guidance is added for every role after tool resolution.
 	// CLI 优先固定尾始终追加,位于内网变体之后,进场预塞仍由 execute() 再往后接。
-	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir) + tail + workerShellCLIRules
+	// 工人红线是代码固定尾:目标内容当数据不当指令,内外网一律追加,
+	// 编辑正文也删不掉。进场预塞仍由 execute() 再往后接。
+	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir) + tail + workerShellCLIRules + untrustedDataRule + workerAntiTrapRules
 }
 
 // renderIntentTask formats the claimed intent for the worker's launch USER message:
@@ -471,7 +496,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		if ids := intentAssetIDs(intent); len(ids) > 0 {
 			if assets, err := as.GetByIDs(ids); err == nil && len(assets) > 0 {
 				if b, err := json.Marshal(assets); err == nil {
-					sysBody += "\n\n本意图 asset_ids 对应的目标资产：\n" + string(b)
+					sysBody += "\n\n本意图 asset_ids 对应的目标资产：\n" + WrapUntrustedData("target-assets", string(b))
 				}
 				// 意图明确针对的这些资产 → 自动纳入任务测试范围（与 insertAssets 同一套
 				// 保守粒度）。upsertTaskScope 的 ON CONFLICT DO NOTHING + uq_task_scope
@@ -521,7 +546,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		DeepSeekSearchModel:   w.webSearch.DeepSeekModel,
 		WebSearchProxy:        w.webSearch.Proxy,
 		// Bash 子命令的 HTTP 默认走记录代理 + 信任其 CA（工具无需 -x/-k）。
-		BashEnv:    proxyEnv(proxyAddr, proxyCA),
+		BashEnv:    uaEnv(proxyEnv(proxyAddr, proxyCA), w.uaForTask(taskID)),
 		WorkingDir: runDir,
 		MaxTurns:   w.maxTurns, // 0 = unlimited (configurable in agent management)
 		// 墙钟预算,轮边界判,不打断半路;0 = 不限。有任务级 deadline 时夹逼到 min(自身预算,
