@@ -28,6 +28,7 @@ func (s *Server) chatGuard() *guard.Guard {
 	g := guard.NewWithInterceptor(s.m.interceptor)
 	if s.m != nil {
 		g.SetEgress(s.m.egress)
+		g.SetRoE(newRoEConfig(s.m.pg))
 	}
 	return g
 }

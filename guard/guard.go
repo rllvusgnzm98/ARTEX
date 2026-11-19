@@ -37,6 +37,7 @@ type Guard struct {
 	interceptor *intercept.Interceptor // optional; nil disables user-configured rules
 	egress      *EgressGuard           // optional; 出口敏感指纹拦截,nil 关闭
 	tarpit      *tarpitState           // optional; tarpit 熔断,nil 关闭
+	roe         RoEConfig              // optional; 零值 / Scope=nil 关闭
 }
 
 // New creates a Guard without user-configured intercept rules (used for pentest
@@ -77,13 +78,15 @@ func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
 		_ = json.Unmarshal(ev.Input, &in)
 		cmd = in.Text
 	}
-	// preToolUse 顺序: egress → (PR-J 将插 RoE) → tarpit → 现有 intercept。
-	// 本刀不实现 RoE/一键放行。egress 先于 allow 审计,避免命令原文里的秘密落盘。
+	// preToolUse 顺序: egress → RoE → tarpit → 现有 intercept。
+	// egress 先于 allow 审计,避免命令原文里的秘密落盘。
 	if res, stop := g.checkEgress(ev, cmd); stop {
 		return res
 	}
 	g.record(ev.ToolName, "allow", "", cmd)
-	// PR-J 预留: RoE 三态检查将插在此处(egress 之后、tarpit 之前)。
+	if res, stop := g.checkRoE(ctx, ev, cmd); stop {
+		return res
+	}
 	g.checkTarpit(ev)
 	return g.applyIntercept(ctx, ev)
 }

@@ -586,6 +586,11 @@ func (i *Interceptor) Log(ctx context.Context, convID int64, dec Decision, toolN
 // page shows it and the sidebar badge lights up. The worker thread blocks just
 // like in a chat session — the user must visit the approvals page to unblock it.
 func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision, toolName string, input []byte) bool {
+	// 一键放行只走 ask 路径:deny 在 guard 里直接拦截,不会进入这里。
+	if i.AutoAllowStatus().Enabled {
+		i.autoAllowApprove(ctx, convID, dec, toolName, input)
+		return true
+	}
 	ruleID := dec.RuleID
 	taskID, agentName := taskInfoFromCtx(ctx)
 	taskEmit := taskEmitFromCtx(ctx)

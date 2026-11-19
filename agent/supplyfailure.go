@@ -22,6 +22,7 @@ const (
 	TerminalSupplyInterrupt = "supply_interrupt"
 	TerminalTargetBlocked   = "target_blocked"
 	TerminalBudgetExhausted = "budget_exhausted"
+	TerminalLLMTransient    = "llm_transient" // 单次 LLM 墙钟超时:可重试,≠ 目标失败,≠ 供应冻结
 )
 
 // Supply signals that can be reported without treating the run as a target failure.
@@ -129,6 +130,18 @@ func SettleWorkerRun(reason harness.TerminalReason, err error) RunSettlement {
 			TaskStatus:          "",
 		}
 	}
+	if IsCallTimeout(err) {
+		// 墙钟超时可走 llmpool 转移;转移耗尽后仍不是目标失败,也不可标供应 blocked。
+		// 意图回场为 open,现场不冻结,允许后续再派发。
+		return RunSettlement{
+			IntentState:         "open",
+			TerminalKind:        TerminalLLMTransient,
+			Signal:              "call_timeout",
+			AllowRedispatch:     true,
+			TargetFailureWrites: 0,
+			TaskStatus:          "",
+		}
+	}
 	if err != nil {
 		return RunSettlement{
 			IntentState:         "blocked",
@@ -162,7 +175,7 @@ func ShouldDispatch(frozen bool) bool {
 // ApplyTargetFailure records a target/goal failure write if and only if the
 // settlement allows it. Supply interrupts always leave TargetFailureWrites at 0.
 func (s RunSettlement) ApplyTargetFailure(write func()) RunSettlement {
-	if s.SupplyFailure || s.TerminalKind == TerminalSupplyInterrupt {
+	if s.SupplyFailure || s.TerminalKind == TerminalSupplyInterrupt || s.TerminalKind == TerminalLLMTransient {
 		return s
 	}
 	if write != nil {

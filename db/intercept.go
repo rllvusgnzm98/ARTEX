@@ -171,6 +171,34 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), $9, $10) RETURNING id`,
 	return id, err
 }
 
+// CreateDecidedInterceptWithSource 与 CreateDecidedIntercept 相同,但显式写入
+// decision_source,绕过 interceptSource 的规则/原因推断。一键放行用 source=
+// "auto_allow",让历史行标明这次批准是无人值守放行,而非人工/模型/规则裁决。
+func (d *DB) CreateDecidedInterceptWithSource(ruleID, convID int64, taskID, agentName, toolName string, input []byte, status, reason, source string, audits ...*InterceptAudit) (int64, error) {
+	raw := json.RawMessage(input)
+	if len(raw) == 0 {
+		raw = json.RawMessage("{}")
+	}
+	var convIDPtr *int64
+	if convID != 0 {
+		convIDPtr = &convID
+	}
+	var taskIDPtr *string
+	if taskID != "" {
+		taskIDPtr = &taskID
+	}
+	var ruleIDPtr *int64
+	if ruleID != 0 {
+		ruleIDPtr = &ruleID
+	}
+	var id int64
+	err := d.QueryRow(`
+INSERT INTO intercept_pending(rule_id, conversation_id, task_id, agent_name, tool_name, tool_input, status, reason, decided_at, decision_source, audit)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), $9, $10) RETURNING id`,
+		ruleIDPtr, convIDPtr, taskIDPtr, agentName, toolName, raw, status, reason, source, firstAudit(audits)).Scan(&id)
+	return id, err
+}
+
 const interceptPendingCols = `id, rule_id, conversation_id, task_id, agent_name, tool_name, tool_input, status, reason, decided_at, created_at, decision_source`
 
 func scanInterceptPending(s interface{ Scan(...any) error }, p *InterceptPending) error {
