@@ -47,4 +47,4 @@ COPY skills/ /app/skills/
 VOLUME ["/app/data"]
 EXPOSE 8787 8788
 ENTRYPOINT ["/app/start.sh"]
-CMD ["-addr", ":8787", "-proxy", ":8788"]
+CMD ["-addr", ":8787", "-proxy", "127.0.0.1:8788"]

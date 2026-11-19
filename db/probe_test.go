@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"testing"
@@ -76,6 +77,84 @@ func TestProbeDoesNotCreateSchema(t *testing.T) {
 
 func pqIdent(name string) string {
 	return `"` + name + `"`
+}
+
+func TestProbeOtherQueryErrorIsNotUninitialized(t *testing.T) {
+	base := testDSN(t)
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatal("DSN 不是 URL，无法构造权限夹具（本用例在有 DSN 时必须 RAN）")
+	}
+	adminURL := *u
+	adminURL.Path = "/postgres"
+	admin, err := sql.Open("pgx", adminURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := admin.PingContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	dbName := "artex_probe_qe_" + suffix
+	role := "artex_probe_ro_" + suffix
+	// 夹具口令，不是真实秘密。
+	rolePass := "fixture_no_select"
+	if _, err := admin.ExecContext(ctx, `CREATE DATABASE `+pqIdent(dbName)); err != nil {
+		t.Fatalf("无法创建一次性探测库: %v", err)
+	}
+	if _, err := admin.ExecContext(ctx, `CREATE ROLE `+pqIdent(role)+` LOGIN PASSWORD '`+rolePass+`'`); err != nil {
+		_, _ = admin.Exec(`DROP DATABASE IF EXISTS ` + pqIdent(dbName))
+		t.Fatalf("无法创建只读角色: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = admin.Exec(`DROP DATABASE IF EXISTS ` + pqIdent(dbName))
+		_, _ = admin.Exec(`DROP ROLE IF EXISTS ` + pqIdent(role))
+	})
+
+	ownerURL := *u
+	ownerURL.Path = "/" + dbName
+	owner, err := sql.Open("pgx", ownerURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if err := owner.PingContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stmts := []string{
+		`CREATE TABLE llm_profiles (id int)`,
+		`GRANT CONNECT ON DATABASE ` + pqIdent(dbName) + ` TO ` + pqIdent(role),
+		`GRANT USAGE ON SCHEMA public TO ` + pqIdent(role),
+		`REVOKE ALL ON TABLE llm_profiles FROM PUBLIC`,
+		`REVOKE ALL ON TABLE llm_profiles FROM ` + pqIdent(role),
+	}
+	for _, s := range stmts {
+		if _, err := owner.ExecContext(ctx, s); err != nil {
+			t.Fatalf("准备权限夹具失败 (%s): %v", s, err)
+		}
+	}
+
+	ro := *u
+	ro.Path = "/" + dbName
+	ro.User = url.UserPassword(role, rolePass)
+	n, err := Probe(ro.String())
+	if err == nil {
+		t.Fatalf("权限不足时必须返回 error，不得再返回 (%d, nil) 被当成库未初始化", n)
+	}
+	var qe *ProbeQueryError
+	if !errors.As(err, &qe) {
+		t.Fatalf("其它查询错误应包装为 ProbeQueryError, got %T %v", err, err)
+	}
+	if n >= 0 {
+		t.Fatalf("查询失败时 n 应为 -1, got %d", n)
+	}
+	if isUndefinedTable(err) {
+		t.Fatal("权限错误不得被判成表不存在")
+	}
 }
 
 func TestProbeUnreachable(t *testing.T) {

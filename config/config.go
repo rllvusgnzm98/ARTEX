@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -180,18 +181,29 @@ func (d Database) buildDSN() string {
 	return u.String()
 }
 
-// String is a redacted view of the resolved DSN (password masked) for logging.
+// keywordSecret 匹配 libpq 风格键值串里的口令键（长短优先），值可加引号。
+var keywordSecret = regexp.MustCompile(`(?i)(^|[\s])((?:password|passwd|pwd|pass)=)('[^']*'|"[^"]*"|[^\s]+)`)
+
+func redactKeywordSecrets(s string) string {
+	return keywordSecret.ReplaceAllString(s, "${1}${2}****")
+}
+
+// Redact 返回供日志使用的脱敏 DSN。URL 形态（postgres://user:pass@host/db）
+// 仍按原逻辑打码 User 中的口令；url.Parse 失败或没有 User 时，再处理
+// key=value（password/passwd/pwd/pass）里的口令。
 func Redact(dsn string) string {
 	u, err := url.Parse(dsn)
-	if err != nil {
-		return dsn
+	// 无 scheme 的 key=value 串会被 url.Parse 收成 Path 并把空格编成 %20，
+	// 必须走原文打码，不能先 String()。
+	if err != nil || u.Scheme == "" {
+		return redactKeywordSecrets(dsn)
 	}
 	if u.User != nil {
 		if _, hasPw := u.User.Password(); hasPw {
 			u.User = url.UserPassword(u.User.Username(), "****")
 		}
 	}
-	return fmt.Sprintf("%s", u.String())
+	return redactKeywordSecrets(u.String())
 }
 
 // CallbackAddr resolves the platform callback address:

@@ -95,8 +95,11 @@ func DSN() (dsn, source string, err error) {
 
 // Probe 轻量只读预检（artex doctor 用）：连接 + ping，通了就顺手只读统计
 // LLM profile 数。与 Open 不同，这里不做任何迁移/seed/写操作。
-// 返回 (llmProfiles, err)：err 非 nil 是连接失败；llmProfiles < 0 表示连上了
-// 但查不到（如库还没初始化，llm_profiles 表不存在）。
+// 返回 (llmProfiles, err)：
+//   - err 非 nil：连接失败，或已连上但 count(*) 因「表不存在」以外的原因失败
+//     （如权限不足）。后者包装为 *ProbeQueryError，doctor 应说「查询/权限失败」，
+//     不得说成「库未初始化」。
+//   - err == nil 且 llmProfiles < 0：已连上，但 llm_profiles 表不存在（库未初始化）。
 func Probe(dsn string) (int, error) {
 	sqlDB, err := sql.Open("pgx", dsn)
 	if err != nil {
@@ -110,9 +113,36 @@ func Probe(dsn string) (int, error) {
 	}
 	var n int
 	if err := sqlDB.QueryRowContext(ctx, `SELECT count(*) FROM llm_profiles`).Scan(&n); err != nil {
-		return -1, nil
+		if isUndefinedTable(err) {
+			return -1, nil
+		}
+		return -1, &ProbeQueryError{Err: err}
 	}
 	return n, nil
+}
+
+const pgUndefinedTable = "42P01"
+
+func isUndefinedTable(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == pgUndefinedTable
+}
+
+// ProbeQueryError 表示 Probe 已 ping 成功，但只读 count(*) 失败，且不是表不存在。
+type ProbeQueryError struct{ Err error }
+
+func (e *ProbeQueryError) Error() string {
+	if e == nil || e.Err == nil {
+		return "查询/权限失败"
+	}
+	return "查询/权限失败: " + e.Err.Error()
+}
+
+func (e *ProbeQueryError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
 }
 
 // DB wraps the shared *sql.DB. PG handles its own connection pool + concurrency
