@@ -229,3 +229,40 @@ func TestPreToolUseAllowOnlyAfterAllGates(t *testing.T) {
 		t.Fatalf("全部闸门通过后应恰好一条空 reason allow, got %+v", ok.Audit())
 	}
 }
+
+func TestRoEUsesExtractedShellHintHosts(t *testing.T) {
+	// 新 CLI 抽出的 host 仍走既有 warn/strict 语义;不改 roeAsk/一键放行路径。
+	strict := roeGuard("strict", []ScopeRule{{Kind: "domain", Value: "target.com"}})
+	for _, cmd := range []string{
+		`ffuf -u https://evil.com/FUZZ -w /tmp/words.txt`,
+		`gobuster dns -d evil.com`,
+		`nuclei -u evil.com`,
+		`nxc smb 10.0.0.7`,
+		`impacket-psexec user@evil.com`,
+	} {
+		if blocked, _ := bashBlocked(t, strict, cmd); !blocked {
+			t.Errorf("strict 应对抽出的范围外 host 拦截: %q", cmd)
+		}
+	}
+	if blocked, _ := bashBlocked(t, strict, `ffuf -u https://api.target.com/FUZZ`); blocked {
+		t.Error("strict 下范围内目标不应拦截")
+	}
+	// CIDR 字面量仍不提取 → 无目标 → 不拦截(既有保守语义)。
+	if blocked, _ := bashBlocked(t, strict, `nxc smb 192.168.1.0/24`); blocked {
+		t.Error("CIDR 字面量不提取时不应按范围外拦截")
+	}
+
+	warn := roeGuard("warn", []ScopeRule{{Kind: "domain", Value: "target.com"}})
+	if blocked, _ := bashBlocked(t, warn, `katana -u https://evil.com`); blocked {
+		t.Fatal("warn 模式应放行")
+	}
+	var found bool
+	for _, e := range warn.Audit() {
+		if e.Action == "allow" && strings.Contains(e.Reason, "RoE") && strings.Contains(e.Reason, "evil.com") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("warn 放行应写 RoE 审计(含抽出的 host), got %+v", warn.Audit())
+	}
+}
