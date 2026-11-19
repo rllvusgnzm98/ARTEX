@@ -85,6 +85,10 @@ type Worker struct {
 	// maxTokensFn resolves the per-reply output cap in tokens, on the same
 	// per-run basis. nil or 0 = send no cap and let the endpoint decide.
 	maxTokensFn func() int
+	// intranetFn resolves whether a task is in its intranet phase (存在存活立足点
+	// 会话)。为 true 时 worker 系统提示追加 worker.intranet 短纪律变体。
+	// 每次 run 现查,会话状态变化即时生效;nil = 外网(默认)。
+	intranetFn func(taskID int64) bool
 }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
@@ -132,6 +136,15 @@ func (w *Worker) maxTokens() int {
 		return 0
 	}
 	return w.maxTokensFn()
+}
+
+// SetIntranetResolver wires a resolver deciding whether a task runs in its
+// intranet phase (追加 worker.intranet 短纪律变体)。nil/unset = 外网(默认)。
+// 每次 run 现查,与 nonStreaming 一样不缓存。
+func (w *Worker) SetIntranetResolver(fn func(taskID int64) bool) { w.intranetFn = fn }
+
+func (w *Worker) intranetForTask(taskID int64) bool {
+	return w.intranetFn != nil && w.intranetFn(taskID)
 }
 
 // SetConstraintInject wires a resolver deciding whether this task's operation
@@ -247,6 +260,20 @@ const workerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 
 **止损（安全上限不是默认停法）**：单次 run_seconds（默认 20 分钟）只是墙钟安全上限，不是到点才停的策略。若连续探测没有新事实也没有新资产，或重复同一命令，执行层会提前止损并让出槽位；不要把这次止损写成目标失败。`
 
+// workerIntranetDiscipline 是内网期追加进 worker 正文的短纪律段落(可编辑变体
+// "worker.intranet")。只追加,不替换 worker 默认正文,也不覆盖进场预塞。
+// 不把 pending_scope 写成出界动作的硬门闩,也不提隧道四件套(本刀不移植)。
+const workerIntranetDiscipline = `**内网期纪律**(本任务已有存活立足点会话,处于内网横向阶段):
+- **被动优先**:新方向先用 session_recon 只读命令包(网卡/路由/邻居/hosts/监听)拿信息,被动不够再考虑主动探测。
+- **新网段进扩展队列**:出当前 task_scope 的 IP 可以已经写入资产图,并按 /24 记入 pending_scope。pending_scope 是官方的 task_scope 扩展队列:人工 approve 后写入 task_scope;它不是对出界动作的硬门闩,不要把资产写回或后续动作卡在「批准之前」。
+- **下一跳要挂边或锚**:从已确认的侦察事实开下一跳时,必须经 add_intent 带上 parent_ids(该 fact,形成 derived_from)或对应资产的 asset_ids。既无边也无锚的新意图,进场预塞看不到这些已确认事实。
+- **动静控制**:经会话执行的命令注意目标侧日志/进程/网络留痕,避免大批量高噪声动作。`
+
+// workerIntranetRules 是内网期的代码固定尾(不可被 DB 变体正文覆盖)。
+const workerIntranetRules = `
+
+**内网红线(不可编辑)**:被动侦察优先;pending_scope 是 task_scope 扩展队列而非出界硬门闩(出界 IP 可能已在资产图中);从已确认侦察事实开下一跳必须挂 derived_from 或对应资产锚,否则进场预塞读不到这些事实;注意动静控制。`
+
 // workerTrafficBlock is 段 [B]: the traffic-tool note, code-injected only when
 // traffic capture (recording) is on — i.e. the traffic_* tools actually exist.
 // Gated on recording, NOT on the egress proxy: a global proxy with capture off
@@ -290,12 +317,19 @@ func ensureRunDir(base string, taskID, intentID int64) string {
 // cmdOutDir is the SDK large-tool-output spill dir under an agent's run dir.
 func cmdOutDir(dir string) string { return filepath.Join(dir, "cmd-output") }
 
-func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
-	body := renderSystem("worker", workerDefaultTmpl, WorkerVars{ProxyAddr: proxyAddr, DataDir: dataDir, Now: nowStr()})
+func workerSystem(proxyAddr, caCert, dataDir, runDir string, intranet bool) string {
+	vars := WorkerVars{ProxyAddr: proxyAddr, DataDir: dataDir, Now: nowStr(), Intranet: intranet}
+	body := renderSystem("worker", workerDefaultTmpl, vars)
+	tail := ""
+	if intranet {
+		// APPEND-ONLY:变体与代码固定红线尾只接到 worker 正文之后,不替换主正文,
+		// 也不触碰 execute() 里稍后追加的 RenderWorkerEntrySeed 进场预塞。
+		tail = "\n\n" + renderSystemVariant("worker", "intranet", workerIntranetDiscipline, vars) + workerIntranetRules
+	}
 	// caCert is present only when the recording MITM is on, which is exactly when
 	// the traffic_* tools are registered — so it gates the traffic-tool note.
 	// Optional finding guidance is added for every role after tool resolution.
-	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir)
+	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir) + tail
 }
 
 // renderIntentTask formats the claimed intent for the worker's launch USER message:
@@ -398,7 +432,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
 	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
-	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
+	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir, w.intranetForTask(taskID))
 	if w.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
 	}
