@@ -84,7 +84,8 @@ func IsSideEffectTool(name string) bool {
 	case "Bash", "Write", "Edit", "MultiEdit", "WebFetch", "web_search",
 		"record_fact", "report_finding", "insert_assets", "add_finding",
 		"add_company_scope", "add_task_scope", "set_goals", "set_constraints",
-		"prove_goal", "goal_met", "register_session", "session_recon":
+		"prove_goal", "goal_met", "register_session", "session_recon",
+		"tunnel_deploy":
 		return true
 	default:
 		return false

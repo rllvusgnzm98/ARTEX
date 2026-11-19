@@ -42,6 +42,10 @@ func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	tools = append(tools, s.findingRetestTools()...)
 	tools = append(tools, s.platformTools()...) // 平台操作工具(建改 skill/工具/MCP，给 Auto 用)
 	tools = append(tools, s.sessionTools()...)  // 立足点：register_session / session_recon
+	tools = append(tools, s.tunnelTools()...)   // 隧道：list/probe/deploy/teardown
+	if t := s.stageShareTool(); t != nil {
+		tools = append(tools, t)
+	}
 	custom, err := s.customTools()
 	if err != nil {
 		log.Printf("[custom-tool] 加载失败: %v", err)

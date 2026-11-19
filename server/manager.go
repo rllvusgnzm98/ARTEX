@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -15,11 +16,13 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/config"
 	pgdb "github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/enrich"
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/traffic"
+	"github.com/Autumn-27/artex/tunnel"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -245,6 +248,10 @@ type Manager struct {
 	// capture is on it becomes the MITM's upstream; when capture is off it is
 	// injected into agent bash env / WebFetch directly. See ProxyAddr.
 	globalProxy string
+
+	// taskProxy 按任务 MITM 实例管理器（见 taskproxy.go）；nil = 关闭。
+	// 不得用进程级 SetUpstream 让任务互相踩踏上游。
+	taskProxy *taskProxyManager
 }
 
 // Settings keys the UI toggles at runtime.
@@ -440,6 +447,14 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		}
 	}
 	m.enrich = enrich.New(m.assets, m.ProxyAddr, 4)
+	// 按任务懒建 MITM。ARTEX_TASK_PROXY=off 关闭；端口池 ARTEX_TASK_PROXY_PORT_RANGE。
+	if config.TaskProxyEnabled() {
+		if pmin, pmax, err := tunnel.ParsePortRange(config.TaskProxyPortRange()); err != nil {
+			log.Printf("[taskproxy] 端口池非法,按任务 MITM 关闭: %v", err)
+		} else {
+			m.taskProxy = newTaskProxyManager(dir, pgdb.NewTunnelStore(pg), m.GlobalProxy, pmin, pmax)
+		}
+	}
 	// Reconcile the seeded browser MCP with the persisted capture state, so a
 	// restart with capture already on keeps Playwright routed through the proxy.
 	m.syncBrowserMCPProxy()
@@ -795,6 +810,12 @@ func (m *Manager) SetGlobalProxy(raw string) error {
 			return err
 		}
 	}
+	// 无隧道任务的 MITM 实例以全局代理为回落上游——全局代理变了它们一起换。
+	if m.taskProxy != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		m.taskProxy.RefreshAll(ctx)
+		cancel()
+	}
 	// Keep the browser MCP's egress in sync with the new global proxy too.
 	m.syncBrowserMCPProxy()
 	return nil
@@ -803,10 +824,44 @@ func (m *Manager) SetGlobalProxy(raw string) error {
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.taskProxy != nil {
+		m.taskProxy.Close()
+	}
 	if m.traffic != nil {
 		m.traffic.Close()
 	}
 	return m.pg.Close()
+}
+
+// TaskProxyForTask is the worker's per-task proxy resolver: when capture is on
+// and the feature is enabled it lazily builds/returns the task's own MITM
+// instance (addr + CA); "" → the worker falls back to the global SetProxy value.
+func (m *Manager) TaskProxyForTask(taskID int64) (addr, caCert string) {
+	if m.taskProxy == nil || !m.TrafficEnabled() {
+		return "", ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return m.taskProxy.ForTask(ctx, taskID)
+}
+
+// RefreshTaskProxy re-resolves one task's MITM upstream after a tunnel state
+// change. No-op when the feature is off or the task has no live instance.
+func (m *Manager) RefreshTaskProxy(taskID int64) {
+	if m.taskProxy == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	m.taskProxy.Refresh(ctx, taskID)
+}
+
+// CloseTaskProxy destroys a task's MITM instance (task deleted/archived).
+// The recorded tree (incl. CA dir) stays on disk.
+func (m *Manager) CloseTaskProxy(taskID int64) {
+	if m.taskProxy != nil {
+		m.taskProxy.CloseTask(taskID)
+	}
 }
 
 // isTerminalStatus reports whether a task status is terminal (done/failed/timeout).

@@ -288,6 +288,13 @@ func (e *Engine) StopTask(taskID string) {
 	e.deleteMu.Lock()
 	e.deleting.Delete(taskID)
 	e.deleteMu.Unlock()
+
+	// 任务删除/归档连带销毁其 MITM 实例（端口注销；CA/录制树保留）。
+	if e.m != nil {
+		if id, err := strconv.ParseInt(taskID, 10, 64); err == nil {
+			e.m.CloseTaskProxy(id)
+		}
+	}
 }
 
 // cancelExec cancels a task's current per-task exec context (any in-flight

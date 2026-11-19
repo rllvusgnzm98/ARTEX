@@ -97,3 +97,46 @@ func TestTaskIntranetLiveSessionOnly(t *testing.T) {
 		t.Fatal("本任务存活立足点会话应切内网变体")
 	}
 }
+
+type fakeTunnelLiveLister struct {
+	recs []*db.TunnelRecord
+	err  error
+}
+
+func (f *fakeTunnelLiveLister) ListByTask(context.Context, int64) ([]*db.TunnelRecord, error) {
+	return f.recs, f.err
+}
+
+func TestHasLiveTaskTunnelNilSafe(t *testing.T) {
+	if hasLiveTaskTunnel(nil, errors.New("list failed")) {
+		t.Fatal("查找失败不得误切内网变体")
+	}
+	if hasLiveTaskTunnel(nil, nil) {
+		t.Fatal("无记录应为外网")
+	}
+	if hasLiveTaskTunnel([]*db.TunnelRecord{{TaskID: 1, State: db.TunnelStopped}}, nil) {
+		t.Fatal("stopped 隧道不得切内网变体")
+	}
+	if !hasLiveTaskTunnel([]*db.TunnelRecord{{TaskID: 1, State: db.TunnelAlive}}, nil) {
+		t.Fatal("存活隧道应切内网变体")
+	}
+}
+
+func TestTaskIntranetLiveTunnelSwitchesAndLookupFailureStaysExternal(t *testing.T) {
+	s := &Server{ctx: context.Background()}
+	if s.taskIntranet(9) {
+		t.Fatal("无台账时应保持外网")
+	}
+	s.tunnelLive = &fakeTunnelLiveLister{err: errors.New("lookup failed")}
+	if s.taskIntranet(9) {
+		t.Fatal("台账查找失败必须保持外网变体")
+	}
+	s.tunnelLive = &fakeTunnelLiveLister{recs: []*db.TunnelRecord{{TaskID: 9, State: db.TunnelError}}}
+	if s.taskIntranet(9) {
+		t.Fatal("非 alive 隧道不得切内网变体")
+	}
+	s.tunnelLive = &fakeTunnelLiveLister{recs: []*db.TunnelRecord{{TaskID: 9, State: db.TunnelAlive}}}
+	if !s.taskIntranet(9) {
+		t.Fatal("本任务存活隧道应切内网变体")
+	}
+}

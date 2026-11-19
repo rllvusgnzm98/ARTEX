@@ -79,6 +79,7 @@ import type {
   Settings,
   Severity,
   ShellSession,
+  TunnelRecord,
   SkillCall,
   SkillItem,
   SSProject,
@@ -1343,4 +1344,8 @@ export const api = {
     post<SessionReadResult>(`/sessions/${encodeURIComponent(String(id))}/read`, { path }),
   probeSession: (id: string | number) =>
     post<{ alive: boolean; ms?: number; error?: string }>(`/sessions/${encodeURIComponent(String(id))}/probe`),
+  tunnels: (taskId?: string) =>
+    get<{ items: TunnelRecord[] }>(`/tunnels${taskQuery(taskId)}`).then((r) => arr(r.items)),
+  teardownTunnel: (id: string | number) =>
+    post<{ tunnel_id: number; state: string }>(`/tunnels/${encodeURIComponent(String(id))}/teardown`),
 };
