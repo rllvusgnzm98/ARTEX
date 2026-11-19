@@ -169,20 +169,34 @@ func (s *CredentialStore) scan(row interface{ Scan(...any) error }) (*Credential
 	return &r, nil
 }
 
-// appendListed 把一行加入列表。单行解密失败则跳过并只记 credential id，
-// 不中断整个列表，也不把 secret/密文/口令写入日志。扫描错误仍返回。
-func (s *CredentialStore) appendListed(out []*CredentialRecord, row interface{ Scan(...any) error }) ([]*CredentialRecord, error) {
+// CredentialList 是列表结果。Items 只含解密成功的记录（含明文 Secret，
+// 调用方出接口前必须再走 PublicCredential / PublicCredentials 脱敏）；
+// Skipped 是解密失败的 id，不含 secret/密文，供调用方看见被跳过的行。
+type CredentialList struct {
+	Items   []*CredentialRecord
+	Skipped []int64
+}
+
+// appendListed 把一行加入列表。单行解密失败则记入 Skipped 并只在日志里写
+// credential id，不中断整个列表，也不把 secret/密文/口令写入日志。扫描错误仍返回。
+func (s *CredentialStore) appendListed(list CredentialList, row interface{ Scan(...any) error }) (CredentialList, error) {
 	r, enc, err := s.scanMeta(row)
 	if err != nil {
-		return out, err
+		return list, err
 	}
 	plain, err := s.decrypt(enc)
 	if err != nil {
 		log.Printf("[credentials] skip credential %d: decrypt failed", r.ID)
-		return out, nil
+		list.Skipped = append(list.Skipped, r.ID)
+		return list, nil
 	}
 	r.Secret = plain
-	return append(out, &r), nil
+	list.Items = append(list.Items, &r)
+	return list, nil
+}
+
+func emptyCredentialList() CredentialList {
+	return CredentialList{Items: []*CredentialRecord{}, Skipped: []int64{}}
 }
 
 // Get 取一条（含解密 secret）；不存在返回 (nil, nil)。
@@ -195,42 +209,43 @@ func (s *CredentialStore) Get(ctx context.Context, id int64) (*CredentialRecord,
 	return r, err
 }
 
-// ListByTask 取一个任务的全部凭据（按 id 升序，含解密 secret）。
-func (s *CredentialStore) ListByTask(ctx context.Context, taskID int64) ([]*CredentialRecord, error) {
+// ListByTask 取一个任务的凭据（按 id 升序）。可解行在 Items（含解密 secret）；
+// 单行解密失败记入 Skipped（只含 id），不让整个列表失败。
+func (s *CredentialStore) ListByTask(ctx context.Context, taskID int64) (CredentialList, error) {
 	rows, err := s.d.QueryContext(ctx,
 		`SELECT `+credentialCols+` FROM credentials WHERE task_id=$1 ORDER BY id`, taskID)
 	if err != nil {
-		return nil, err
+		return emptyCredentialList(), err
 	}
 	defer rows.Close()
-	out := []*CredentialRecord{}
+	list := emptyCredentialList()
 	for rows.Next() {
-		out, err = s.appendListed(out, rows)
+		list, err = s.appendListed(list, rows)
 		if err != nil {
-			return nil, err
+			return emptyCredentialList(), err
 		}
 	}
-	return out, rows.Err()
+	return list, rows.Err()
 }
 
-// ListAll 取全部凭据（按 id 升序，含解密 secret）——控制台跨任务视图用。
-// 调用方必须走 PublicCredential 脱敏，secret 不明文出接口。
-// 单行解密失败（例如 jwt.key 已轮换）跳过该行，不让整表列表失败。
-func (s *CredentialStore) ListAll(ctx context.Context) ([]*CredentialRecord, error) {
+// ListAll 取全部凭据（按 id 升序）——控制台跨任务视图用。
+// 调用方必须走 PublicCredential / PublicCredentials 脱敏，secret 不明文出接口。
+// 单行解密失败（例如 jwt.key 已轮换）记入 Skipped，不让整表列表失败。
+func (s *CredentialStore) ListAll(ctx context.Context) (CredentialList, error) {
 	rows, err := s.d.QueryContext(ctx,
 		`SELECT `+credentialCols+` FROM credentials ORDER BY id`)
 	if err != nil {
-		return nil, err
+		return emptyCredentialList(), err
 	}
 	defer rows.Close()
-	out := []*CredentialRecord{}
+	list := emptyCredentialList()
 	for rows.Next() {
-		out, err = s.appendListed(out, rows)
+		list, err = s.appendListed(list, rows)
 		if err != nil {
-			return nil, err
+			return emptyCredentialList(), err
 		}
 	}
-	return out, rows.Err()
+	return list, rows.Err()
 }
 
 // SetVerified 标记凭据是否已实测可登录（复用打分的 verified 加分依赖它）。
@@ -271,6 +286,32 @@ func PublicCredential(c *CredentialRecord) map[string]any {
 		"host_asset_id": c.HostAssetID,
 		"created_at":    c.CreatedAt,
 	}
+}
+
+// CredentialStatusUndecryptable 是列表占位行的状态：该行存在但当前密钥无法解密。
+const CredentialStatusUndecryptable = "undecryptable"
+
+// PublicUndecryptable 是无法解密行的对外占位，只含 id 和 status，不含 secret/密文/口令。
+func PublicUndecryptable(id int64) map[string]any {
+	return map[string]any{"id": id, "status": CredentialStatusUndecryptable}
+}
+
+// PublicCredentials 把列表转成控制台/API 项（按 id 升序交错）：可解行脱敏，
+// 无法解密的行只含 id 与 status=undecryptable。skipped 等于无法解密的行数。
+func PublicCredentials(list CredentialList) (items []map[string]any, skipped int) {
+	items = []map[string]any{}
+	skipped = len(list.Skipped)
+	i, j := 0, 0
+	for i < len(list.Items) || j < len(list.Skipped) {
+		if j < len(list.Skipped) && (i >= len(list.Items) || list.Skipped[j] < list.Items[i].ID) {
+			items = append(items, PublicUndecryptable(list.Skipped[j]))
+			j++
+			continue
+		}
+		items = append(items, PublicCredential(list.Items[i]))
+		i++
+	}
+	return items, skipped
 }
 
 // CredentialReuseFields 是工人复用路径下发给该任务工具结果的必要字段（可含明文

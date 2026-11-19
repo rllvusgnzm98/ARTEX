@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -14,6 +17,59 @@ import (
 )
 
 const credFixturePass = "fixture-pass"
+
+// doListCredentials 解析 GET /api/credentials 响应，校验 200 且含 skipped 计数。
+func doListCredentials(t *testing.T, h http.HandlerFunc, url string) (items []any, skipped int, raw []byte) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, url, nil)
+	w := httptest.NewRecorder()
+	h(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET %s 状态码 = %d, body = %q", url, w.Code, w.Body.String())
+	}
+	raw = w.Body.Bytes()
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("响应 JSON 解析失败: %v (%q)", err, raw)
+	}
+	items, _ = body["items"].([]any)
+	switch v := body["skipped"].(type) {
+	case float64:
+		skipped = int(v)
+	default:
+		t.Fatalf("响应必须含数字 skipped, got %#v body=%s", body["skipped"], raw)
+	}
+	return items, skipped, raw
+}
+
+func assertNoSecretMaterial(t *testing.T, raw []byte, logs string) {
+	t.Helper()
+	blob := string(raw) + "\n" + logs
+	for _, needle := range []string{credFixturePass, "fixture-other-key", "gcm1:"} {
+		if strings.Contains(blob, needle) {
+			t.Fatalf("响应或日志不得含明文 secret/密文: needle=%q body=%s logs=%s", needle, raw, logs)
+		}
+	}
+}
+
+func assertUndecryptablePlaceholder(t *testing.T, m map[string]any, wantID int64, raw []byte) {
+	t.Helper()
+	if m["status"] != db.CredentialStatusUndecryptable {
+		t.Fatalf("坏行应为 status=%s 占位: %#v body=%s", db.CredentialStatusUndecryptable, m, raw)
+	}
+	for _, k := range []string{"secret", "secret_masked", "username", "cred_type", "domain", "source", "task_id"} {
+		if _, ok := m[k]; ok {
+			t.Fatalf("占位不得含 %s 或其他凭据字段: %#v", k, m)
+		}
+	}
+	if len(m) != 2 {
+		t.Fatalf("占位只含 id 和 status: %#v", m)
+	}
+	id, _ := m["id"].(float64)
+	if int64(id) != wantID {
+		t.Fatalf("占位 id 不匹配: %#v want %d", m, wantID)
+	}
+}
 
 func TestIntranetListCredentialsRedactsSecret(t *testing.T) {
 	pg := openIntranetTestDB(t)
@@ -161,12 +217,14 @@ func TestIntranetListCredentialsSkipsUndecryptable(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = other.Delete(context.Background(), bid) })
 
-	all := doListItems(t, s.intranetListCredentials, "/api/credentials")
+	var logBuf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(prev)
+
+	all, skipped, raw := doListCredentials(t, s.intranetListCredentials, "/api/credentials")
+	assertNoSecretMaterial(t, raw, logBuf.String())
 	var foundGood, foundBad bool
-	raw, _ := json.Marshal(all)
-	if strings.Contains(string(raw), credFixturePass) || strings.Contains(string(raw), "fixture-other-key") {
-		t.Fatalf("列表不得含明文 secret: %s", raw)
-	}
 	for _, it := range all {
 		m, _ := it.(map[string]any)
 		id, _ := m["id"].(float64)
@@ -178,29 +236,42 @@ func TestIntranetListCredentialsSkipsUndecryptable(t *testing.T) {
 			if m["secret_masked"] == nil || m["secret_masked"] == credFixturePass {
 				t.Fatalf("可解行应含脱敏字段: %#v", m)
 			}
+			if m["status"] != nil {
+				t.Fatalf("可解行不应带 undecryptable 状态: %#v", m)
+			}
 		}
 		if int64(id) == bid {
 			foundBad = true
+			assertUndecryptablePlaceholder(t, m, bid, raw)
 		}
 	}
 	if !foundGood {
 		t.Fatalf("GET /api/credentials 应含可解行, body=%s", raw)
 	}
-	if foundBad {
-		t.Fatal("无法解密的行不得出现在列表中")
+	if !foundBad {
+		t.Fatalf("无法解密的行应以占位出现在 items 中, body=%s", raw)
+	}
+	if skipped != 1 {
+		t.Fatalf("顶层 skipped 应对调用方可见且为 1, got %d body=%s", skipped, raw)
+	}
+	if !strings.Contains(logBuf.String(), "skip credential") || !strings.Contains(logBuf.String(), strconv.FormatInt(bid, 10)) {
+		t.Fatalf("日志应只记无法解密的 credential id: %s", logBuf.String())
 	}
 
-	byTask := doListItems(t, s.intranetListCredentials, "/api/credentials?task_id=980041")
-	if len(byTask) != 1 {
-		t.Fatalf("按 task 过滤应只返回可解行: %v", byTask)
+	byTask, bySkipped, taskRaw := doListCredentials(t, s.intranetListCredentials, "/api/credentials?task_id=980041")
+	if len(byTask) != 1 || bySkipped != 0 {
+		t.Fatalf("按 task 过滤应只返回可解行且 skipped=0: items=%v skipped=%d", byTask, bySkipped)
 	}
-	taskRaw, _ := json.Marshal(byTask)
-	if strings.Contains(string(taskRaw), credFixturePass) {
-		t.Fatalf("按 task 过滤不得含明文: %s", taskRaw)
-	}
+	assertNoSecretMaterial(t, taskRaw, "")
 
-	skipped := doListItems(t, s.intranetListCredentials, "/api/credentials?task_id=980042")
-	if len(skipped) != 0 {
-		t.Fatalf("仅有不可解行的任务应返回空列表而非 500: %v", skipped)
+	onlyBad, onlySkipped, onlyRaw := doListCredentials(t, s.intranetListCredentials, "/api/credentials?task_id=980042")
+	if onlySkipped != 1 {
+		t.Fatalf("仅有不可解行的任务应 200 且 skipped=1, got %d body=%s", onlySkipped, onlyRaw)
 	}
+	if len(onlyBad) != 1 {
+		t.Fatalf("仅有不可解行的任务 items 应有一条占位: %v", onlyBad)
+	}
+	m, _ := onlyBad[0].(map[string]any)
+	assertUndecryptablePlaceholder(t, m, bid, onlyRaw)
+	assertNoSecretMaterial(t, onlyRaw, logBuf.String())
 }

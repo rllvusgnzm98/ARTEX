@@ -187,8 +187,11 @@ func TestCredentialStoreCRUD(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Delete(context.Background(), oid) })
 	list, err := store.ListByTask(ctx, 999999001)
-	if err != nil || len(list) != 1 || list[0].ID != id {
-		t.Fatalf("ListByTask = %v, %v", list, err)
+	if err != nil || len(list.Items) != 1 || list.Items[0].ID != id {
+		t.Fatalf("ListByTask = %+v, %v", list, err)
+	}
+	if len(list.Skipped) != 0 {
+		t.Fatalf("可解列表不应 skipped: %+v", list.Skipped)
 	}
 	// 函数体内删除第二行，避免只靠 Cleanup（若 Close 过早会删失败并留行）。
 	if err := store.Delete(ctx, oid); err != nil {
@@ -247,7 +250,7 @@ func TestListSkipsUndecryptableRows(t *testing.T) {
 		t.Fatalf("ListAll 不得因单行解密失败而失败: %v", err)
 	}
 	foundGood, foundBad := false, false
-	for _, r := range all {
+	for _, r := range all.Items {
 		if r.ID == gid {
 			foundGood = true
 			if r.Secret != fixturePass {
@@ -262,15 +265,21 @@ func TestListSkipsUndecryptableRows(t *testing.T) {
 		t.Fatal("ListAll 应含可解行")
 	}
 	if foundBad {
-		t.Fatal("ListAll 不得返回无法解密的行")
+		t.Fatal("ListAll.Items 不得含无法解密的行（不得带回 secret）")
+	}
+	if len(all.Skipped) != 1 || all.Skipped[0] != bid {
+		t.Fatalf("ListAll.Skipped 应对调用方暴露无法解密的 id, got %+v", all.Skipped)
 	}
 
 	same, err := good.ListByTask(ctx, 999999012)
 	if err != nil {
 		t.Fatalf("ListByTask 不得因单行解密失败而失败: %v", err)
 	}
-	if len(same) != 0 {
-		t.Fatalf("不可解任务列表应跳过该行: %+v", same)
+	if len(same.Items) != 0 {
+		t.Fatalf("不可解任务列表 Items 应跳过该行: %+v", same.Items)
+	}
+	if len(same.Skipped) != 1 || same.Skipped[0] != bid {
+		t.Fatalf("ListByTask.Skipped 应对调用方暴露无法解密的 id, got %+v", same.Skipped)
 	}
 
 	logs := buf.String()

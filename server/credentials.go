@@ -109,15 +109,16 @@ func (s *Server) listCredentialsTool() actool.CoreTool {
 			if ri.TaskID <= 0 {
 				return actool.Errorf("list_credentials 需要任务上下文"), nil
 			}
-			creds, err := s.credStore.ListByTask(ctx, ri.TaskID)
+			listed, err := s.credStore.ListByTask(ctx, ri.TaskID)
 			if err != nil {
 				return actool.Errorf("读取凭据失败:" + err.Error()), nil
 			}
-			items := []map[string]any{}
-			for _, c := range creds {
-				items = append(items, db.PublicCredential(c))
-			}
-			return jsonResult(map[string]any{"credentials": items, "count": len(items)})
+			items, skipped := db.PublicCredentials(listed)
+			return jsonResult(map[string]any{
+				"credentials": items,
+				"count":       len(listed.Items),
+				"skipped":     skipped,
+			})
 		},
 	})
 }
@@ -139,10 +140,11 @@ func (s *Server) credentialReusePlanTool() actool.CoreTool {
 			if ri.TaskID <= 0 {
 				return actool.Errorf("credential_reuse_plan 需要任务上下文"), nil
 			}
-			creds, err := s.credStore.ListByTask(ctx, ri.TaskID)
+			listed, err := s.credStore.ListByTask(ctx, ri.TaskID)
 			if err != nil {
 				return actool.Errorf("读取凭据失败:" + err.Error()), nil
 			}
+			creds := listed.Items
 			if len(creds) == 0 {
 				return actool.Text("本任务还没有登记凭据(add_credential 先登记),无复用建议"), nil
 			}
@@ -241,20 +243,17 @@ func (s *Server) intranetListCredentials(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	var creds []*db.CredentialRecord
+	var listed db.CredentialList
 	var err error
 	if taskID > 0 {
-		creds, err = s.credStore.ListByTask(r.Context(), taskID)
+		listed, err = s.credStore.ListByTask(r.Context(), taskID)
 	} else {
-		creds, err = s.credStore.ListAll(r.Context())
+		listed, err = s.credStore.ListAll(r.Context())
 	}
 	if err != nil {
 		writeErr(w, 500, "凭据读取失败: "+err.Error())
 		return
 	}
-	items := []map[string]any{}
-	for _, c := range creds {
-		items = append(items, db.PublicCredential(c))
-	}
-	writeJSON(w, 200, map[string]any{"items": items})
+	items, skipped := db.PublicCredentials(listed)
+	writeJSON(w, 200, map[string]any{"items": items, "skipped": skipped})
 }
