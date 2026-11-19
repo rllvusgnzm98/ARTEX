@@ -1706,3 +1706,17 @@ export interface PendingScopeRow {
   last_seen: string;
   decided_at?: string;
 }
+
+/** GET /api/credentials 的脱敏行。不含明文 secret。 */
+export interface Credential {
+  id: number | string;
+  task_id?: number;
+  username?: string;
+  cred_type: string;
+  secret_masked?: string;
+  domain?: string;
+  source?: string;
+  verified?: boolean;
+  host_asset_id?: number;
+  created_at?: string;
+}

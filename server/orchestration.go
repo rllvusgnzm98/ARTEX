@@ -40,9 +40,10 @@ func jsonResult(v any) (actool.Result, error) {
 func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	tools := append(s.m.HostTools(), s.orchestrationTools()...)
 	tools = append(tools, s.findingRetestTools()...)
-	tools = append(tools, s.platformTools()...) // 平台操作工具(建改 skill/工具/MCP，给 Auto 用)
-	tools = append(tools, s.sessionTools()...)  // 立足点：register_session / session_recon
-	tools = append(tools, s.tunnelTools()...)   // 隧道：list/probe/deploy/teardown
+	tools = append(tools, s.platformTools()...)   // 平台操作工具(建改 skill/工具/MCP，给 Auto 用)
+	tools = append(tools, s.sessionTools()...)    // 立足点：register_session / session_recon
+	tools = append(tools, s.tunnelTools()...)     // 隧道：list/probe/deploy/teardown
+	tools = append(tools, s.credentialTools()...) // 凭据：add/list/reuse_plan
 	if t := s.stageShareTool(); t != nil {
 		tools = append(tools, t)
 	}

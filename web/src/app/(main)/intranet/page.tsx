@@ -8,17 +8,20 @@ import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-import type { IntranetTopology, ShellSession, Task } from "@/lib/types";
+import type { Credential, IntranetTopology, ShellSession, Task } from "@/lib/types";
 
 import { type HostFilter, SessionsTab } from "./_components/sessions-tab";
+import { CredsTab } from "./_components/creds-tab";
 import { PendingScopeTab } from "./_components/pending-scope-tab";
 import { TopologyGraph } from "./_components/topology-graph";
 
 export default function IntranetPage() {
   const [topology, setTopology] = React.useState<IntranetTopology | null>(null);
   const [sessions, setSessions] = React.useState<ShellSession[]>([]);
+  const [credentials, setCredentials] = React.useState<Credential[]>([]);
   const [loadingTopology, setLoadingTopology] = React.useState(true);
   const [loadingSessions, setLoadingSessions] = React.useState(true);
+  const [loadingCreds, setLoadingCreds] = React.useState(true);
   const [hostFilter, setHostFilter] = React.useState<HostFilter | null>(null);
   const [taskId, setTaskId] = React.useState("all");
   const [tasks, setTasks] = React.useState<Task[]>([]);
@@ -65,10 +68,32 @@ export default function IntranetPage() {
     [taskParam],
   );
 
+  const credSigRef = React.useRef("");
+  const loadCredentials = React.useCallback(
+    (initial = false) => {
+      if (initial) setLoadingCreds(true);
+      api
+        .credentials(taskParam)
+        .then((items) => {
+          const sig = JSON.stringify(items);
+          if (sig !== credSigRef.current) {
+            credSigRef.current = sig;
+            setCredentials(items);
+          }
+        })
+        .catch(() => {
+          /* 保留上一次数据 */
+        })
+        .finally(() => initial && setLoadingCreds(false));
+    },
+    [taskParam],
+  );
+
   React.useEffect(() => {
     loadTopology();
     loadSessions(true);
-  }, [loadTopology, loadSessions]);
+    loadCredentials(true);
+  }, [loadTopology, loadSessions, loadCredentials]);
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-4 p-4">
@@ -94,9 +119,10 @@ export default function IntranetPage() {
           onClick={() => {
             loadTopology();
             loadSessions(true);
+            loadCredentials(true);
           }}
         >
-          {loadingTopology || loadingSessions ? (
+          {loadingTopology || loadingSessions || loadingCreds ? (
             <Loader2Icon className="size-4 animate-spin" />
           ) : (
             <RefreshCwIcon className="size-4" />
@@ -117,6 +143,7 @@ export default function IntranetPage() {
       <Tabs defaultValue="sessions" className="flex min-h-0 flex-1 flex-col">
         <TabsList>
           <TabsTrigger value="sessions">会话</TabsTrigger>
+          <TabsTrigger value="credentials">凭据</TabsTrigger>
           <TabsTrigger value="pending">待授权网段</TabsTrigger>
         </TabsList>
         <TabsContent value="sessions" className="flex-1 overflow-auto">
@@ -127,6 +154,9 @@ export default function IntranetPage() {
             hostFilter={hostFilter}
             onClearFilter={() => setHostFilter(null)}
           />
+        </TabsContent>
+        <TabsContent value="credentials" className="flex-1 overflow-auto">
+          <CredsTab credentials={credentials} loading={loadingCreds} />
         </TabsContent>
         <TabsContent value="pending" className="flex-1 overflow-auto">
           <PendingScopeTab taskId={taskParam} />

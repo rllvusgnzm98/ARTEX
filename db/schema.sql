@@ -1450,3 +1450,24 @@ CREATE TABLE IF NOT EXISTS tunnels (
 );
 CREATE INDEX IF NOT EXISTS idx_tunnels_task ON tunnels(task_id);
 CREATE INDEX IF NOT EXISTS idx_tunnels_state ON tunnels(state);
+
+
+-- =====================================================================
+-- 凭据库（PR-H, 只追加 IF NOT EXISTS）
+-- =====================================================================
+-- secret 存 gcm1:<base64> AES-GCM 密文（密钥由 jwt.key 域分离派生，
+-- 见 db/credentials.go）。轮换 jwt.key 会使已存密文无法解密，本波不迁移。
+CREATE TABLE IF NOT EXISTS credentials (
+    id            BIGSERIAL PRIMARY KEY,
+    task_id       BIGINT NOT NULL,
+    host_asset_id BIGINT,
+    username      TEXT NOT NULL DEFAULT '',
+    cred_type     TEXT NOT NULL CHECK(cred_type IN
+        ('password','hash_nt','hash_lm','hash_sha1','ticket','ssh_key','token')),
+    secret        TEXT NOT NULL DEFAULT '',
+    domain        TEXT NOT NULL DEFAULT '',
+    source        TEXT NOT NULL DEFAULT '',
+    verified      BOOLEAN NOT NULL DEFAULT false,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_credentials_task ON credentials(task_id);
