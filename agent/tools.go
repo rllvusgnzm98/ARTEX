@@ -464,6 +464,19 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		findingList = append(findingList, m)
 	}
 	out["finding_list"] = findingList
+	// 疑似蜜罐资产清单(静态签名命中,score>0,上限 20 条,评分降序)。
+	// 单信号只降级不封锁——处置纪律在系统提示固定尾(plannerHoneypotRules)。
+	if t.as != nil && t.taskID > 0 {
+		if pots, err := t.as.HoneypotAssetsByTask(t.taskID, 20); err == nil && len(pots) > 0 {
+			plist := make([]map[string]any, 0, len(pots))
+			for _, p := range pots {
+				plist = append(plist, map[string]any{
+					"id": p.ID, "asset": p.Label, "score": p.Score, "signatures": p.Evidence,
+				})
+			}
+			out["honeypot_assets"] = plist
+		}
+	}
 	// recent_facts：非折叠事实里最新的一窗（≤N，factNodes 按 id 降序即最新在前）。已折进
 	// digest 且仍冷的（hidden）走 cold_digests，不在此重复。每条 {id, summary, from_intent?,
 	// confidence?}；evidence 等详情用 node_detail(id)。更早的用 list_facts 翻。

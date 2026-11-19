@@ -1471,3 +1471,11 @@ CREATE TABLE IF NOT EXISTS credentials (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_credentials_task ON credentials(task_id);
+
+-- =====================================================================
+-- 蜜罐评分（PR-I, 只追加 IF NOT EXISTS）
+-- =====================================================================
+-- honeypot_score: 0-1,命中静态签名的最高置信度(0=无信号);重复评估取更高分。
+-- honeypot_evidence: 命中签名证据,JSON 数组文本,合并去重。
+ALTER TABLE assets ADD COLUMN IF NOT EXISTS honeypot_score REAL NOT NULL DEFAULT 0;
+ALTER TABLE assets ADD COLUMN IF NOT EXISTS honeypot_evidence TEXT NOT NULL DEFAULT '';

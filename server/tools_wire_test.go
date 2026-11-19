@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/Autumn-27/artex/agent"
@@ -65,13 +66,22 @@ func TestWireTools(t *testing.T) {
 	// non-catalog rows, so future user-defined custom tools survive too.
 	if bash, ok := worker["Bash"]; !ok {
 		t.Error("worker lost Bash (should pass through)")
-	} else if bash.Description() != actool.NewBash().Description() {
-		t.Error("Bash should pass through undecorated, but description changed")
+	} else {
+		// worker Bash 追加按任务稳定 UA 纪律(代码固定尾);SDK 原文仍是前缀。
+		if !strings.HasPrefix(bash.Description(), actool.NewBash().Description()) {
+			t.Error("worker Bash should keep the original SDK description as prefix")
+		}
+		if !strings.Contains(bash.Description(), "ARTEX_UA") {
+			t.Error("worker Bash should carry the stable-UA note")
+		}
 	}
 	// planner is not bound to record_fact → resolving a base that contains it drops it.
 	planner := names(agent.ToolResolve(ctx, "planner", base))
 	if _, ok := planner["record_fact"]; ok {
 		t.Error("planner should not get record_fact (not bound)")
+	}
+	if bash, ok := planner["Bash"]; ok && bash.Description() != actool.NewBash().Description() {
+		t.Error("planner Bash should stay undecorated")
 	}
 
 	// Edit description + add a default to a scalar param, then confirm the resolved

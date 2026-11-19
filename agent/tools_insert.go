@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/honeydetect"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -105,6 +106,7 @@ type assetInputItem struct {
 	ContentLength *int64           `json:"content_length"`
 	PageTitle     string           `json:"page_title"`
 	FaviconMMH3   string           `json:"favicon_mmh3"`
+	Banner        string           `json:"banner"` // 可选;蜜罐静态签名评估用
 	Auth          []map[string]any `json:"auth"`
 	ServiceName   string           `json:"service_name"`
 	ServiceIP     string           `json:"service_ip"` // optional enrichment IP
@@ -308,6 +310,11 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 							IP:            svcIP,
 							TaskID:        taskID,
 						})
+						if err == nil {
+							t.evaluateHoneypot(id, honeydetect.ServiceView{
+								Port: urlPort(item.URL), Banner: item.Banner, Title: item.PageTitle,
+							})
+						}
 					} else {
 						id, err = t.as.UpsertOtherService(db.UpsertOtherServiceReq{
 							Domain:      item.Domain,
@@ -317,6 +324,11 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 							Auth:        item.Auth,
 							TaskID:      taskID,
 						})
+						if err == nil {
+							t.evaluateHoneypot(id, honeydetect.ServiceView{
+								Port: item.Port, Banner: item.Banner,
+							})
+						}
 					}
 
 				case "endpoint":
