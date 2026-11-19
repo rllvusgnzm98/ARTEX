@@ -160,6 +160,7 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		NonStreaming: c.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:    c.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
 	}
+	AttachStableWebFetch(&opts, "") // 回包走 untrusted-data；会话助手无 taskID，不另起 UA
 	if c.guard != nil {
 		opts.Hooks = c.guard.Hooks()
 	}
