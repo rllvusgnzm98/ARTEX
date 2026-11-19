@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 )
 
@@ -478,6 +479,10 @@ func (s *Server) insertAssets(w http.ResponseWriter, r *http.Request) {
 			ContentLength *int64           `json:"content_length"`
 			PageTitle     string           `json:"page_title"`
 			FaviconMMH3   string           `json:"favicon_mmh3"`
+			Banner        string           `json:"banner"`
+			Body          string           `json:"body"`
+			CertSubject   string           `json:"cert_subject"`
+			CertIssuer    string           `json:"cert_issuer"`
 			Auth          []map[string]any `json:"auth"`
 			ServiceIP     string           `json:"service_ip"`
 			// service other
@@ -524,8 +529,14 @@ func (s *Server) insertAssets(w http.ResponseWriter, r *http.Request) {
 					svcIP = a.IP
 				}
 				id, err = as.UpsertHTTPService(db.UpsertHTTPServiceReq{URL: a.URL, Technologies: a.Technologies, StatusCode: a.StatusCode, ContentLength: a.ContentLength, PageTitle: a.PageTitle, FaviconMMH3: a.FaviconMMH3, Auth: a.Auth, IP: svcIP, TaskID: req.TaskID})
+				if err == nil {
+					agent.ApplyHoneypotEvaluation(as, id, agent.ServiceViewFromFields(a.URL, a.Port, a.Banner, a.PageTitle, a.Body, a.CertSubject, a.CertIssuer))
+				}
 			} else {
 				id, err = as.UpsertOtherService(db.UpsertOtherServiceReq{Domain: a.Domain, IP: a.IP, Port: a.Port, ServiceName: a.ServiceName, Auth: a.Auth, TaskID: req.TaskID})
+				if err == nil {
+					agent.ApplyHoneypotEvaluation(as, id, agent.ServiceViewFromFields("", a.Port, a.Banner, a.PageTitle, a.Body, a.CertSubject, a.CertIssuer))
+				}
 			}
 		case "endpoint":
 			svcIP := a.ServiceIP
