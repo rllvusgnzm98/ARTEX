@@ -21,8 +21,9 @@ import (
 	"github.com/Autumn-27/artex/guard"
 )
 
-// scopeRulesFromRows 把 task_scope 行归一成 ScopeMatcher 规则。
-// 只用于 pending_scope 出界判定，不接入 RoE / 拦截挂钩。
+// scopeRulesFromRows 把官方 task_scope 行归一成 ScopeMatcher 规则。
+// RoE 出界判定与 pending_scope 发现侧共用此函数。pending_scope 本身仍是
+// 范围扩张队列,不是出界行动硬闸。
 func scopeRulesFromRows(rows []db.TaskScope) []guard.ScopeRule {
 	out := make([]guard.ScopeRule, 0, len(rows))
 	for _, r := range rows {

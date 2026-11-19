@@ -228,12 +228,20 @@ func statusOf(err error) int {
 // task-level timeout, and burning a backup key on it would both waste credit and
 // pollute the run's termination diagnosis. Never on 400 either: a malformed or
 // over-long request fails identically everywhere.
+//
+// DeadlineExceeded is special: if the caller ctx is still alive, the deadline
+// came from a lower-layer timer (单次 LLM 墙钟 / SDK attempt timeout), which is
+// a retryable transient failure and should fail over. If the caller ctx is
+// already done, this is user cancel or a task-level deadline — never fail over.
 func shouldFailover(ctx context.Context, err error) bool {
 	if err == nil {
 		return false
 	}
-	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true // call_timeout: 调用方未到期,超时来自下层派生 ctx,瞬时,可转移
 	}
 	switch code := statusOf(err); {
 	case code == 0:

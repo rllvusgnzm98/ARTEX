@@ -192,6 +192,10 @@ func (s *Server) registerSessionTool() actool.CoreTool {
 			if a.URL == "" {
 				return actool.Errorf("url 为必填参数"), nil
 			}
+			warn, roeErr := s.sessionRoECheck(ctx, a.URL)
+			if roeErr != nil {
+				return actool.Errorf(roeErr.Error()), nil
+			}
 			var sh *session.HTTPShell
 			var info session.ProbeInfo
 			var err error
@@ -244,6 +248,9 @@ func (s *Server) registerSessionTool() actool.CoreTool {
 			}
 			if len(info.Funcs) == 0 && strings.HasPrefix(info.Lang, "php") && info.Variant != "cmd" {
 				out["warning"] = "目标 PHP 禁用了全部命令执行函数（disable_functions）；session_exec 不可用，文件读写仍可用"
+			}
+			if warn != "" {
+				out["roe_warning"] = warn
 			}
 			return jsonResult(out)
 		},

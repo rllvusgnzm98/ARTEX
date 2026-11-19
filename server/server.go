@@ -934,6 +934,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/intercept/rules/{id}", s.interceptUpdateRule)
 	mux.HandleFunc("DELETE /api/intercept/rules/{id}", s.interceptDeleteRule)
 	mux.HandleFunc("POST /api/intercept/rules/{id}/toggle", s.interceptToggleRule)
+	mux.HandleFunc("GET /api/guard/auto-allow", s.guardAutoAllowGet)
+	mux.HandleFunc("PUT /api/guard/auto-allow", s.guardAutoAllowSet)
 
 	// 资产拦截规则管理（全局黑名单：域名/IP/URL/CIDR）
 	mux.HandleFunc("GET /api/asset-intercept/rules", s.assetInterceptListRules)

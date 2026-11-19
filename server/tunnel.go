@@ -295,6 +295,7 @@ func (s *Server) tunnelDeployTool() actool.CoreTool {
 				return actool.Errorf("端口占用汇总失败：" + err.Error()), nil
 			}
 			var plan *tunnel.Plan
+			var roeWarn string
 			switch kind {
 			case tunnel.KindSocks:
 				plan, err = tunnel.PlanSocks(opts)
@@ -307,6 +308,11 @@ func (s *Server) tunnelDeployTool() actool.CoreTool {
 				if perr != nil || port <= 0 {
 					return actool.Errorf("target 端口非法： " + portStr), nil
 				}
+				warn, roeErr := s.roeCheckHost(ctx, host, "隧道目标")
+				if roeErr != nil {
+					return actool.Errorf(roeErr.Error()), nil
+				}
+				roeWarn = warn
 				opts.TargetHost, opts.TargetPort = host, port
 				plan, err = tunnel.PlanPortfwd(opts)
 			default:
@@ -334,6 +340,9 @@ func (s *Server) tunnelDeployTool() actool.CoreTool {
 			}
 			if rec.Error != "" {
 				out["error"] = rec.Error
+			}
+			if roeWarn != "" {
+				out["roe_warning"] = roeWarn
 			}
 			var stored tunnel.Plan
 			if json.Unmarshal(rec.DeployParams, &stored) == nil {

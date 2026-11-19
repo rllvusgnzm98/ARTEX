@@ -18,9 +18,10 @@ import (
 //   ④ 等在跑 worker drain(受 grace) → ⑤ 终局一轮 planner 判定 → ⑥ 定终态(带守卫)
 
 const (
-	settleDrainGrace     = 90 * time.Second // 等在跑 worker 优雅收尾的上限;超过则硬 cancel
-	deadlinePollInterval = 2 * time.Second  // deadline 未盖章/LLM 未就绪时的轮询间隔
-	deadlineMaxSleep     = 30 * time.Second // 单次最长睡眠(便于周期复查终态)
+	settleDrainGrace      = 90 * time.Second // 等在跑 worker 优雅收尾的上限;超过则硬 cancel
+	deadlinePollInterval  = 2 * time.Second  // deadline 未盖章/LLM 未就绪时的轮询间隔
+	deadlineMaxSleep      = 30 * time.Second // 单次最长睡眠(便于周期复查终态)
+	freezeDetectThreshold = 60 * time.Second // 超睡达到此阈值才视为宿主睡眠/时钟跳变
 )
 
 // ---------- settling 状态 ----------
@@ -146,20 +147,60 @@ func (e *Engine) startDeadlineCoordinator(ctx context.Context, t *Task) {
 	runTaskRoutine(rt, func(loopCtx context.Context) { e.deadlineCoordinator(loopCtx, t) })
 }
 
+// detectFreeze 比较计划睡眠与实际经过时间。只有超睡 ≥ 60s 才返回顺延量
+// (实际-计划);正常调度抖动、低于阈值的小跳、时钟回拨都不顺延。连续小跳不累计。
+func detectFreeze(planned, actual time.Duration) time.Duration {
+	overshoot := actual - planned
+	if overshoot < freezeDetectThreshold {
+		return 0
+	}
+	return overshoot
+}
+
+// extendDeadline 只顺延进程内存中的 deadline,不写库。重启后 taskDeadline 回落到
+// DB deadline_at,本进程内的顺延即丢弃。尚未盖章(map 中无记录)则不操作。
+func (e *Engine) extendDeadline(taskID string, shift time.Duration) {
+	secs := int64(shift / time.Second)
+	if secs <= 0 {
+		return
+	}
+	for {
+		v, ok := e.deadline.Load(taskID)
+		if !ok {
+			return
+		}
+		old := v.(int64)
+		if e.deadline.CompareAndSwap(taskID, old, old+secs) {
+			log.Printf("[deadline] WARN task %s 检测到冻结 %s,deadline 顺延至 %s",
+				taskID, (time.Duration(secs) * time.Second).String(),
+				time.Unix(old+secs, 0).Format("2006-01-02 15:04:05"))
+			return
+		}
+	}
+}
+
 // deadlineCoordinator waits until the task's absolute deadline, then runs the settle
-// sequence. Absolute wall-clock: it keeps counting through pauses.
+// sequence. Absolute wall-clock: it keeps counting through pauses. 每次醒来先做
+// 时钟跳变检测:宿主睡眠/时钟跳变造成的超睡部分只顺延内存 deadline,避免冻结冤杀。
 func (e *Engine) deadlineCoordinator(ctx context.Context, t *Task) {
+	planned := time.Duration(0)
+	lastWake := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
+		if shift := detectFreeze(planned, time.Since(lastWake)); shift > 0 {
+			e.extendDeadline(t.ID, shift)
+		}
 		if isTerminalStatus(e.m.TaskStatus(t.ID)) {
 			return // already finished (goals met / failed) — nothing to time out
 		}
 		dl := e.taskDeadline(t)
 		if dl <= 0 {
+			planned = deadlinePollInterval
+			lastWake = time.Now()
 			if sleepCtx(ctx, deadlinePollInterval) { // not yet stamped (task hasn't really run)
 				return
 			}
@@ -170,6 +211,8 @@ func (e *Engine) deadlineCoordinator(ctx context.Context, t *Task) {
 			if nap > deadlineMaxSleep {
 				nap = deadlineMaxSleep
 			}
+			planned = nap
+			lastWake = time.Now()
 			if sleepCtx(ctx, nap) {
 				return
 			}

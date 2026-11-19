@@ -52,6 +52,8 @@ func TestClassifySupplyFailureRejectsNonSupply(t *testing.T) {
 		context.Canceled,
 		context.DeadlineExceeded,
 		fmt.Errorf("canceled: %w", context.Canceled),
+		&CallTimeoutError{Provider: "openai", Model: "m", Timeout: 600e9, Elapsed: 600e9},
+		fmt.Errorf("wrap: %w", &CallTimeoutError{Provider: "openai", Model: "m", Timeout: 600e9, Elapsed: 600e9}),
 	}
 	for _, err := range negatives {
 		if class, ok := ClassifySupplyFailure(err); ok {
@@ -185,5 +187,43 @@ func TestSingleProviderChainDoesNotRequireSecondModel(t *testing.T) {
 	s := SettleWorkerRun(harness.ReasonModelError, errors.New("status 402: payment required"))
 	if !s.SupplyFailure || !s.FreezeScene {
 		t.Fatalf("single-provider 402 should freeze without a mandatory fallback, got %+v", s)
+	}
+}
+
+func TestCallTimeoutSettlementNotSupplyOrTargetFailure(t *testing.T) {
+	t.Parallel()
+	err := &CallTimeoutError{Provider: "openai", Model: "m", Timeout: 600e9, Elapsed: 600e9}
+	if !IsCallTimeout(err) {
+		t.Fatal("expected IsCallTimeout")
+	}
+	if IsCallTimeout(context.Canceled) || IsCallTimeout(context.DeadlineExceeded) {
+		t.Fatal("用户取消或上层 DeadlineExceeded 不得被当成墙钟超时")
+	}
+	if IsSupplyFailure(err) {
+		t.Fatal("墙钟超时不得标为供应故障")
+	}
+	s := SettleWorkerRun(harness.ReasonModelError, err)
+	if s.SupplyFailure || s.FreezeScene {
+		t.Fatalf("must not freeze or mark supply failure: %+v", s)
+	}
+	if s.IntentState == "blocked" || s.IntentState == "done" || s.IntentState == "exhausted" {
+		t.Fatalf("intent state %q must not be blocked/done/exhausted", s.IntentState)
+	}
+	if s.IntentState != "open" || s.TerminalKind != TerminalLLMTransient {
+		t.Fatalf("settle=%+v, want open / llm_transient", s)
+	}
+	if s.TaskStatus == "done" || s.TaskStatus == "failed" || s.TaskStatus == "blocked" {
+		t.Fatalf("task status %q must stay unset", s.TaskStatus)
+	}
+	wrote := 0
+	s = s.ApplyTargetFailure(func() { wrote++ })
+	if s.TargetFailureWrites != 0 || wrote != 0 {
+		t.Fatalf("TargetFailureWrites=%d wrote=%d, want 0 (≠ 目标失败)", s.TargetFailureWrites, wrote)
+	}
+	if IntentStateAfterRun(harness.ReasonModelError, err, StopLossVerdict{}) != "open" {
+		t.Fatal("IntentStateAfterRun must keep call_timeout off the blocked path")
+	}
+	if IntentStateAfterRun(harness.ReasonModelError, context.Canceled, StopLossVerdict{}) != "blocked" {
+		t.Fatal("用户取消不得误标为墙钟超时回场")
 	}
 }

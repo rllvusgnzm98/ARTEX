@@ -918,6 +918,7 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 	g := guard.NewWithInterceptor(ic)
 	g.SetEgress(eg)
 	g.SetTarpit(newTarpitConfig(pg, store))
+	g.SetRoE(newRoEConfig(pg))
 	return &Task{
 		ID: strconv.FormatInt(pt.ID, 10), ExpID: pt.ExplorationID,
 		Name:       pt.Name,
