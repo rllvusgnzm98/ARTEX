@@ -1610,3 +1610,81 @@ export interface InterceptExecution {
   seq: number;
   items: Activity[];
 }
+
+
+/** GET /api/intranet/topology 的主机节点。 */
+export interface IntranetNode {
+  id: string;
+  ip: string;
+  segment: string;
+  has_session: boolean;
+  alive_sessions: number;
+  is_callback: boolean;
+  services?: { port: number; service?: string }[];
+}
+
+/** GET /api/intranet/topology 的边。本刀通常为空（无隧道台账）。 */
+export interface IntranetEdge {
+  id: number | string;
+  kind: string;
+  from: string;
+  to: string;
+  state: string;
+}
+
+export interface IntranetSegment {
+  name: string;
+  color_key: string;
+}
+
+export interface IntranetTopology {
+  nodes: IntranetNode[];
+  edges: IntranetEdge[];
+  segments: IntranetSegment[];
+}
+
+/** GET /api/sessions 的立足点会话记录。status: alive / dead。 */
+export interface ShellSession {
+  id: number | string;
+  kind: string;
+  url: string;
+  lang: string;
+  platform?: string;
+  host_asset_id?: number | string;
+  status: string;
+  last_beat: string;
+  created_at?: string;
+  created_by_task?: number;
+}
+
+export interface SessionExecResult {
+  stdout: string;
+  stderr: string;
+  ms: number;
+  timed_out: boolean;
+  error?: string;
+}
+
+export interface SessionFsEntry {
+  name: string;
+  is_dir: boolean;
+  size: number;
+}
+
+export interface SessionReadResult {
+  content?: string;
+  content_base64?: string;
+  truncated: boolean;
+}
+
+export interface PendingScopeRow {
+  id: number;
+  task_id: number;
+  kind: string;
+  value: string;
+  status: "pending" | "approved" | "dismissed";
+  hits: number;
+  first_seen: string;
+  last_seen: string;
+  decided_at?: string;
+}

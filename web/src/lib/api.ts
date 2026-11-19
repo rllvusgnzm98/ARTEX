@@ -52,6 +52,8 @@ import type {
   InterceptDetail,
   InterceptPending,
   InterceptRule,
+  IntranetTopology,
+  PendingScopeRow,
   JudgeConfig,
   JudgeUsage,
   LLMPoolStatus,
@@ -72,8 +74,11 @@ import type {
   PromptVar,
   PromptVersion,
   SessionTokenUsage,
+  SessionFsEntry,
+  SessionReadResult,
   Settings,
   Severity,
+  ShellSession,
   SkillCall,
   SkillItem,
   SSProject,
@@ -209,6 +214,7 @@ const del = <T>(p: string, body?: unknown) =>
 
 // Go serializes nil slices as JSON null — coerce to [].
 const arr = <T>(x: T[] | null | undefined): T[] => x ?? [];
+const taskQuery = (taskId?: string) => (taskId ? `?task_id=${encodeURIComponent(taskId)}` : "");
 const tq = (task?: string, sep: "?" | "&" = "?") => (task ? `${sep}task=${encodeURIComponent(task)}` : "");
 
 // findingFilterParams 把发现页的筛选条件序列化成 query string。列表 / 分组 /
@@ -1313,4 +1319,28 @@ export const api = {
   // 202 即返回，实际下载在后台跑，进度走 /api/update/stream。
   applyUpdate: () => post<{ ok: boolean; target: string }>(`/update/apply`),
   rollbackUpdate: () => post<{ ok: boolean }>(`/update/rollback`),
+
+  pendingScope: (taskId: string, all = false) =>
+    get<{ items: PendingScopeRow[] }>(
+      `/tasks/${encodeURIComponent(taskId)}/pending-scope${all ? "?all=1" : ""}`,
+    ).then((r) => arr(r.items)),
+  decidePendingScope: (id: number, action: "approve" | "dismiss") =>
+    post<PendingScopeRow>(`/pending-scope/${id}/decide`, { action }),
+
+  intranetTopology: (taskId?: string) =>
+    get<IntranetTopology>(`/intranet/topology${taskQuery(taskId)}`).then((r) => ({
+      nodes: arr(r.nodes),
+      edges: arr(r.edges),
+      segments: arr(r.segments),
+    })),
+  shellSessions: (taskId?: string) =>
+    get<{ items: ShellSession[] }>(`/sessions${taskQuery(taskId)}`).then((r) => arr(r.items)),
+  sessionList: (id: string | number, path: string) =>
+    post<{ entries: SessionFsEntry[] }>(`/sessions/${encodeURIComponent(String(id))}/list`, { path }).then((r) =>
+      arr(r.entries),
+    ),
+  sessionRead: (id: string | number, path: string) =>
+    post<SessionReadResult>(`/sessions/${encodeURIComponent(String(id))}/read`, { path }),
+  probeSession: (id: string | number) =>
+    post<{ alive: boolean; ms?: number; error?: string }>(`/sessions/${encodeURIComponent(String(id))}/probe`),
 };

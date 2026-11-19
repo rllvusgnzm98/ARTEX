@@ -25,6 +25,7 @@ import (
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/artex/report"
+	"github.com/Autumn-27/artex/session"
 	"github.com/Autumn-27/artex/traffic"
 	"github.com/Autumn-27/norma/llm"
 	actool "github.com/Autumn-27/norma/tool"
@@ -45,6 +46,9 @@ type Server struct {
 
 	skillDir string // root directory for skill subdirectories
 	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
+
+	sessReg   *session.Registry // 立足点会话注册表；nil = DB 未就绪
+	sessStore *db.SessionStore  // 会话落库访问层（secret AES-GCM，密钥由 jwtKey 派生）
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
@@ -227,6 +231,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		}
 		go s.evidenceStore().RunGC(s.ctx)
 		s.seedPythonInterpreter()     // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
+		s.initSessions()              // 立足点会话：Registry + 启动恢复与陈旧探活
+		s.seedSessionTools()          // register_session / session_recon 默认绑 worker
 		go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
 		// 与触发器的业务节奏不同，且两者失败互不牵连——推送卡住不该影响 agent 触发。
@@ -718,6 +724,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tasks/{id}/scope", s.taskScopeList)
 	mux.HandleFunc("POST /api/tasks/{id}/scope", s.taskScopeAdd)
 	mux.HandleFunc("DELETE /api/tasks/{id}/scope/{sid}", s.taskScopeDelete)
+	mux.HandleFunc("GET /api/tasks/{id}/pending-scope", s.pendingScopeList)
+	mux.HandleFunc("POST /api/pending-scope/{id}/decide", s.pendingScopeDecide)
 	mux.HandleFunc("GET /api/tasks/{id}/goals", s.listGoals)                       // 目标管理:列出本任务全部目标
 	mux.HandleFunc("POST /api/tasks/{id}/goals", s.addGoal)                        // 目标管理:人工新增目标(复活任务)
 	mux.HandleFunc("PATCH /api/tasks/{id}/goals/{gid}", s.editGoal)                // 目标管理:修改目标(复活任务)
@@ -919,6 +927,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/asset-intercept/rules/{id}", s.assetInterceptUpdateRule)
 	mux.HandleFunc("DELETE /api/asset-intercept/rules/{id}", s.assetInterceptDeleteRule)
 	mux.HandleFunc("POST /api/asset-intercept/rules/{id}/toggle", s.assetInterceptToggleRule)
+
+	mux.HandleFunc("GET /api/sessions", s.intranetListSessions)
+	mux.HandleFunc("GET /api/sessions/{id}", s.intranetGetSession)
+	mux.HandleFunc("POST /api/sessions/{id}/exec", s.intranetExec)
+	mux.HandleFunc("POST /api/sessions/{id}/probe", s.intranetProbeSession)
+	mux.HandleFunc("POST /api/sessions/{id}/list", s.intranetListDir)
+	mux.HandleFunc("POST /api/sessions/{id}/read", s.intranetReadFile)
+	mux.HandleFunc("POST /api/sessions/{id}/write", s.intranetWriteFile)
+	mux.HandleFunc("DELETE /api/sessions/{id}", s.intranetDeleteSession)
+	mux.HandleFunc("GET /api/intranet/topology", s.intranetTopology)
 
 	mux.HandleFunc("GET /api/intercept/pending", s.interceptListPending)
 	mux.HandleFunc("GET /api/intercept/pending/{id}", s.interceptGetOne)

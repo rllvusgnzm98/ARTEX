@@ -1388,3 +1388,39 @@ CREATE INDEX IF NOT EXISTS idx_notification_deliveries_batch
     ON notification_deliveries(batch_id) WHERE batch_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_notification_deliveries_channel
     ON notification_deliveries(channel_id, id DESC);
+
+-- =====================================================================
+-- 立足点会话台账 + 待授权网段（PR-E, 只追加 IF NOT EXISTS，不覆盖既有表）
+-- =====================================================================
+-- 内网被动侦察发现的未授权网段按 /24 聚合。人工批准(approved)后才
+-- 写进 task_scope 扩范围;拒绝(dismissed)后同一条目不再累计 hits。
+CREATE TABLE IF NOT EXISTS pending_scope (
+    id          BIGSERIAL PRIMARY KEY,
+    task_id     BIGINT NOT NULL,
+    kind        TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','dismissed')),
+    hits        INT NOT NULL DEFAULT 1,
+    first_seen  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    decided_at  TIMESTAMPTZ,
+    UNIQUE (task_id, kind, value)
+);
+
+-- 已登记立足点会话的一等台账。secret 是连接参数 JSON,AES-GCM
+-- 加密存储(密钥由 jwt.key 派生,见 db/sessions.go),串形如 "gcm1:<base64>"。
+CREATE TABLE IF NOT EXISTS sessions (
+    id                BIGSERIAL PRIMARY KEY,
+    kind              TEXT NOT NULL,           -- http_php/http_jsp/http_aspx/ssh/reverse(预留)
+    host_asset_id     BIGINT,                  -- 登记为 endpoint 资产后的资产 id(可空)
+    url               TEXT NOT NULL DEFAULT '',
+    secret            TEXT NOT NULL DEFAULT '',
+    lang              TEXT NOT NULL DEFAULT '',
+    status            TEXT NOT NULL DEFAULT 'alive' CHECK(status IN ('alive','dead')),
+    created_by_task   BIGINT,
+    created_by_intent BIGINT,
+    last_beat         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
+CREATE INDEX IF NOT EXISTS idx_sessions_task ON sessions(created_by_task);
