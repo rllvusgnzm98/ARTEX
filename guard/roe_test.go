@@ -3,6 +3,7 @@ package guard
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -14,7 +15,7 @@ func roeGuard(mode string, rules []ScopeRule) *Guard {
 	g := New()
 	g.SetRoE(RoEConfig{
 		Mode:     func() string { return mode },
-		Scope:    func(taskID int64) []ScopeRule { return rules },
+		Scope:    func(taskID int64) ([]ScopeRule, error) { return rules, nil },
 		TaskIDOf: func(ctx context.Context) int64 { return 42 },
 	})
 	return g
@@ -53,10 +54,17 @@ func TestRoEStrictAllowsInScope(t *testing.T) {
 }
 
 func TestRoEUnknownScopeAllows(t *testing.T) {
-	// 未登记范围(空规则)→ Unknown → 放行,保持现状语义。
-	g := roeGuard("strict", nil)
-	if blocked, _ := bashBlocked(t, g, `curl https://anything.com/`); blocked {
-		t.Error("未登记范围不应拦截")
+	// 未登记范围 / 空范围 → Unknown → 放行,warn 与 strict 都是既定语义。
+	for _, mode := range []string{"strict", "warn"} {
+		g := roeGuard(mode, nil)
+		if blocked, _ := bashBlocked(t, g, `curl https://anything.com/`); blocked {
+			t.Errorf("mode %q 未登记范围不应拦截", mode)
+		}
+		for _, e := range g.Audit() {
+			if strings.Contains(e.Reason, "读取失败") {
+				t.Errorf("mode %q 未登记范围的审计不应写成读失败: %+v", mode, e)
+			}
+		}
 	}
 }
 
@@ -87,7 +95,7 @@ func TestRoENoTaskIDAllows(t *testing.T) {
 	g := roeGuard("strict", []ScopeRule{{Kind: "domain", Value: "target.com"}})
 	g.SetRoE(RoEConfig{
 		Mode:     func() string { return "strict" },
-		Scope:    func(int64) []ScopeRule { return []ScopeRule{{Kind: "domain", Value: "target.com"}} },
+		Scope:    func(int64) ([]ScopeRule, error) { return []ScopeRule{{Kind: "domain", Value: "target.com"}}, nil },
 		TaskIDOf: func(context.Context) int64 { return 0 }, // chat 等非任务运行
 	})
 	if blocked, _ := bashBlocked(t, g, `curl https://evil.com/`); blocked {
@@ -122,5 +130,102 @@ func TestRoEEmptyAndUnknownModeIsWarn(t *testing.T) {
 		if !found {
 			t.Fatalf("mode %q 应写 RoE 审计, got %+v", mode, g.Audit())
 		}
+	}
+}
+
+func roeGuardScopeErr(mode string, err error) *Guard {
+	g := New()
+	g.SetRoE(RoEConfig{
+		Mode:     func() string { return mode },
+		Scope:    func(int64) ([]ScopeRule, error) { return nil, err },
+		TaskIDOf: func(context.Context) int64 { return 42 },
+	})
+	return g
+}
+
+func TestRoEScopeLoadErrorStrictDoesNotFailOpen(t *testing.T) {
+	g := roeGuardScopeErr("strict", errors.New("scope store unavailable"))
+	blocked, msg := bashBlocked(t, g, `curl https://anything.com/`)
+	if !blocked {
+		t.Fatal("ListTaskScope 读失败在 strict 下不得当成空范围放行")
+	}
+	if !strings.Contains(msg, "读取失败") || !strings.Contains(msg, "非未登记范围") {
+		t.Errorf("拦截消息应标明是读失败而非未登记, got: %s", msg)
+	}
+	var allows, blocks int
+	for _, e := range g.Audit() {
+		if e.Action == "allow" && e.Reason == "" {
+			t.Errorf("strict 拦下时不得先留下空 reason 的 allow 行: %+v", e)
+		}
+		if e.Action == "allow" {
+			allows++
+		}
+		if e.Action == "block" && strings.Contains(e.Reason, "读取失败") {
+			blocks++
+		}
+	}
+	if allows != 0 {
+		t.Errorf("strict 读失败应只有 block, 不应有 allow, got allows=%d audit=%+v", allows, g.Audit())
+	}
+	if blocks != 1 {
+		t.Errorf("strict 读失败应记一条读失败 block, got %d audit=%+v", blocks, g.Audit())
+	}
+}
+
+func TestRoEScopeLoadErrorWarnAllowsWithDistinctAudit(t *testing.T) {
+	g := roeGuardScopeErr("warn", errors.New("scope store unavailable"))
+	if blocked, _ := bashBlocked(t, g, `curl https://anything.com/`); blocked {
+		t.Fatal("ListTaskScope 读失败在 warn 下应放行")
+	}
+	var found bool
+	for _, e := range g.Audit() {
+		if e.Action == "allow" && strings.Contains(e.Reason, "读取失败") && strings.Contains(e.Reason, "非未登记范围") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("warn 下放行须留下可与未登记区分的读失败审计, got %+v", g.Audit())
+	}
+
+	// 对照:同一模式下未登记范围不得出现「读取失败」字样。
+	empty := roeGuard("warn", nil)
+	if blocked, _ := bashBlocked(t, empty, `curl https://anything.com/`); blocked {
+		t.Fatal("未登记范围在 warn 下应放行")
+	}
+	for _, e := range empty.Audit() {
+		if strings.Contains(e.Reason, "读取失败") {
+			t.Fatalf("未登记范围审计被写成读失败: %+v", e)
+		}
+	}
+}
+
+func TestPreToolUseAllowOnlyAfterAllGates(t *testing.T) {
+	// strict 范围外拦截时,不得先留下空 reason 的 allow。
+	g := roeGuard("strict", []ScopeRule{{Kind: "domain", Value: "target.com"}})
+	if blocked, _ := bashBlocked(t, g, `curl https://evil.com/`); !blocked {
+		t.Fatal("strict 范围外应拦截")
+	}
+	for _, e := range g.Audit() {
+		if e.Action == "allow" && e.Reason == "" {
+			t.Fatalf("后面闸门拦住时不得先留下空 reason 的 allow 行: %+v", e)
+		}
+		if e.Action == "allow" {
+			t.Fatalf("strict 拦下不应有 allow 行: %+v", e)
+		}
+	}
+
+	// 全部闸门通过后才记一条空 reason 的 allow。
+	ok := roeGuard("strict", []ScopeRule{{Kind: "domain", Value: "target.com"}})
+	if blocked, _ := bashBlocked(t, ok, `curl https://target.com/`); blocked {
+		t.Fatal("范围内目标应放行")
+	}
+	var emptyAllow int
+	for _, e := range ok.Audit() {
+		if e.Action == "allow" && e.Reason == "" {
+			emptyAllow++
+		}
+	}
+	if emptyAllow != 1 {
+		t.Fatalf("全部闸门通过后应恰好一条空 reason allow, got %+v", ok.Audit())
 	}
 }

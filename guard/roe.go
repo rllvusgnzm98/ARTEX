@@ -20,8 +20,10 @@ type RoEConfig struct {
 	// "off" | "warn" | "strict". 空/未知值按 warn(默认)。
 	Mode func() string
 	// Scope returns the task's registered scope rules; server 装配时从
-	// db task_scope 拉取。空列表 = 未登记范围 → Unknown → 放行。
-	Scope func(taskID int64) []ScopeRule
+	// db task_scope 拉取。空列表且 err==nil = 未登记/空范围 → Unknown → 放行
+	// (warn 与 strict 都是既定语义)。err!=nil 表示 ListTaskScope 读失败,
+	// 不得当成空范围:strict 拒绝放行,warn 放行但审计须标明读失败。
+	Scope func(taskID int64) ([]ScopeRule, error)
 	// TaskIDOf extracts the task id from the hook ctx (server 注入
 	// agent.RunInfoFrom;guard 不反向依赖 agent 包)。nil → 0 → Unknown。
 	TaskIDOf func(ctx context.Context) int64
@@ -75,7 +77,11 @@ func (g *Guard) checkRoE(ctx context.Context, ev hook.Event, cmd string) (hook.R
 	if len(hosts) == 0 {
 		return hook.Result{}, false // 提取不出目标 = 无目标,不拦截(保守取向)
 	}
-	matcher := NewScopeMatcher(cfg.Scope(taskID))
+	rules, err := cfg.Scope(taskID)
+	if err != nil {
+		return g.roeScopeLoadFailure(ev, cmd, mode, taskID, err)
+	}
+	matcher := NewScopeMatcher(rules)
 	var out []string
 	unknown := false
 	for _, h := range hosts {
@@ -93,7 +99,7 @@ func (g *Guard) checkRoE(ctx context.Context, ev hook.Event, cmd string) (hook.R
 		// 部分目标出了已登记范围、部分无规则可依 —— 按 Out 处理已有的违规即可。
 		log.Printf("[guard][roe] task %d 部分目标无范围规则可依: %v", taskID, hosts)
 	}
-	reason := roeMessage(out, cfg.Scope(taskID))
+	reason := roeMessage(out, rules)
 	if mode == "strict" {
 		return g.roeAsk(ctx, ev, reason)
 	}
@@ -101,6 +107,25 @@ func (g *Guard) checkRoE(ctx context.Context, ev hook.Event, cmd string) (hook.R
 	g.record(ev.ToolName, "allow", reason, cmd)
 	log.Printf("[guard][roe] task %d 范围外目标(warn 放行): %s", taskID, reason)
 	return hook.Result{}, false
+}
+
+// roeScopeLoadFailure 区分「范围读失败」与「未登记/空范围」。
+// strict 不得 fail-open(不得当成空范围放行);warn 放行但审计写明读失败。
+func (g *Guard) roeScopeLoadFailure(ev hook.Event, cmd, mode string, taskID int64, err error) (hook.Result, bool) {
+	reason := roeScopeLoadFailureReason(mode)
+	log.Printf("[guard][roe] task %d 范围读取失败(%s): %v", taskID, mode, err)
+	if mode == "strict" {
+		return g.block(ev.ToolName, systemBlockMessage(reason), cmd), true
+	}
+	g.record(ev.ToolName, "allow", reason, cmd)
+	return hook.Result{}, false
+}
+
+func roeScopeLoadFailureReason(mode string) string {
+	if mode == "strict" {
+		return "RoE 任务范围读取失败，strict 下拒绝放行（非未登记范围）"
+	}
+	return "RoE 任务范围读取失败，warn 下放行（非未登记范围）"
 }
 
 // roeAsk routes a strict-mode out-of-scope call through the same human-approval

@@ -79,16 +79,21 @@ func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
 		cmd = in.Text
 	}
 	// preToolUse 顺序: egress → RoE → tarpit → 现有 intercept。
-	// egress 先于 allow 审计,避免命令原文里的秘密落盘。
+	// 空 reason 的 allow 只在全部闸门通过后记录,避免 RoE/intercept 拦下时
+	// 先留下 allow+block 双行。egress 仍先于任何审计,避免命令原文里的秘密落盘。
 	if res, stop := g.checkEgress(ev, cmd); stop {
 		return res
 	}
-	g.record(ev.ToolName, "allow", "", cmd)
 	if res, stop := g.checkRoE(ctx, ev, cmd); stop {
 		return res
 	}
 	g.checkTarpit(ev)
-	return g.applyIntercept(ctx, ev)
+	res := g.applyIntercept(ctx, ev)
+	if res.Decision == "block" {
+		return res
+	}
+	g.record(ev.ToolName, "allow", "", cmd)
+	return res
 }
 
 // SetEgress 装配出口审查的敏感指纹集合(server 侧进程内共享一份)。nil = 关闭。
