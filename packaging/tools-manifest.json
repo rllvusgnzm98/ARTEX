@@ -1,5 +1,5 @@
 {
-  "_comment": "ARTEX 外部工具钉版清单。path 相对 data 目录；env 为可选路径覆盖（运行时 env 优先）。sha256 空串 = 未钉（宁可留空也不抄现场哈希），doctor 只校验非空值；哈希不匹配只警告。默认清单不含凭据收割/提权工具，也不含 suo5-payloads / penelope。chisel / suo5 / ligolo-* 仅为可选随道检查，缺失只警告，不是必装。",
+  "_comment": "ARTEX 外部工具钉版清单。path 相对 data 目录；env 为可选路径覆盖（运行时 env 优先）。sha256 空串 = 未钉（宁可留空也不抄现场哈希），doctor 只校验非空值；哈希不匹配只警告。默认清单不含凭据收割/提权工具，也不含 suo5-payloads / penelope。chisel / suo5 / ligolo-* 仅为可选隧道检查，缺失只警告，不是必装。",
   "tools": [
     {
       "name": "suo5",
@@ -23,7 +23,7 @@
     },
     {
       "name": "ligolo-agent",
-      "purpose": "ligolo-ng 反向隧道 agent（可选随道检查，非默认必装）",
+      "purpose": "ligolo-ng 反向隧道 agent（可选隧道检查，非默认必装）",
       "version": "",
       "platform": "linux/amd64",
       "sha256": "",
@@ -33,7 +33,7 @@
     },
     {
       "name": "ligolo-proxy",
-      "purpose": "ligolo-ng 反向隧道 proxy（可选随道检查，非默认必装）",
+      "purpose": "ligolo-ng 反向隧道 proxy（可选隧道检查，非默认必装）",
       "version": "",
       "platform": "linux/amd64",
       "sha256": "",

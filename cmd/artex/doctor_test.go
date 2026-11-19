@@ -105,10 +105,10 @@ func TestRunDoctorMissingToolsAreWarn(t *testing.T) {
 	t.Setenv("ARTEX_TOOLS_MANIFEST", man)
 	out, code := captureDoctor(t, "-data", t.TempDir())
 	if code != 0 {
-		t.Fatalf("随道缺失应为 WARN 而不是 FAIL, exit=%d\n%s", code, out)
+		t.Fatalf("隧道缺失应为 WARN 而不是 FAIL, exit=%d\n%s", code, out)
 	}
-	if !strings.Contains(out, "chisel 缺失") || !strings.Contains(out, "[WARN] 随道工具") {
-		t.Fatalf("随道缺失应记 WARN:\n%s", out)
+	if !strings.Contains(out, "chisel 缺失") || !strings.Contains(out, "[WARN] 隧道工具") {
+		t.Fatalf("隧道缺失应记 WARN:\n%s", out)
 	}
 }
 
@@ -203,6 +203,70 @@ func TestSystemdUnitListensOnAllInterfaces(t *testing.T) {
 	}
 	if strings.Contains(s, "-proxy :8788") {
 		t.Fatal("流量录制代理不得绑到全网卡 :8788")
+	}
+}
+
+func TestDockerfileProxyBindsLoopback(t *testing.T) {
+	candidates := []string{"Dockerfile", filepath.Join("..", "..", "Dockerfile")}
+	var raw []byte
+	var err error
+	for _, p := range candidates {
+		raw, err = os.ReadFile(p)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(raw)
+	want := `CMD ["-addr", ":8787", "-proxy", "127.0.0.1:8788"]`
+	if !strings.Contains(s, want) {
+		t.Fatalf("Dockerfile CMD 必须是 %s", want)
+	}
+	if strings.Contains(s, `"-proxy", ":8788"`) {
+		t.Fatal("Dockerfile 流量录制代理不得绑到全网卡 :8788")
+	}
+	if strings.Contains(s, `"-addr", "127.0.0.1:8787"`) {
+		t.Fatal("Dockerfile 不得把 -addr 改成 127.0.0.1:8787")
+	}
+}
+
+func TestRunDoctorArsenalHashMismatchIsWarn(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("ARTEX_PG_DSN"))
+	if dsn == "" {
+		t.Skip("no ARTEX_PG_DSN — skipping doctor integration")
+	}
+	isolateConfig(t)
+	t.Setenv("ARTEX_PG_DSN", dsn)
+	data := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(data, "tools"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(data, "tools", "demo-tool")
+	if err := os.WriteFile(bin, []byte("fixture-bytes-not-matching-pin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 非空假哈希，与文件内容必然不匹配；只作夹具，不是真实密钥。
+	pinned := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	man := filepath.Join(t.TempDir(), "tools-manifest.json")
+	body := `{"tools":[{"name":"demo-tool","path":"tools/demo-tool","category":"arsenal","sha256":"` + pinned + `"}]}`
+	if err := os.WriteFile(man, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARTEX_TOOLS_MANIFEST", man)
+	out, code := captureDoctor(t, "-data", data)
+	if code != 0 {
+		t.Fatalf("军火库哈希不匹配只应 WARN、不得 FAIL, exit=%d\n%s", code, out)
+	}
+	if !strings.Contains(out, "[WARN] 军火库工具") || !strings.Contains(out, "哈希不匹配") {
+		t.Fatalf("军火库汇总应为 WARN 且文案能看出哈希不匹配:\n%s", out)
+	}
+	if strings.Contains(out, "[OK] 军火库工具") {
+		t.Fatalf("哈希不匹配不得打 OK:\n%s", out)
+	}
+	if strings.Contains(out, "存在 1/1") {
+		t.Fatalf("哈希不匹配不得算进「存在 N/N」:\n%s", out)
 	}
 }
 

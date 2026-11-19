@@ -27,7 +27,7 @@ type Entry struct {
 	SHA256   string `json:"sha256"`   // 钉的 sha256；空串 = 未钉（不校验）
 	Path     string `json:"path"`     // 相对 data 目录的路径（文件或目录）
 	Env      string `json:"env"`      // 可选：覆盖路径的环境变量（如 ARTEX_CHISEL_PATH）
-	Category string `json:"category"` // tunnel（可选随道） | arsenal（军火库）
+	Category string `json:"category"` // tunnel（可选隧道） | arsenal（军火库）
 }
 
 // Manifest 是 tools-manifest.json 的整体结构。

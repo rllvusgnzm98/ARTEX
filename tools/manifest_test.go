@@ -134,7 +134,7 @@ func TestDefaultManifestOmitsHarvestAndLeavesHashesEmpty(t *testing.T) {
 			t.Errorf("%s 分类非法: %q", e.Name, e.Category)
 		}
 		if strings.HasPrefix(name, "ligolo") && e.Category != "tunnel" {
-			t.Errorf("%s 若出现只能作为可选随道检查，got category=%s", e.Name, e.Category)
+			t.Errorf("%s 若出现只能作为可选隧道检查，got category=%s", e.Name, e.Category)
 		}
 	}
 }

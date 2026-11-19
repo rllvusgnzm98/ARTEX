@@ -4,6 +4,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -75,18 +76,28 @@ func runDoctor(args []string) int {
 
 	// 1. PostgreSQL 可连接（复用现有配置解析；轻量 ping，不走 Open 的迁移/seed）
 	dsn, source, dsnErr := db.DSN()
-	profiles, dbOK := -1, false
+	profiles, dbOK, llmChecked := -1, false, false
 	if dsnErr != nil {
 		check(docFail, "PostgreSQL", dsnErr.Error())
 	} else if n, err := db.Probe(dsn); err != nil {
-		check(docFail, "PostgreSQL", fmt.Sprintf("连接失败（来源: %s）: %v", source, err))
+		var qe *db.ProbeQueryError
+		if errors.As(err, &qe) {
+			// 已 ping 通，但 count(*) 不是「表不存在」：权限等查询失败。
+			check(docFail, "PostgreSQL", fmt.Sprintf("查询/权限失败（来源: %s）: %v", source, err))
+			check(docWarn, "LLM profile", "查询/权限失败，无法读取 llm_profiles")
+			llmChecked = true
+		} else {
+			check(docFail, "PostgreSQL", fmt.Sprintf("连接失败（来源: %s）: %v", source, err))
+		}
 	} else {
 		dbOK, profiles = true, n
 		check(docOK, "PostgreSQL", fmt.Sprintf("可连接（来源: %s; %s）", source, config.Redact(dsn)))
 	}
 
-	// 2. LLM profile 已配置（DB 不可达则 SKIP）
-	if !dbOK {
+	// 2. LLM profile 已配置（DB 不可达则 SKIP；查询/权限失败不得说成库未初始化）
+	if llmChecked {
+		// 已在 Probe 查询失败分支报告
+	} else if !dbOK {
 		check(docSkip, "LLM profile", "DB 不可达，跳过（请先在 UI / llm_profiles 配置）")
 	} else if profiles < 0 {
 		check(docWarn, "LLM profile", "库未初始化（llm_profiles 表不存在），启动后请在 UI 配置")
@@ -110,7 +121,7 @@ func runDoctor(args []string) int {
 		check(docOK, "data 目录", *dataDir+" 可写")
 	}
 
-	// 4/5. 外部工具清单：可选随道工具逐项 + 军火库存在性汇总
+	// 4/5. 外部工具清单：可选隧道工具逐项 + 军火库存在性汇总
 	manifest, mErr := tools.Load(tools.ManifestPath())
 	if mErr != nil && !os.IsNotExist(mErr) {
 		check(docWarn, "工具清单", "解析失败（跳过工具检查）: "+mErr.Error())
@@ -119,7 +130,7 @@ func runDoctor(args []string) int {
 	if manifest != nil {
 		results = tools.Check(manifest, *dataDir)
 	} else if os.IsNotExist(mErr) {
-		// 清单缺失（开发态/裁剪部署）：随道工具按运行时同一套解析（env > data/tools）
+		// 清单缺失（开发态/裁剪部署）：隧道工具按运行时同一套解析（env > data/tools）
 		// 兜底查存在性。不检查 suo5-payloads。
 		for _, name := range []string{"suo5", "chisel"} {
 			env := "ARTEX_" + strings.ToUpper(name) + "_PATH"
@@ -127,10 +138,10 @@ func runDoctor(args []string) int {
 				Name: name, Path: "tools/" + name, Env: env, Category: "tunnel",
 			}, *dataDir))
 		}
-		check(docWarn, "工具清单", "packaging/tools-manifest.json 缺失——随道工具按默认路径检查，军火库无法汇总")
+		check(docWarn, "工具清单", "packaging/tools-manifest.json 缺失——隧道工具按默认路径检查，军火库无法汇总")
 	}
 
-	// 4. 随道工具（chisel/suo5/ligolo-*）：存在性 + （清单钉了哈希时）sha256
+	// 4. 隧道工具（chisel/suo5/ligolo-*）：存在性 + （清单钉了哈希时）sha256
 	// 缺失一律 WARN，不得 FAIL，不得静默必装。
 	{
 		var parts []string
@@ -145,34 +156,49 @@ func runDoctor(args []string) int {
 			}
 		}
 		if len(parts) == 0 {
-			check(docSkip, "随道工具", "清单中无随道项")
+			check(docSkip, "隧道工具", "清单中无隧道项")
 		} else {
-			check(worst, "随道工具", strings.Join(parts, "; "))
+			check(worst, "隧道工具", strings.Join(parts, "; "))
 		}
 	}
 
-	// 5. 军火库工具存在性汇总（存在 X/Y）；缺失只 WARN
+	// 5. 军火库工具存在性汇总（存在 X/Y）。缺失只 WARN；哈希不匹配也必须 WARN，
+	// 不能因为「不是 missing」就算进 present 并在全在时打 OK。不得因此 FAIL。
 	{
-		var present, missing []string
+		var present, missing, mismatched []string
 		for _, r := range results {
 			if r.Entry.Category != "arsenal" {
 				continue
 			}
-			if r.Status == tools.StatusMissing {
+			switch r.Status {
+			case tools.StatusMissing:
 				missing = append(missing, r.Entry.Name)
-			} else {
+			case tools.StatusMismatch:
+				mismatched = append(mismatched, r.Entry.Name)
+			default:
 				present = append(present, r.Entry.Name)
 			}
 		}
-		total := len(present) + len(missing)
+		total := len(present) + len(missing) + len(mismatched)
 		switch {
 		case total == 0:
 			check(docSkip, "军火库工具", "清单缺失，无法汇总")
-		case len(missing) == 0:
+		case len(missing) == 0 && len(mismatched) == 0:
 			check(docOK, "军火库工具", fmt.Sprintf("存在 %d/%d", len(present), total))
 		default:
-			check(docWarn, "军火库工具", fmt.Sprintf("存在 %d/%d（缺失: %s）——按需补齐到 %s",
-				len(present), total, strings.Join(missing, ", "), filepath.Join(*dataDir, "tools")))
+			var bits []string
+			bits = append(bits, fmt.Sprintf("存在 %d/%d", len(present), total))
+			if len(missing) > 0 {
+				bits = append(bits, "缺失: "+strings.Join(missing, ", "))
+			}
+			if len(mismatched) > 0 {
+				bits = append(bits, "哈希不匹配: "+strings.Join(mismatched, ", "))
+			}
+			note := strings.Join(bits, "；")
+			if len(missing) > 0 {
+				note += "——按需补齐到 " + filepath.Join(*dataDir, "tools")
+			}
+			check(docWarn, "军火库工具", note)
 		}
 	}
 
