@@ -51,6 +51,11 @@ func main() {
 }
 
 func run() int {
+	// `artex doctor` 部署预检：只读检查，在解析服务 flag / 起任何子系统之前分流。
+	if isDoctorCommand(os.Args) {
+		return runDoctor(os.Args[2:])
+	}
+
 	var (
 		addr    = flag.String("addr", ":8787", "HTTP listen address")
 		dataDir = flag.String("data", filepath.Join(config.BaseDir(), "data"), "data directory for SQLite stores (default: data/ next to the executable)")
