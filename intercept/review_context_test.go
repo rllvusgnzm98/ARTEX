@@ -122,8 +122,9 @@ func TestReviewInputAuditRetention(t *testing.T) {
 		dec := Decision{Action: "allow", ModelInput: input, ModelInputDigest: digestInput(input)}
 		for _, status := range []string{"allowed", "pending", "denied"} {
 			a := auditFor(t.Context(), dec, []byte(`{}`), status)
+			// 无秘密时 arguments 打码是 no-op，快照字节保持；digest 始终对原文。
 			if string(a.ModelInput) != string(input) || a.ModelInputDigest != digestInput(input) {
-				t.Fatal("review snapshot changed")
+				t.Fatal("review snapshot or digest changed")
 			}
 		}
 	}

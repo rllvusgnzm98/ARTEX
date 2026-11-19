@@ -159,7 +159,10 @@ func auditFor(ctx context.Context, dec Decision, input []byte, status string) *d
 	}
 	a.InitialAction, a.InitialReason = dec.Action, dec.Message
 	a.ModelFallback = dec.ModelFallback
-	a.ModelInput, a.ModelInputDigest = dec.ModelInput, dec.ModelInputDigest
+	// digest 保留「实际送进判官的原文」；落库的 model_input 必须打码 arguments。
+	// 详情读出不得用 digest 把明文再还原出来。
+	a.ModelInputDigest = dec.ModelInputDigest
+	a.ModelInput = RedactStoredModelInput(dec.ModelInput)
 	a.RuleName, a.ConfigDigest, a.ProfileID = dec.RuleName, dec.ConfigDigest, dec.ProfileID
 	a.ExecutionStatus = "not_started"
 	if status == "allowed" {
@@ -167,9 +170,8 @@ func auditFor(ctx context.Context, dec Decision, input []byte, status string) *d
 		if a.Correlation != "exact" {
 			a.ExecutionStatus = "unknown"
 		}
-		// Keep the exact model input for EVERY model verdict, including automatic
-		// allows. Raw audit history is not model input. Preserve the existing
-		// lightweight allow-retention policy; render the saved input directly.
+		// 模型裁决（含自动放行）仍保留审查快照，但 arguments 已打码。
+		// 原始会话 transcript 不是 model input。继续沿用轻量 allow 留存策略。
 		a.UserMessage, a.UserTruncated = "", false
 		a.Context, a.ContextTruncated = nil, false
 	}
