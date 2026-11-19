@@ -80,6 +80,7 @@ import type {
   Severity,
   ShellSession,
   TunnelRecord,
+  Credential,
   SkillCall,
   SkillItem,
   SSProject,
@@ -1348,4 +1349,8 @@ export const api = {
     get<{ items: TunnelRecord[] }>(`/tunnels${taskQuery(taskId)}`).then((r) => arr(r.items)),
   teardownTunnel: (id: string | number) =>
     post<{ tunnel_id: number; state: string }>(`/tunnels/${encodeURIComponent(String(id))}/teardown`),
+  handoffSession: (id: string | number) =>
+    post<{ task_id: string }>(`/sessions/${encodeURIComponent(String(id))}/handoff`),
+  credentials: (taskId?: string) =>
+    get<{ items: Credential[] }>(`/credentials${taskQuery(taskId)}`).then((r) => arr(r.items)),
 };

@@ -4,6 +4,16 @@ import * as React from "react";
 
 import { Loader2Icon, RefreshCwIcon } from "lucide-react";
 
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
@@ -32,6 +42,8 @@ export function SessionsTab({
 }) {
   const [probing, setProbing] = React.useState<string | null>(null);
   const [notice, setNotice] = React.useState<string | null>(null);
+  const [handoffTarget, setHandoffTarget] = React.useState<ShellSession | null>(null);
+  const [handingOff, setHandingOff] = React.useState(false);
 
   const visible = React.useMemo(() => {
     if (!hostFilter) return sessions;
@@ -56,6 +68,24 @@ export function SessionsTab({
         setNotice(`探活请求失败：${err instanceof Error ? err.message : String(err)}`);
       })
       .finally(() => setProbing(null));
+  };
+
+  const confirmHandoff = () => {
+    const target = handoffTarget;
+    if (!target) return;
+    setHandingOff(true);
+    setNotice(null);
+    api
+      .handoffSession(target.id)
+      .then((r) => {
+        setNotice(`已创建内网子任务 #${r.task_id}（初始官方范围仅立足点 /32）`);
+        setHandoffTarget(null);
+        onReload();
+      })
+      .catch((err: unknown) => {
+        setNotice(`移交失败：${err instanceof Error ? err.message : String(err)}`);
+      })
+      .finally(() => setHandingOff(false));
   };
 
   return (
@@ -114,9 +144,14 @@ export function SessionsTab({
                     <td className="px-3 py-2">{s.created_by_task || "—"}</td>
                     <td className="px-3 py-2 whitespace-nowrap">{fmtTime(s.last_beat)}</td>
                     <td className="px-3 py-2">
-                      <Button size="sm" variant="outline" disabled={probing === String(s.id)} onClick={() => probe(s)}>
-                        {probing === String(s.id) ? "探活中…" : "探活"}
-                      </Button>
+                      <div className="flex flex-wrap gap-2">
+                        <Button size="sm" variant="outline" disabled={probing === String(s.id)} onClick={() => probe(s)}>
+                          {probing === String(s.id) ? "探活中…" : "探活"}
+                        </Button>
+                        <Button size="sm" variant="outline" onClick={() => setHandoffTarget(s)}>
+                          移交
+                        </Button>
+                      </div>
                     </td>
                   </tr>
                 );
@@ -125,6 +160,29 @@ export function SessionsTab({
           </tbody>
         </table>
       </div>
+      <AlertDialog open={handoffTarget !== null} onOpenChange={(o) => !o && !handingOff && setHandoffTarget(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>移交会话 #{handoffTarget?.id} 到内网任务？</AlertDialogTitle>
+            <AlertDialogDescription>
+              将创建一个新的内网探索任务。初始官方 scope 仅含该立足点主机 /32；发现的新网段进入
+              pending_scope 扩容队列（不是出界行动硬闸），批准后写入 task_scope。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={handingOff}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={handingOff}
+              onClick={(e) => {
+                e.preventDefault();
+                confirmHandoff();
+              }}
+            >
+              {handingOff ? "创建中…" : "确认移交"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
