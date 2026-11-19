@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -232,6 +233,7 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 			log.Printf("[tools] seed %s 失败: %v", t.Name(), err)
 		}
 	}
+	seedShellHints(pg)
 	// bashInteractiveShellNote is appended to Bash's description ONLY for agents whose
 	// interactive_shell is on, so Bash points at shell_open for interactive programs
 	// without ever referencing a tool that isn't injected (§14.1/§14.2).
@@ -287,12 +289,14 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 				out = append(out, resolve(inst, row))
 			}
 		}
-		// shell hints: user-defined kind="shell" tools are not callable — they are
-		// environment declarations that tell the model which command-line tools are
-		// installed. Collect the ones bound to this agent and append to Bash's description.
+		// shell hints: kind="shell" tools are not callable — they are environment
+		// declarations. Collect the ones bound to this agent AND present on PATH
+		// (LookPath at resolve time, exact command name = key) and append to Bash's
+		// description. Missing binaries stay in the tools table; this pass just
+		// does not claim they are installed. Unregistered tools are unchanged.
 		var shellHints []string
 		for _, row := range rows {
-			if row.Kind == "shell" && row.Enabled && contains(row.Agents, agentKey) {
+			if row.Kind == "shell" && row.Enabled && contains(row.Agents, agentKey) && shellHintOnPATH(row.Key) {
 				shellHints = append(shellHints, "- "+row.Key+": "+row.Description)
 			}
 		}
@@ -322,6 +326,26 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 		}
 		return out
 	}
+}
+
+// seedShellHints first-inserts the selected CLI catalog as kind=shell rows.
+// Existing rows (any kind, including user edits) are left untouched.
+func seedShellHints(pg *db.DB) {
+	agents, _ := json.Marshal(agent.ShellHintDefaultAgents())
+	for _, s := range agent.ShellHintSeeds() {
+		if err := pg.SeedShellHint(s.Key, s.Desc, agents); err != nil {
+			log.Printf("[tools] seed shell hint %s 失败: %v", s.Key, err)
+		}
+	}
+}
+
+// shellHintOnPATH reports whether exact command name is findable on the
+// current PATH. Looked up at resolve time (not cached at process start) so a
+// change to PATH is visible on the next assembly. Aliases or alternate
+// filenames (e.g. secretsdump.py vs impacket-secretsdump) do not match.
+func shellHintOnPATH(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
 }
 
 func contains(ss []string, v string) bool {

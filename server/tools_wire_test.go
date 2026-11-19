@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"testing"
 
-	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	actool "github.com/Autumn-27/norma/tool"
 )
 
 func names(tools []actool.CoreTool) map[string]actool.CoreTool {
@@ -39,6 +39,10 @@ func TestWireTools(t *testing.T) {
 	// Bash's description. Disable that for this test so the undecorated
 	// pass-through assertion holds regardless of DB state.
 	t.Setenv("AGENT_CORE_DISABLE_INTERACTIVE_SHELL", "1")
+	// Shell-hint catalog may now decorate Bash when those CLIs are on PATH.
+	// This test pins the unregistered/uninstalled path: an empty PATH means
+	// no catalog command is advertised, so Bash stays an undecorated pass-through.
+	t.Setenv("PATH", t.TempDir())
 
 	// Seeding populated the catalog.
 	rf, err := pg.GetTool("record_fact")

@@ -293,7 +293,13 @@ const workerIntranetDiscipline = `**内网期纪律**(本任务已有存活立�
 // workerIntranetRules 是内网期的代码固定尾(不可被 DB 变体正文覆盖)。
 const workerIntranetRules = `
 
-**内网红线(不可编辑)**:被动侦察优先;pending_scope 是 task_scope 扩展队列而非出界硬门闩(出界 IP 可能已在资产图中);从已确认侦察事实开下一跳必须挂 derived_from 或对应资产锚,否则进场预塞读不到这些事实;注意动静控制。`
+**内网红线(不可编辑)**:被动侦察优先;pending_scope 是 task_scope 扩展队列而非出界硬门闩(出界 IP 可能已在资产图中);从已确认侦察事实开下一跳必须挂 derived_from 或对应资产锚,否则进场预塞读不到这些事实;注意动静控制。站在立足点上时，把扫描打回攻击机/平台侧，不要在对方壳里手写扫描器。`
+
+// workerShellCLIRules 是始终追加的代码固定尾(不可被 DB 正文删掉)。不走 DB 变体,
+// 不写入 BuiltinPromptSeeds。纪律只指向「Bash 说明里已列出的」,不点名具体 CLI。
+const workerShellCLIRules = `
+
+**CLI 优先(不可编辑)**:枚举、爆破、注入、喷洒、指纹，优先用 Bash 说明里已列出的成熟 CLI。工具跑过仍不够，或确是带登录态的业务流、自定义协议，才写短脚本。`
 
 // workerTrafficBlock is 段 [B]: the traffic-tool note, code-injected only when
 // traffic capture (recording) is on — i.e. the traffic_* tools actually exist.
@@ -350,7 +356,8 @@ func workerSystem(proxyAddr, caCert, dataDir, runDir string, intranet bool) stri
 	// caCert is present only when the recording MITM is on, which is exactly when
 	// the traffic_* tools are registered — so it gates the traffic-tool note.
 	// Optional finding guidance is added for every role after tool resolution.
-	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir) + tail
+	// CLI 优先固定尾始终追加,位于内网变体之后,进场预塞仍由 execute() 再往后接。
+	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir) + tail + workerShellCLIRules
 }
 
 // renderIntentTask formats the claimed intent for the worker's launch USER message:
