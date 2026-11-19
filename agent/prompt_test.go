@@ -50,7 +50,7 @@ func TestRenderSystemOverrideAndFallback(t *testing.T) {
 	PromptOverride = func(k string) (string, bool) {
 		return "{{if .ProxyAddr}}走代理 {{.ProxyAddr}}{{else}}手动{{end}}", true
 	}
-	recording := workerSystem("127.0.0.1:8080", "/ca.pem", "/data", "/data")
+	recording := workerSystem("127.0.0.1:8080", "/ca.pem", "/data", "/data", false)
 	if !strings.HasPrefix(recording, "走代理 127.0.0.1:8080") {
 		t.Fatalf("worker proxy branch body: %q", recording)
 	}
@@ -65,18 +65,134 @@ func TestRenderSystemOverrideAndFallback(t *testing.T) {
 	}
 	// Egress proxy set but capture OFF (no CA): the ProxyAddr template branch still
 	// renders, but the trafficTool block must NOT — those tools are not registered.
-	egressOnly := workerSystem("127.0.0.1:8080", "", "/data", "/data")
+	egressOnly := workerSystem("127.0.0.1:8080", "", "/data", "/data", false)
 	if !strings.HasPrefix(egressOnly, "走代理 127.0.0.1:8080") {
 		t.Fatalf("worker egress-only branch body: %q", egressOnly)
 	}
 	if strings.Contains(egressOnly, "traffic_search") {
 		t.Fatalf("worker without recording must NOT inject trafficTool: %q", egressOnly)
 	}
-	noProxy := workerSystem("", "", "/data", "/data")
+	noProxy := workerSystem("", "", "/data", "/data", false)
 	if !strings.HasPrefix(noProxy, "手动") {
 		t.Fatalf("worker no-proxy branch body: %q", noProxy)
 	}
 	if strings.Contains(noProxy, "traffic_search") {
 		t.Fatalf("worker without proxy must NOT inject trafficTool: %q", noProxy)
+	}
+}
+
+func TestWorkerSystemIntranetVariant(t *testing.T) {
+	t.Cleanup(func() { PromptOverride = nil })
+
+	PromptOverride = nil
+	got := workerSystem("", "", "/data", "/data", true)
+	if !strings.Contains(got, "内网红线") {
+		t.Fatalf("有活会话时缺少代码固定内网红线尾: %q", got)
+	}
+	if !strings.Contains(got, "内网期纪律") {
+		t.Fatalf("有活会话时应追加 worker.intranet 短纪律: %q", got)
+	}
+	// 变体只追加,不得替换 worker 默认正文。
+	if !strings.Contains(got, "执行者") {
+		t.Fatalf("内网变体不得覆盖 worker 主正文: %q", got)
+	}
+	if strings.Contains(got, "批准前不得") || strings.Contains(got, "不得对其主动探测") || strings.Contains(got, "tunnel_deploy") || strings.Contains(got, "隧道四件套") {
+		t.Fatalf("纪律不得把 pending_scope 写成硬门闩,也不得提隧道四件套: %q", got)
+	}
+
+	// worker.intranet 覆盖只作用于追加段,不能抢走 worker 正文。
+	PromptOverride = func(k string) (string, bool) {
+		switch k {
+		case "worker.intranet":
+			return "内网正文覆盖 {{.Intranet}}", true
+		case "worker":
+			return "外网正文", true
+		}
+		return "", false
+	}
+	if got = workerSystem("", "", "/data", "/data", true); !strings.HasPrefix(got, "外网正文") {
+		t.Fatalf("worker 正文仍应由 worker 键渲染: %q", got)
+	}
+	if !strings.Contains(got, "内网正文覆盖 true") {
+		t.Fatalf("worker.intranet 覆盖应出现在追加段: %q", got)
+	}
+	if !strings.Contains(got, "内网红线") {
+		t.Fatalf("编辑变体正文也删不掉代码固定内网红线尾: %q", got)
+	}
+
+	// 变体缺失时退回内置纪律,并仍追加红线尾。
+	PromptOverride = func(k string) (string, bool) {
+		if k == "worker" {
+			return "外网正文", true
+		}
+		return "", false
+	}
+	if got = workerSystem("", "", "/data", "/data", true); !strings.HasPrefix(got, "外网正文") {
+		t.Fatalf("缺失变体时应退回 worker 正文: %q", got)
+	}
+	if !strings.Contains(got, "内网期纪律") || !strings.Contains(got, "内网红线") {
+		t.Fatalf("缺失变体时应追加内置纪律与红线尾: %q", got)
+	}
+
+	// intranet=false 不追加纪律或红线尾。
+	if got = workerSystem("", "", "/data", "/data", false); strings.Contains(got, "内网红线") || strings.Contains(got, "内网期纪律") {
+		t.Fatalf("无活会话不得追加内网变体: %q", got)
+	}
+
+	// 进场预塞与「图谱不完整」标记在内网变体下仍追加在既有位置、语义不变。
+	incomplete := RenderWorkerEntrySeed(WorkerEntrySeed{
+		GraphIncomplete:   true,
+		IncompleteReasons: []string{"prefetch"},
+		Prefetched:        false,
+	})
+	assembled := workerSystem("", "", "/data", "/data", true) + incomplete
+	if !strings.Contains(assembled, "内网红线") {
+		t.Fatalf("拼接后应保留内网变体:\n%s", assembled)
+	}
+	if !strings.Contains(assembled, GraphIncompleteMarker) {
+		t.Fatalf("内网变体下「图谱不完整」标记必须仍在:\n%s", assembled)
+	}
+	// 预塞段在变体之后追加(与 execute() 既有顺序一致),变体不得覆盖预塞。
+	idxVariant := strings.Index(assembled, "内网期纪律")
+	idxSeed := strings.Index(assembled, GraphIncompleteMarker)
+	if idxVariant < 0 || idxSeed < 0 || idxSeed < idxVariant {
+		t.Fatalf("进场预塞应保持在变体之后的既有位置, variant=%d seed=%d", idxVariant, idxSeed)
+	}
+}
+
+func TestIntranetResolverIsRequeriedEachRun(t *testing.T) {
+	var w Worker
+	if w.intranetForTask(7) {
+		t.Fatal("未设置 resolver 时应保持外网默认")
+	}
+	calls := 0
+	w.SetIntranetResolver(func(taskID int64) bool {
+		calls++
+		return taskID == 7 && calls >= 2
+	})
+	if w.intranetForTask(7) {
+		t.Fatal("resolver 第一次应返回 false")
+	}
+	if !w.intranetForTask(7) {
+		t.Fatal("resolver 必须每次 run 现查,第二次应为 true")
+	}
+	if w.intranetForTask(8) {
+		t.Fatal("其他 task 不得误切内网变体")
+	}
+	if calls != 3 {
+		t.Fatalf("intranetFn 应被调用 3 次, got %d", calls)
+	}
+}
+
+func TestPlannerNextHopDisciplineWording(t *testing.T) {
+	got := plannerSystem("核验已确认主机", "/data", "/data")
+	if !strings.Contains(got, "derived_from") || !strings.Contains(got, "parent_ids") || !strings.Contains(got, "asset_ids") {
+		t.Fatalf("规划器应要求下一跳挂 derived_from 或资产锚:\n%s", got)
+	}
+	if !strings.Contains(got, "不要假设读取侧已对任意后续意图闭环") {
+		t.Fatalf("规划器应明确读取侧未对任意后续意图闭环:\n%s", got)
+	}
+	if strings.Contains(got, "读取侧已经闭环") || strings.Contains(got, "读取侧已闭环") {
+		t.Fatalf("不得宣称读取侧已闭环:\n%s", got)
 	}
 }

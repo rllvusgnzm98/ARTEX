@@ -676,3 +676,37 @@ func (s *Server) intranetTopology(w http.ResponseWriter, r *http.Request) {
 	recs = filterSessionsByTask(recs, taskID)
 	writeJSON(w, 200, buildTopology(assets, recs, nil, ""))
 }
+
+// taskIntranet 判定任务是否处于内网期(worker.intranet 短纪律变体的开关):
+// 存在该任务创建的存活立足点会话。worker 每次 run 现查,会话状态变化即时生效;
+// 读取失败按外网处理(不误切变体)。隧道台账本刀不移植:若后续接入,必须对
+// nil 存储与读取失败保持安全,不得为了做这个检查而搬隧道台账。
+func (s *Server) taskIntranet(taskID int64) bool {
+	if taskID <= 0 {
+		return false
+	}
+	if s != nil && s.sessStore != nil {
+		ctx := s.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		recs, err := s.sessStore.List(ctx, db.SessionAlive)
+		if hasLiveTaskSession(recs, err, taskID) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasLiveTaskSession 把「查找失败 / 非法 task / 无存活会话」一律视为外网。
+func hasLiveTaskSession(recs []*db.SessionRecord, err error, taskID int64) bool {
+	if err != nil || taskID <= 0 {
+		return false
+	}
+	for _, r := range recs {
+		if r != nil && r.CreatedByTask == taskID {
+			return true
+		}
+	}
+	return false
+}

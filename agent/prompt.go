@@ -16,7 +16,12 @@ var PromptOverride func(agentKey string) (string, bool)
 // user template referencing a catalog variable renders; referencing anything else
 // fails template execution and falls back to the built-in default.
 type PlannerVars struct{ Goal, Scope, AssetSummary, DataDir, Now string }
-type WorkerVars struct{ ProxyAddr, WorkerName, DataDir, Now string }
+type WorkerVars struct {
+	ProxyAddr, WorkerName, DataDir, Now string
+	// Intranet 为 true 时,workerSystem 在正文之后追加 worker.intranet 短纪律变体
+	// (只追加,不替换 worker 正文,也不覆盖进场预塞)。
+	Intranet bool
+}
 type MainVars struct{ Goal, AssetSummary, FindingsSummary, DataDir, Now string }
 type GoalsVars struct{ EngagementDescription, DataDir, Now string }
 
@@ -46,6 +51,24 @@ func renderSystem(agentKey, def string, vars any) string {
 		return out
 	}
 	// DB template broke (e.g. references an out-of-catalog var) → code default.
+	if out, err := renderTmpl(def, vars); err == nil {
+		return out
+	}
+	return def
+}
+
+// renderSystemVariant 同 renderSystem,但支持变体 key(如 worker 的 "intranet"):
+// 先试 agentKey+"."+variant 的 DB 覆盖,没有再退回内置变体默认(def)。
+// 变体模板渲染失败同样退回 def,绝不出半渲染提示词。本仓把变体只用于追加段,
+// 不替换 worker 主正文,也不覆盖进场预塞。
+func renderSystemVariant(agentKey, variant, def string, vars any) string {
+	if variant != "" && PromptOverride != nil {
+		if tmpl, ok := PromptOverride(agentKey + "." + variant); ok && tmpl != "" {
+			if out, err := renderTmpl(tmpl, vars); err == nil {
+				return out
+			}
+		}
+	}
 	if out, err := renderTmpl(def, vars); err == nil {
 		return out
 	}
