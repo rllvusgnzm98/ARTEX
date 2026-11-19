@@ -839,6 +839,15 @@ func (s *Server) pgResetTool(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": true})
 		return
 	}
+	if sd, ok := agent.ShellHintByKey(key); ok {
+		agents, _ := json.Marshal(agent.ShellHintDefaultAgents())
+		if err := pg.ResetShellHint(sd.Key, sd.Desc, agents); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true})
+		return
+	}
 	writeErr(w, 404, "非内置工具或不存在: "+key)
 }
 

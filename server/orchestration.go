@@ -58,7 +58,7 @@ func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	deferred := map[string][]string{}
 	rows, _ := s.m.pg.ListCustomTools()
 	for _, t := range rows {
-		if t.Deferred && t.Enabled {
+		if t.Deferred && t.Enabled && t.Kind != "shell" {
 			deferred[t.Key] = t.Agents
 		}
 	}

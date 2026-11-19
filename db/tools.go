@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 )
 
 // Tool is one row of the built-in tool catalog. key + handler live in code; this
@@ -16,7 +17,7 @@ type Tool struct {
 	Schema      json.RawMessage `json:"schema"`
 	Agents      []string        `json:"agents"`
 	Enabled     bool            `json:"enabled"`
-	Kind        string          `json:"kind"`     // builtin | command | script | http
+	Kind        string          `json:"kind"`     // builtin | command | script | http | shell
 	Exec        json.RawMessage `json:"exec"`     // 自定义工具执行规格(kind!=builtin)
 	Deferred    bool            `json:"deferred"` // schema 延迟(走 SearchExtraTools/ExecuteExtraTool)
 	Calls       int             `json:"calls"`    // runtime ledger aggregate; not stored in tools
@@ -39,6 +40,22 @@ func (d *DB) SeedTool(key, desc string, schema, agents json.RawMessage) error {
 INSERT INTO tools(key, system, description, schema, agents, enabled)
 VALUES ($1, true, $2, $3, $4, true)
 ON CONFLICT (key) DO NOTHING`, key, desc, schema, agents)
+	return err
+}
+
+// SeedShellHint first-inserts a kind=shell environment declaration (not a
+// callable builtin). kind/deferred are written explicitly so the tools.kind
+// default of 'builtin' cannot apply. ON CONFLICT DO NOTHING: an existing row
+// — including a user-edited description/binding, or a same-key row whose kind
+// is not shell — is never overwritten, and kind is never forced.
+func (d *DB) SeedShellHint(key, desc string, agents json.RawMessage) error {
+	if len(agents) == 0 {
+		agents = json.RawMessage(`["worker","pentest"]`)
+	}
+	_, err := d.Exec(`
+INSERT INTO tools(key, system, description, schema, agents, enabled, kind, exec, deferred)
+VALUES ($1, true, $2, '{}'::jsonb, $3, true, 'shell', '{}'::jsonb, false)
+ON CONFLICT (key) DO NOTHING`, key, desc, agents)
 	return err
 }
 
@@ -80,15 +97,63 @@ func (d *DB) UpsertToolForce(key, desc string, schema, agents json.RawMessage) e
 	if len(agents) == 0 {
 		agents = json.RawMessage("[]")
 	}
-	_, err := d.Exec(`
+	// INSERT does not set kind (default builtin) — that path is only for a
+	// missing builtin row. ON CONFLICT updates only kind=builtin rows, so a
+	// same-key shell (or other non-builtin) row is never rewritten or recast.
+	res, err := d.Exec(`
 INSERT INTO tools(key, system, description, schema, agents, enabled)
 VALUES ($1, true, $2, $3, $4, true)
 ON CONFLICT (key) DO UPDATE
   SET description = EXCLUDED.description,
       schema      = EXCLUDED.schema,
       agents      = EXCLUDED.agents,
-      enabled     = true`, key, desc, schema, agents)
-	return err
+      enabled     = true
+  WHERE tools.kind = 'builtin'`, key, desc, schema, agents)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("refusing to reset non-builtin tool %s", key)
+	}
+	return nil
+}
+
+// ResetShellHint restores a kind=shell hint to its code defaults (description,
+// binding, enabled, deferred=false) while keeping kind='shell'. It never
+// recasts a non-shell row. If the key is absent, it first-inserts a shell row
+// (same shape as SeedShellHint).
+func (d *DB) ResetShellHint(key, desc string, agents json.RawMessage) error {
+	if len(agents) == 0 {
+		agents = json.RawMessage(`["worker","pentest"]`)
+	}
+	res, err := d.Exec(`
+UPDATE tools
+SET description=$2, schema='{}'::jsonb, agents=$3, enabled=true,
+    kind='shell', exec='{}'::jsonb, deferred=false, system=true, updated_at=now()
+WHERE key=$1 AND kind='shell'`, key, desc, agents)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	var kind string
+	err = d.QueryRow(`SELECT kind FROM tools WHERE key=$1`, key).Scan(&kind)
+	if err == sql.ErrNoRows {
+		return d.SeedShellHint(key, desc, agents)
+	}
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("refusing to reset tool %s with kind=%s to shell", key, kind)
 }
 
 // RefreshToolDefaults updates a system tool's model-facing description + schema to the
