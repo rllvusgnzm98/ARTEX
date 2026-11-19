@@ -195,11 +195,14 @@ func TestSystemdUnitListensOnAllInterfaces(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := string(raw)
-	if !strings.Contains(s, "ExecStart=") || !strings.Contains(s, "-addr :8787") {
-		t.Fatalf("systemd ExecStart 必须是 -addr :8787:\n%s", s)
+	if !strings.Contains(s, "ExecStart=/opt/artex/artex -addr :8787 -proxy 127.0.0.1:8788") {
+		t.Fatalf("systemd ExecStart 必须是 -addr :8787 -proxy 127.0.0.1:8788:\n%s", s)
 	}
 	if strings.Contains(s, "-addr 127.0.0.1:8787") {
 		t.Fatal("systemd 不得把监听改成 127.0.0.1:8787")
+	}
+	if strings.Contains(s, "-proxy :8788") {
+		t.Fatal("流量录制代理不得绑到全网卡 :8788")
 	}
 }
 

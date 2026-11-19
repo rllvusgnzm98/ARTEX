@@ -35,7 +35,7 @@ WorkingDirectory=/opt/artex
 # 可选环境注入：文件不存在也不报错（行首的 -）。用于 ARTEX_CALLBACK_ADDR、
 # ARTEX_PG_DSN 等不便写进单元文件的环境变量。
 EnvironmentFile=-/etc/artex.env
-ExecStart=/opt/artex/artex -addr :8787 -proxy :8788
+ExecStart=/opt/artex/artex -addr :8787 -proxy 127.0.0.1:8788
 # 崩溃/自更新重拉：固定 5s 间隔
 Restart=on-failure
 RestartSec=5s
