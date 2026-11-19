@@ -1,0 +1,95 @@
+{
+  "_comment": "ARTEX 外部工具钉版清单。path 相对 data 目录；env 为可选路径覆盖（运行时 env 优先）。sha256 空串 = 未钉（宁可留空也不抄现场哈希），doctor 只校验非空值；哈希不匹配只警告。默认清单不含凭据收割/提权工具，也不含 suo5-payloads / penelope。chisel / suo5 / ligolo-* 仅为可选随道检查，缺失只警告，不是必装。",
+  "tools": [
+    {
+      "name": "suo5",
+      "purpose": "HTTP 隧道 CLI：经已有立足点建立 socks5（可选，非默认必装）",
+      "version": "",
+      "platform": "linux/amd64",
+      "sha256": "",
+      "path": "tools/suo5",
+      "env": "ARTEX_SUO5_PATH",
+      "category": "tunnel"
+    },
+    {
+      "name": "chisel",
+      "purpose": "反向 TCP 隧道：建立反向 socks5 / 单端口转发（可选，非默认必装）",
+      "version": "",
+      "platform": "linux/amd64",
+      "sha256": "",
+      "path": "tools/chisel",
+      "env": "ARTEX_CHISEL_PATH",
+      "category": "tunnel"
+    },
+    {
+      "name": "ligolo-agent",
+      "purpose": "ligolo-ng 反向隧道 agent（可选随道检查，非默认必装）",
+      "version": "",
+      "platform": "linux/amd64",
+      "sha256": "",
+      "path": "tools/ligolo-agent",
+      "env": "",
+      "category": "tunnel"
+    },
+    {
+      "name": "ligolo-proxy",
+      "purpose": "ligolo-ng 反向隧道 proxy（可选随道检查，非默认必装）",
+      "version": "",
+      "platform": "linux/amd64",
+      "sha256": "",
+      "path": "tools/ligolo-proxy",
+      "env": "",
+      "category": "tunnel"
+    },
+    {
+      "name": "gogo",
+      "purpose": "内网端口扫描与服务识别",
+      "version": "",
+      "platform": "linux/amd64",
+      "sha256": "",
+      "path": "tools/gogo",
+      "env": "",
+      "category": "arsenal"
+    },
+    {
+      "name": "naabu",
+      "purpose": "快速端口扫描",
+      "version": "",
+      "platform": "linux/amd64",
+      "sha256": "",
+      "path": "tools/naabu",
+      "env": "",
+      "category": "arsenal"
+    },
+    {
+      "name": "httpx",
+      "purpose": "HTTP 服务探活与指纹/标题识别",
+      "version": "",
+      "platform": "linux/amd64",
+      "sha256": "",
+      "path": "tools/httpx",
+      "env": "",
+      "category": "arsenal"
+    },
+    {
+      "name": "katana",
+      "purpose": "Web 爬虫与端点发现",
+      "version": "",
+      "platform": "linux/amd64",
+      "sha256": "",
+      "path": "tools/katana",
+      "env": "",
+      "category": "arsenal"
+    },
+    {
+      "name": "fscan",
+      "purpose": "内网综合扫描：端口与服务识别",
+      "version": "",
+      "platform": "linux/amd64",
+      "sha256": "",
+      "path": "tools/fscan",
+      "env": "",
+      "category": "arsenal"
+    }
+  ]
+}

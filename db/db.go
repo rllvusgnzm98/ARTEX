@@ -93,6 +93,28 @@ func DSN() (dsn, source string, err error) {
 	return config.PostgresDSN()
 }
 
+// Probe 轻量只读预检（artex doctor 用）：连接 + ping，通了就顺手只读统计
+// LLM profile 数。与 Open 不同，这里不做任何迁移/seed/写操作。
+// 返回 (llmProfiles, err)：err 非 nil 是连接失败；llmProfiles < 0 表示连上了
+// 但查不到（如库还没初始化，llm_profiles 表不存在）。
+func Probe(dsn string) (int, error) {
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return -1, err
+	}
+	defer sqlDB.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := sqlDB.PingContext(ctx); err != nil {
+		return -1, err
+	}
+	var n int
+	if err := sqlDB.QueryRowContext(ctx, `SELECT count(*) FROM llm_profiles`).Scan(&n); err != nil {
+		return -1, nil
+	}
+	return n, nil
+}
+
 // DB wraps the shared *sql.DB. PG handles its own connection pool + concurrency
 // (MVCC), so unlike the old SQLite store there is no process-wide write mutex.
 type DB struct{ *sql.DB }
