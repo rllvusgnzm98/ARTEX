@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/honeydetect"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -107,6 +106,9 @@ type assetInputItem struct {
 	PageTitle     string           `json:"page_title"`
 	FaviconMMH3   string           `json:"favicon_mmh3"`
 	Banner        string           `json:"banner"` // 可选;蜜罐静态签名评估用
+	Body          string           `json:"body"`   // 可选;HTTP 正文，蜜罐评估用，不落独立列
+	CertSubject   string           `json:"cert_subject"`
+	CertIssuer    string           `json:"cert_issuer"`
 	Auth          []map[string]any `json:"auth"`
 	ServiceName   string           `json:"service_name"`
 	ServiceIP     string           `json:"service_ip"` // optional enrichment IP
@@ -179,6 +181,10 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 					},
 					"page_title":   str("页面 <title> 内容（可选）"),
 					"favicon_mmh3": str("favicon MMH3 哈希（可选）"),
+					"banner":       str("服务横幅/Server 头等观测文本（可选；蜜罐静态签名评估用，HTTP 与非 HTTP 均可）"),
+					"body":         str("HTTP 响应正文或其他服务正文观测（可选；蜜罐评估用，不单独落库）"),
+					"cert_subject": str("TLS 证书 subject（可选；蜜罐评估用，不单独落库）"),
+					"cert_issuer":  str("TLS 证书 issuer（可选；蜜罐评估用，不单独落库）"),
 					"technologies": map[string]any{
 						"type":        "array",
 						"items":       map[string]any{"type": "string"},
@@ -311,9 +317,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 							TaskID:        taskID,
 						})
 						if err == nil {
-							t.evaluateHoneypot(id, honeydetect.ServiceView{
-								Port: urlPort(item.URL), Banner: item.Banner, Title: item.PageTitle,
-							})
+							t.evaluateHoneypot(id, serviceViewFromItem(item, true))
 						}
 					} else {
 						id, err = t.as.UpsertOtherService(db.UpsertOtherServiceReq{
@@ -325,9 +329,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 							TaskID:      taskID,
 						})
 						if err == nil {
-							t.evaluateHoneypot(id, honeydetect.ServiceView{
-								Port: item.Port, Banner: item.Banner,
-							})
+							t.evaluateHoneypot(id, serviceViewFromItem(item, false))
 						}
 					}
 

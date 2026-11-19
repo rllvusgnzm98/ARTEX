@@ -52,18 +52,61 @@ func honeypotConfidence(score float64) string {
 	return "medium"
 }
 
-// evaluateHoneypot 是 service 资产落库后的签名评分挂点。best-effort:
-// 任何失败都只影响蜜罐标记,不影响资产登记。
-func (t *ToolSet) evaluateHoneypot(assetID int64, v honeydetect.ServiceView) {
-	if assetID <= 0 {
-		return
+// serviceViewFromItem 把 insert_assets 观测字段填进 ServiceView。
+// HTTP 用 URL 端口；非 HTTP 用显式 port。body/证书不落独立列，只参与评估。
+func serviceViewFromItem(item assetInputItem, httpService bool) honeydetect.ServiceView {
+	port := item.Port
+	if httpService {
+		if p := urlPort(item.URL); p != 0 {
+			port = p
+		}
 	}
-	score, evidence := honeydetect.Evaluate(v)
+	return honeydetect.ServiceView{
+		Port:        port,
+		Banner:      item.Banner,
+		Title:       item.PageTitle,
+		Body:        item.Body,
+		CertSubject: item.CertSubject,
+		CertIssuer:  item.CertIssuer,
+	}
+}
+
+// ServiceViewFromFields 供控制台/API upsert 复用同一套评估输入（字段名对齐 ServiceView）。
+func ServiceViewFromFields(url string, port int, banner, title, body, certSubject, certIssuer string) honeydetect.ServiceView {
+	if url != "" {
+		if p := urlPort(url); p != 0 {
+			port = p
+		}
+	}
+	return honeydetect.ServiceView{
+		Port:        port,
+		Banner:      banner,
+		Title:       title,
+		Body:        body,
+		CertSubject: certSubject,
+		CertIssuer:  certIssuer,
+	}
+}
+
+// ApplyHoneypotEvaluation 用既有 honeydetect 签名库评估，命中则回写
+// honeypot_score / honeypot_evidence。不是默认硬闸，不影响资产登记成败。
+func ApplyHoneypotEvaluation(as *db.AssetStore, assetID int64, v honeydetect.ServiceView) (score float64, evidence []string) {
+	if assetID <= 0 {
+		return 0, nil
+	}
+	score, evidence = honeydetect.Evaluate(v)
+	if score > 0 && as != nil {
+		_ = as.SetHoneypotScore(assetID, score, evidence)
+	}
+	return score, evidence
+}
+
+// evaluateHoneypot 是 service 资产落库后的签名评分挂点。best-effort:
+// 任何失败都只影响蜜罐标记,不影响资产登记。命中时再写一条 fact。
+func (t *ToolSet) evaluateHoneypot(assetID int64, v honeydetect.ServiceView) {
+	score, evidence := ApplyHoneypotEvaluation(t.as, assetID, v)
 	if score <= 0 {
 		return
-	}
-	if t.as != nil {
-		_ = t.as.SetHoneypotScore(assetID, score, evidence)
 	}
 	if t.ts == nil || t.taskID <= 0 {
 		return
