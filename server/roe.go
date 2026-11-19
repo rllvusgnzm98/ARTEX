@@ -28,12 +28,12 @@ func newRoEConfig(pg *db.DB) guard.RoEConfig {
 			v, _, _ := pg.GetSetting(settingRoEEnforcement)
 			return v
 		},
-		Scope: func(taskID int64) []guard.ScopeRule {
+		Scope: func(taskID int64) ([]guard.ScopeRule, error) {
 			rows, err := pg.Assets().ListTaskScope(taskID)
 			if err != nil {
-				return nil // 读取失败按未登记范围(Unknown → 放行)
+				return nil, err // 读失败交给 guard:strict 不得当成空范围放行
 			}
-			return scopeRulesFromRows(rows)
+			return scopeRulesFromRows(rows), nil
 		},
 		TaskIDOf: func(ctx context.Context) int64 {
 			return agent.RunInfoFrom(ctx).TaskID
