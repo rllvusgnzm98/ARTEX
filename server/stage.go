@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"path/filepath"
@@ -55,11 +54,9 @@ func (s *Server) SetStageBaseURL(addr string) {
 // 的 system/text 模式);任务已结束或无任务上下文时至少留服务端日志。
 func (s *Server) recordStageEvent(ev stage.Event) {
 	e := ev.Entry
-	summary := fmt.Sprintf("stage %s: %s (token=%s… size=%d bytes, expires %s)",
-		ev.Kind, e.Name, e.Token[:8], e.Size, e.ExpiresAt.Format(time.RFC3339))
-	if ev.Kind == stage.EventDownload {
-		summary = fmt.Sprintf("stage download: %s 被 %s 拉取 %d/%d 字节(累计命中 %d 次)",
-			e.Name, ev.Remote, ev.Bytes, e.Size, e.Hits)
+	summary, detail := stageEventTexts(ev)
+	if testStageActivity != nil {
+		testStageActivity(summary, detail)
 	}
 	log.Printf("[stage] task=%s %s", orDash(e.TaskID), summary)
 	if e.TaskID == "" {
@@ -74,8 +71,7 @@ func (s *Server) recordStageEvent(ev stage.Event) {
 	if _, err := t.Store.AppendActivity(db.Activity{
 		Worker: "system", Kind: "text", Tool: "stage_share",
 		Summary: summary,
-		Detail: fmt.Sprintf("token=%s name=%s size=%d one_shot=%v expires_at=%s remote=%s bytes=%d hits=%d",
-			e.Token, e.Name, e.Size, e.OneShot, e.ExpiresAt.Format(time.RFC3339), ev.Remote, ev.Bytes, e.Hits),
+		Detail:  detail,
 	}); err != nil {
 		log.Printf("[stage] activity 写入失败(task=%s): %v", e.TaskID, err)
 	}
@@ -128,7 +124,18 @@ func (s *Server) stageCreate(w http.ResponseWriter, r *http.Request) {
 	var err error
 	switch {
 	case strings.TrimSpace(req.Path) != "":
-		e, err = s.stage.PutFile(strings.TrimSpace(req.Path), opts)
+		// path 模式会读主机文件：必须围在 task_id 对应的任务工作区内。
+		// 没有 task_id 时拒绝（content_base64 不读主机路径，可保留）。
+		if strings.TrimSpace(req.TaskID) == "" {
+			writeErr(w, 400, "path 模式需要 task_id，且文件必须位于该任务工作区内")
+			return
+		}
+		resolved, rerr := s.resolveTaskWorkspaceFile(strings.TrimSpace(req.TaskID), strings.TrimSpace(req.Path))
+		if rerr != nil {
+			writeErr(w, 400, rerr.Error())
+			return
+		}
+		e, err = s.stage.PutFile(resolved, opts)
 	case req.ContentBase64 != "":
 		data, derr := base64.StdEncoding.DecodeString(req.ContentBase64)
 		if derr != nil {
@@ -177,14 +184,15 @@ func (s *Server) stageShareTool() actool.CoreTool {
 	}
 	return actool.Build(actool.Spec{
 		Name: "stage_share",
-		Description: "把工作区里已生成的文件交给平台受管暂存服务投递给目标:返回随机 token 下载 URL(/s/<token>/<name>,无目录列举)与过期时间。" +
+		Description: "把当前任务工作区里已生成的文件交给平台受管暂存服务投递给目标:返回随机 token 下载 URL(/s/<token>/<name>,无目录列举)与过期时间。" +
+			"只允许投递本任务工作区（data/tasks/<taskID>）内的文件；相对或绝对路径均可，逃出工作区的路径会被拒绝。" +
 			"硬 TTL 默认 15 分钟(ttl_minutes 可调,上限 120),到期自动销毁;one_shot=true 时目标首次完整下载后立即即焚。" +
-			"【只用于向目标投递工具/payload】——不要投递战利品/凭据,数据回流一律走会话读取/evidence。" +
+			"【只用于向目标投递工具】——不要投递战利品/凭据,数据回流一律走会话读取/evidence。" +
 			"返回的 URL 主机是平台监听地址;目标机器不可达该地址时,用目标可达的平台地址/隧道替换主机部分(路径与 token 不变)。",
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"path":        map[string]any{"type": "string", "description": "要投递的本地文件绝对路径(工作区里已生成的工具/payload)"},
+				"path":        map[string]any{"type": "string", "description": "当前任务工作区内要投递的文件路径（相对或绝对，不得逃出工作区）"},
 				"ttl_minutes": map[string]any{"type": "integer", "description": "存活分钟数,默认 15,上限 120"},
 				"one_shot":    map[string]any{"type": "boolean", "description": "true = 目标首次成功完整下载后立即销毁(默认 false)"},
 			},
@@ -206,11 +214,15 @@ func (s *Server) stageShareTool() actool.CoreTool {
 				return actool.Errorf("path 为必填参数"), nil
 			}
 			ri := agent.RunInfoFrom(ctx)
-			taskID := ""
-			if ri.TaskID > 0 { // 0 = 非任务 run(聊天会话),无任务上下文
-				taskID = strconv.FormatInt(ri.TaskID, 10)
+			if ri.TaskID <= 0 { // 0 = 非任务 run(聊天会话),无任务上下文
+				return actool.Errorf("缺少任务上下文，拒绝读取主机路径"), nil
 			}
-			e, err := s.stage.PutFile(strings.TrimSpace(a.Path), stage.PutOpts{
+			taskID := strconv.FormatInt(ri.TaskID, 10)
+			resolved, rerr := s.resolveTaskWorkspaceFile(taskID, strings.TrimSpace(a.Path))
+			if rerr != nil {
+				return actool.Errorf(rerr.Error()), nil
+			}
+			e, err := s.stage.PutFile(resolved, stage.PutOpts{
 				TTL:     time.Duration(a.TTLMinutes) * time.Minute,
 				OneShot: a.OneShot,
 				TaskID:  taskID,
