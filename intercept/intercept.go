@@ -570,7 +570,8 @@ func defaultMessage(action, name string) string {
 func (i *Interceptor) Log(ctx context.Context, convID int64, dec Decision, toolName string, input []byte, status string) {
 	taskID, agentName := taskInfoFromCtx(ctx)
 	audit := auditFor(ctx, dec, input, status)
-	id, err := i.db.CreateDecidedIntercept(dec.RuleID, convID, taskID, agentName, toolName, input, status, dec.Message, audit)
+	stored := RedactStoredToolInput(toolName, input)
+	id, err := i.db.CreateDecidedIntercept(dec.RuleID, convID, taskID, agentName, toolName, stored, status, dec.Message, audit)
 	if err == nil {
 		i.bindResult(ctx, id, audit)
 	}
@@ -590,7 +591,8 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 	taskEmit := taskEmitFromCtx(ctx)
 
 	audit := auditFor(ctx, dec, input, "pending")
-	pendingID, err := i.db.CreateInterceptPending(ruleID, convID, taskID, agentName, toolName, input, dec.Message, audit)
+	stored := RedactStoredToolInput(toolName, input)
+	pendingID, err := i.db.CreateInterceptPending(ruleID, convID, taskID, agentName, toolName, stored, dec.Message, audit)
 	if err != nil {
 		return false
 	}
@@ -608,7 +610,7 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 	detail, _ := json.Marshal(map[string]any{
 		"pending_id": pendingID,
 		"tool":       toolName,
-		"input":      json.RawMessage(input),
+		"input":      json.RawMessage(stored),
 	})
 	activity := db.Activity{
 		Kind:    "intercept_request",

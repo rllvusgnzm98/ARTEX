@@ -220,7 +220,7 @@ func (s *Server) interceptListPending(w http.ResponseWriter, r *http.Request) {
 	if pending == nil {
 		pending = []db.InterceptPending{}
 	}
-	writeJSON(w, 200, map[string]any{"pending": pending})
+	writeJSON(w, 200, map[string]any{"pending": intercept.PublicPendings(pending)})
 }
 
 func (s *Server) interceptGetOne(w http.ResponseWriter, r *http.Request) {
@@ -242,7 +242,7 @@ func (s *Server) interceptGetOne(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "not found")
 		return
 	}
-	writeJSON(w, 200, p)
+	writeJSON(w, 200, intercept.PublicPending(*p))
 }
 
 func (s *Server) interceptListTaskItems(w http.ResponseWriter, r *http.Request) {
@@ -270,7 +270,7 @@ func (s *Server) interceptListTaskItems(w http.ResponseWriter, r *http.Request) 
 		if items == nil {
 			items = []db.InterceptApprovalRow{}
 		}
-		writeJSON(w, 200, map[string]any{"items": items, "total": len(items)})
+		writeJSON(w, 200, map[string]any{"items": intercept.PublicApprovals(items), "total": len(items)})
 		return
 	}
 	page, size := interceptPageParams(q)
@@ -282,7 +282,7 @@ func (s *Server) interceptListTaskItems(w http.ResponseWriter, r *http.Request) 
 	if items == nil {
 		items = []db.InterceptApprovalRow{}
 	}
-	writeJSON(w, 200, map[string]any{"items": items, "total": total, "page": page, "page_size": size})
+	writeJSON(w, 200, map[string]any{"items": intercept.PublicApprovals(items), "total": total, "page": page, "page_size": size})
 }
 
 func (s *Server) interceptHistory(w http.ResponseWriter, r *http.Request) {
@@ -305,7 +305,7 @@ func (s *Server) interceptHistory(w http.ResponseWriter, r *http.Request) {
 		if items == nil {
 			items = []db.InterceptApprovalRow{}
 		}
-		writeJSON(w, 200, map[string]any{"items": items, "total": len(items)})
+		writeJSON(w, 200, map[string]any{"items": intercept.PublicApprovals(items), "total": len(items)})
 		return
 	}
 	page, size := interceptPageParams(q)
@@ -317,7 +317,7 @@ func (s *Server) interceptHistory(w http.ResponseWriter, r *http.Request) {
 	if items == nil {
 		items = []db.InterceptApprovalRow{}
 	}
-	writeJSON(w, 200, map[string]any{"items": items, "total": total, "page": page, "page_size": size})
+	writeJSON(w, 200, map[string]any{"items": intercept.PublicApprovals(items), "total": total, "page": page, "page_size": size})
 }
 
 func interceptFilterParams(q url.Values) (db.InterceptApprovalFilter, error) {
@@ -527,7 +527,7 @@ func (s *Server) interceptDetail(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "not found")
 		return
 	}
-	writeJSON(w, 200, detail)
+	writeJSON(w, 200, intercept.PublicDetail(detail))
 }
 
 // The navigation endpoint returns only the original call and its paired result.
