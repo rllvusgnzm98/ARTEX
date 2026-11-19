@@ -19,6 +19,7 @@ export default function IntranetPage() {
   const [topology, setTopology] = React.useState<IntranetTopology | null>(null);
   const [sessions, setSessions] = React.useState<ShellSession[]>([]);
   const [credentials, setCredentials] = React.useState<Credential[]>([]);
+  const [skippedCreds, setSkippedCreds] = React.useState(0);
   const [loadingTopology, setLoadingTopology] = React.useState(true);
   const [loadingSessions, setLoadingSessions] = React.useState(true);
   const [loadingCreds, setLoadingCreds] = React.useState(true);
@@ -74,11 +75,12 @@ export default function IntranetPage() {
       if (initial) setLoadingCreds(true);
       api
         .credentials(taskParam)
-        .then((items) => {
-          const sig = JSON.stringify(items);
+        .then((listed) => {
+          const sig = JSON.stringify(listed);
           if (sig !== credSigRef.current) {
             credSigRef.current = sig;
-            setCredentials(items);
+            setCredentials(listed.items);
+            setSkippedCreds(listed.skipped);
           }
         })
         .catch(() => {
@@ -156,7 +158,7 @@ export default function IntranetPage() {
           />
         </TabsContent>
         <TabsContent value="credentials" className="flex-1 overflow-auto">
-          <CredsTab credentials={credentials} loading={loadingCreds} />
+          <CredsTab credentials={credentials} skipped={skippedCreds} loading={loadingCreds} />
         </TabsContent>
         <TabsContent value="pending" className="flex-1 overflow-auto">
           <PendingScopeTab taskId={taskParam} />

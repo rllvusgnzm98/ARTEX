@@ -146,6 +146,11 @@ func (s *Server) credentialReusePlanTool() actool.CoreTool {
 			}
 			creds := listed.Items
 			if len(creds) == 0 {
+				// 不可解行在 Skipped：已有登记，只是当前密钥解不开。
+				// 不得说「还没有登记凭据」，也不去解密失败行或把明文写进列表/日志。
+				if len(listed.Skipped) > 0 {
+					return actool.Text("本任务已登记凭据，但当前无法解密，因此无复用建议"), nil
+				}
 				return actool.Text("本任务还没有登记凭据(add_credential 先登记),无复用建议"), nil
 			}
 			assets, err := s.m.pg.Assets().QueryByTask(ri.TaskID, "ip", 2000, 0)

@@ -80,7 +80,7 @@ import type {
   Severity,
   ShellSession,
   TunnelRecord,
-  Credential,
+  CredentialList,
   SkillCall,
   SkillItem,
   SSProject,
@@ -1352,5 +1352,8 @@ export const api = {
   handoffSession: (id: string | number) =>
     post<{ task_id: string }>(`/sessions/${encodeURIComponent(String(id))}/handoff`),
   credentials: (taskId?: string) =>
-    get<{ items: Credential[] }>(`/credentials${taskQuery(taskId)}`).then((r) => arr(r.items)),
+    get<Partial<CredentialList>>(`/credentials${taskQuery(taskId)}`).then((r) => ({
+      items: arr(r.items),
+      skipped: typeof r.skipped === "number" && r.skipped > 0 ? r.skipped : 0,
+    })),
 };
