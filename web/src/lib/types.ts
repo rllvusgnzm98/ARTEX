@@ -1712,11 +1712,19 @@ export interface Credential {
   id: number | string;
   task_id?: number;
   username?: string;
-  cred_type: string;
+  cred_type?: string;
   secret_masked?: string;
   domain?: string;
   source?: string;
   verified?: boolean;
   host_asset_id?: number;
   created_at?: string;
+  /** 无法解密的占位行：只含 id 与此状态，无密文。 */
+  status?: "undecryptable";
+}
+
+/** GET /api/credentials 的完整响应。skipped 是无法解密的行数。 */
+export interface CredentialList {
+  items: Credential[];
+  skipped: number;
 }

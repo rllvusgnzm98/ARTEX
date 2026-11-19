@@ -275,3 +275,58 @@ func TestIntranetListCredentialsSkipsUndecryptable(t *testing.T) {
 	assertUndecryptablePlaceholder(t, m, bid, onlyRaw)
 	assertNoSecretMaterial(t, onlyRaw, logBuf.String())
 }
+
+func TestCredentialReusePlanEmptyVsUndecryptable(t *testing.T) {
+	pg := openIntranetTestDB(t)
+	goodKey := []byte("intranet-test-master-key")
+	cs := db.NewCredentialStore(pg, goodKey)
+	other := db.NewCredentialStore(pg, []byte("another-master-key-32bytes!!!!"))
+	s := &Server{credStore: cs, m: &Manager{pg: pg}}
+
+	emptyCtx := agent.WithRunInfo(context.Background(), agent.RunInfo{TaskID: 980081})
+	emptyRes, err := s.credentialReusePlanTool().Call(emptyCtx, json.RawMessage(`{}`), &actool.ToolContext{})
+	if err != nil || emptyRes.IsError {
+		t.Fatalf("0 条登记应成功返回说明: err=%v res=%s", err, emptyRes.Flatten())
+	}
+	emptyText := emptyRes.Flatten()
+	if !strings.Contains(emptyText, "还没有登记凭据") {
+		t.Fatalf("真正 0 条登记应保持原语义: %s", emptyText)
+	}
+	if strings.Contains(emptyText, "无法解密") {
+		t.Fatalf("0 条登记不得说成无法解密: %s", emptyText)
+	}
+
+	bid, err := other.Create(context.Background(), &db.CredentialRecord{
+		TaskID: 980082, Username: "other", CredType: "password",
+		Secret: "fixture-other-key", Source: "t",
+	})
+	if err != nil {
+		t.Fatalf("Create other: %v", err)
+	}
+	t.Cleanup(func() { _ = other.Delete(context.Background(), bid) })
+
+	var logBuf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(prev)
+
+	badCtx := agent.WithRunInfo(context.Background(), agent.RunInfo{TaskID: 980082})
+	badRes, err := s.credentialReusePlanTool().Call(badCtx, json.RawMessage(`{}`), &actool.ToolContext{})
+	if err != nil || badRes.IsError {
+		t.Fatalf("全是不可解行时应返回说明而不是工具错误: err=%v res=%s", err, badRes.Flatten())
+	}
+	badText := badRes.Flatten()
+	if strings.Contains(badText, "还没有登记凭据") {
+		t.Fatalf("已登记但无法解密时不得说还没有登记凭据: %s", badText)
+	}
+	if !strings.Contains(badText, "无法解密") || !strings.Contains(badText, "无复用建议") {
+		t.Fatalf("应明确是已登记但当前无法解密、因此无复用建议: %s", badText)
+	}
+	assertNoSecretMaterial(t, []byte(badText), logBuf.String())
+
+	listRes, err := s.listCredentialsTool().Call(badCtx, json.RawMessage(`{}`), &actool.ToolContext{})
+	if err != nil || listRes.IsError {
+		t.Fatalf("list_credentials: err=%v res=%s", err, listRes.Flatten())
+	}
+	assertNoSecretMaterial(t, []byte(listRes.Flatten()), logBuf.String())
+}
