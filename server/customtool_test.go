@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -82,11 +83,17 @@ func TestShellQuote(t *testing.T) {
 
 // TestExecPython runs a real Python script end-to-end: it must read params from
 // stdin JSON and the mirrored env var, then print — verifying the whole script
-// param-passing path. Skips if no python3.
+// param-passing path. Skips if no python3/python is usable (Windows 常见：只有
+// WindowsApps 的 python3 占位程序，真正可用的是 python.exe，因此两者都试)。
 func TestExecPython(t *testing.T) {
 	interp, err := exec.LookPath("python3")
+	// Windows 常见只有 WindowsApps 的 python3 占位程序（执行返回 9009），
+	// 真正可用的是 python.exe：两者都试，占位程序不算可用解释器。
+	if err != nil || (runtime.GOOS == "windows" && strings.Contains(strings.ToLower(interp), "windowsapps")) {
+		interp, err = exec.LookPath("python")
+	}
 	if err != nil {
-		t.Skip("python3 unavailable")
+		t.Skip("python3/python unavailable")
 	}
 	code := `import json,sys,os
 a = json.load(sys.stdin)
