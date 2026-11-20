@@ -428,18 +428,34 @@ func recoverTaskArchiveStages(dataDir string, pg *pgdb.DB) error {
 			errs = append(errs, getErr)
 			continue
 		}
-		if archive != nil && archive.State == pgdb.ArchiveReady {
+		if archive != nil && (archive.State == pgdb.ArchiveReady || archive.ArchivedAt != nil) {
 			if err := os.RemoveAll(root); err != nil {
 				errs = append(errs, err)
 			}
 			continue
 		}
+		taskID, err := strconv.ParseInt(journal.TaskID, 10, 64)
+		if archive != nil {
+			taskID = archive.TaskID
+		} else if err != nil || taskID <= 0 {
+			errs = append(errs, fmt.Errorf("invalid task ID in archive staging journal: %q", journal.TaskID))
+			continue
+		}
+		packagePath := taskArchivePath(dataDir, journal.ArchiveID, strconv.FormatInt(taskID, 10))
+		// Keep the journal until both package paths are clean so recovery can retry.
+		var cleanupErrs []error
+		for _, path := range []string{packagePath, packagePath + ".partial"} {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				cleanupErrs = append(cleanupErrs, err)
+			}
+		}
+		if err := errors.Join(cleanupErrs...); err != nil {
+			errs = append(errs, err)
+			continue
+		}
 		stage := &taskArchiveFileStage{root: root, payload: filepath.Join(root, "payload"), journal: journal}
 		if err := stage.rollback(); err != nil {
 			errs = append(errs, err)
-		}
-		if archive != nil && archive.ArchivePath != "" {
-			_ = os.Remove(archive.ArchivePath)
 		}
 	}
 	return errors.Join(errs...)

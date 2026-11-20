@@ -272,6 +272,9 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 			return nil, fmt.Errorf("restore %s: %w", table, err)
 		}
 	}
+	if err := restoreArchiveFindingRetests(tx, remappedTables["finding_retests"]); err != nil {
+		return nil, fmt.Errorf("restore finding_retests: %w", err)
+	}
 	if err := restoreFindingTrafficTx(tx, snapshot); err != nil {
 		return nil, fmt.Errorf("restore finding traffic: %w", err)
 	}
@@ -299,6 +302,20 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 		return nil, err
 	}
 	return warnings, tx.Commit()
+}
+
+func restoreArchiveFindingRetests(tx *sql.Tx, raw json.RawMessage) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	_, err := tx.Exec(`INSERT INTO finding_retests (
+ id,finding_id,conversation_id,status,verdict,notes,snapshot,summary,evidence,error,created_at,started_at,finished_at
+)
+SELECT r.id,r.finding_id,
+ (SELECT c.id FROM conversations c WHERE c.id=r.conversation_id FOR KEY SHARE),
+ r.status,r.verdict,r.notes,r.snapshot,r.summary,r.evidence,r.error,r.created_at,r.started_at,r.finished_at
+FROM json_populate_recordset(NULL::finding_retests,$1::json) r`, string(raw))
+	return err
 }
 
 func restoreExplorationStub(tx *sql.Tx, raw json.RawMessage, expID int64) error {

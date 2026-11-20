@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	pgdb "github.com/Autumn-27/artex/db"
@@ -162,6 +163,92 @@ func TestTaskArchiveStageJournalRollsBackInterruptedMoves(t *testing.T) {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("interrupted archive did not restore %s: %v", path, err)
 		}
+	}
+}
+
+func TestTaskArchiveRecoveryCleansUncommittedPackages(t *testing.T) {
+	dsn, _, err := pgdb.DSN()
+	if err != nil {
+		t.Skipf("no database config: %v", err)
+	}
+	pg, err := pgdb.Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pg.Close()
+	for _, tc := range []struct {
+		name      string
+		suffix    string
+		committed bool
+	}{
+		{name: "partial_write", suffix: ".partial"},
+		{name: "renamed_before_commit"},
+		{name: "committed", committed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			task, err := pg.CreateTaskWithOptions(t.Name(), "recover archive package", pgdb.TaskCreateOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_, _ = pg.Exec(`DELETE FROM task_archives WHERE task_id=$1`, task.ID)
+				_ = pg.DeleteTask(task.ID)
+			})
+			if err := pg.SetPaused(task.ID, true); err != nil {
+				t.Fatal(err)
+			}
+			archive, err := pg.QueueTaskArchive(task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			taskID := strconv.FormatInt(task.ID, 10)
+			taskFile := filepath.Join(dataDir, "tasks", taskID, "evidence.txt")
+			if err := os.MkdirAll(filepath.Dir(taskFile), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(taskFile, []byte("task evidence"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			stage, err := stageTaskArchiveFiles(dataDir, archive.ID, taskID, task.ExplorationID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := taskArchivePath(dataDir, archive.ID, taskID)
+			if err := os.WriteFile(path+tc.suffix, []byte("archive package"), archiveFileMode); err != nil {
+				t.Fatal(err)
+			}
+			if tc.committed {
+				if _, err := pg.Exec(`UPDATE task_archives SET state=$2,archive_path=$3,archived_at=now() WHERE id=$1`, archive.ID, pgdb.ArchiveReady, path); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := pg.FailTaskArchiveJob(archive.ID, pgdb.Archiving, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := recoverTaskArchiveStages(dataDir, pg); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(stage.root); !os.IsNotExist(err) {
+				t.Fatalf("staging remains after recovery: %v", err)
+			}
+			if tc.committed {
+				if got, err := os.ReadFile(path); err != nil || string(got) != "archive package" {
+					t.Fatalf("committed package = %q, %v", got, err)
+				}
+				if _, err := os.Stat(taskFile); !os.IsNotExist(err) {
+					t.Fatalf("committed task file reappeared: %v", err)
+				}
+				return
+			}
+			for _, uncommitted := range []string{path, path + ".partial"} {
+				if _, err := os.Stat(uncommitted); !os.IsNotExist(err) {
+					t.Errorf("uncommitted package %s remains: %v", uncommitted, err)
+				}
+			}
+			if got, err := os.ReadFile(taskFile); err != nil || string(got) != "task evidence" {
+				t.Fatalf("rolled back task file = %q, %v", got, err)
+			}
+		})
 	}
 }
 

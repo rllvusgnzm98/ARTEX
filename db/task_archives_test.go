@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -329,6 +330,188 @@ VALUES($1,$2,0,'quota_exhausted','balance exhausted',$3,$4,$3)`, task.ID, llmPro
 	}
 	if item, err := d.GetTaskArchive(archive.ID); err != nil || item != nil {
 		t.Fatalf("archive metadata must be consumed: %+v, %v", item, err)
+	}
+}
+
+func TestTaskArchiveFindingRetestHistory(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if err := d.EnsureLLMRecordsTable(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.EnsureLLMUsageTable(); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		legacy bool
+	}{
+		{name: "with_retest_history"},
+		{name: "legacy_manifest_without_retests", legacy: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			task, err := d.CreateTaskWithOptions(t.Name(), "restore finding retests", TaskCreateOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_, _ = d.Exec(`DELETE FROM task_archives WHERE task_id=$1`, task.ID)
+				_ = d.DeleteTask(task.ID)
+			})
+			if err := d.SetPaused(task.ID, true); err != nil {
+				t.Fatal(err)
+			}
+			findingID, err := d.AddFinding(task.ID, 0, "archive-retest", "finding", "high", "original summary", "original evidence", "worker", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var conversationIDs, retestIDs [2]int64
+			var expected [2]string
+			for i := range conversationIDs {
+				var conversationID int64
+				if err := d.QueryRow(`INSERT INTO conversations(agent_key) VALUES($1) RETURNING id`, FindingRetestAgentKey).Scan(&conversationID); err != nil {
+					t.Fatal(err)
+				}
+				conversationIDs[i] = conversationID
+				t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM conversations WHERE id=$1`, conversationID) })
+				if err := d.QueryRow(`INSERT INTO finding_retests AS r
+(finding_id,conversation_id,status,verdict,notes,snapshot,summary,evidence,created_at,started_at,finished_at)
+VALUES($1,$2,'completed','fixed',$3,'{"input":"original finding"}','retest summary','retest evidence',
+       now()-interval '2 minutes',now()-interval '1 minute',now())
+RETURNING id,to_jsonb(r)::text`, findingID, conversationID, fmt.Sprintf("retest notes %d", i)).Scan(&retestIDs[i], &expected[i]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			archive, err := d.QueueTaskArchive(task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			claimed, err := d.ClaimTaskArchiveJob(t.Context())
+			if err != nil || claimed == nil || claimed.ID != archive.ID || claimed.State != Archiving {
+				t.Fatalf("archive claim = %+v, %v", claimed, err)
+			}
+			snapshot, err := d.SnapshotTaskArchive(task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := snapshot.DataCounts["finding_retests"]; got != int64(len(retestIDs)) {
+				t.Fatalf("snapshot retest count = %d, want %d", got, len(retestIDs))
+			}
+			if err := d.CompleteTaskArchive(archive.ID, snapshot, "archive.tar.zst", "checksum", 1, 1); err != nil {
+				t.Fatal(err)
+			}
+			if history, err := d.ListFindingRetests(findingID); err != nil || len(history) != 0 {
+				t.Fatalf("archived retest history = %v, %v", history, err)
+			}
+			if _, err := d.Exec(`DELETE FROM conversations WHERE id=$1`, conversationIDs[1]); err != nil {
+				t.Fatal(err)
+			}
+			if tc.legacy {
+				snapshot.FormatVersion = TaskArchiveLegacyFormatVersion
+				delete(snapshot.Tables, "finding_retests")
+				delete(snapshot.DataCounts, "finding_retests")
+			}
+			if _, err := d.QueueTaskArchiveRestore(archive.ID); err != nil {
+				t.Fatal(err)
+			}
+			claimed, err = d.ClaimTaskArchiveJob(t.Context())
+			if err != nil || claimed == nil || claimed.ID != archive.ID || claimed.State != Restoring {
+				t.Fatalf("restore claim = %+v, %v", claimed, err)
+			}
+			if _, err := d.RestoreTaskArchive(archive.ID, snapshot, 0); err != nil {
+				t.Fatal(err)
+			}
+			history, err := d.ListFindingRetests(findingID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.legacy {
+				if len(history) != 0 {
+					t.Fatalf("legacy archive restored %d unexpected retests", len(history))
+				}
+				return
+			}
+			if len(history) != len(retestIDs) {
+				t.Fatalf("restored %d retests, want %d", len(history), len(retestIDs))
+			}
+			for i, id := range retestIDs {
+				var got, want string
+				if err := d.QueryRow(`SELECT to_jsonb(r)::text,
+ (CASE WHEN $3 THEN jsonb_set($2::jsonb,'{conversation_id}','null'::jsonb) ELSE $2::jsonb END)::text
+FROM finding_retests r WHERE id=$1`, id, expected[i], i == 1).Scan(&got, &want); err != nil {
+					t.Fatal(err)
+				}
+				if got != want {
+					t.Errorf("restored retest %d:\n got %s\nwant %s", id, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestTaskArchiveRetryRefreshesRequestSnapshot(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	task, err := d.CreateTaskWithOptions("initial description", "initial goal", TaskCreateOptions{Name: "initial archive name"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = d.Exec(`DELETE FROM task_archives WHERE task_id=$1`, task.ID)
+		_ = d.DeleteTask(task.ID)
+	}()
+	source, err := d.CreateTaskWithOptions("archive source", "source goal", TaskCreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.DeleteTask(source.ID)
+	if err := d.SetPaused(task.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := d.QueueTaskArchive(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	category := fmt.Sprintf("archive retry category %d", task.ID)
+	var categoryID int64
+	if err := d.QueryRow(`INSERT INTO task_categories(name,nkey) VALUES($1,$1) RETURNING id`, category).Scan(&categoryID); err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM task_categories WHERE id=$1`, categoryID)
+	name := fmt.Sprintf("updated archive name %d", task.ID)
+	if _, err := d.Exec(`UPDATE tasks SET name=$2,category_id=$3,description='new description',goal='new goal',
+status='done',deadline_at=now()+interval '10 minutes' WHERE id=$1`, task.ID, name, categoryID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(`INSERT INTO task_relations(task_id,source_task_id) VALUES($1,$2)`, task.ID, source.ID); err != nil {
+		t.Fatal(err)
+	}
+	stillQueued, err := d.QueueTaskArchive(task.ID)
+	if err != nil || stillQueued.TaskName != initial.TaskName || stillQueued.CategoryIDSnapshot != nil ||
+		len(stillQueued.SourceTaskIDs) != 0 || stillQueued.RemainingTimeoutSeconds != initial.RemainingTimeoutSeconds {
+		t.Fatalf("requeue before failure changed snapshot: %+v, %v", stillQueued, err)
+	}
+	if err := d.FailTaskArchiveJob(initial.ID, Archiving, errors.New("archive failed")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.QueueTaskArchive(task.ID); err != nil {
+		t.Fatal(err)
+	}
+	page, err := d.ListTaskArchives(name, ArchiveQueued, 1, 10)
+	if err != nil || len(page.Items) != 1 {
+		t.Fatalf("list after retry = %+v, %v", page, err)
+	}
+	got := page.Items[0]
+	if got.ID != initial.ID || got.TaskName != name || got.TaskDescription != "new description" || got.TaskGoal != "new goal" ||
+		got.OriginalStatus != "done" || got.CategoryIDSnapshot == nil || *got.CategoryIDSnapshot != categoryID || got.CategoryNameSnapshot != category ||
+		!slices.Equal(got.SourceTaskIDs, []int64{source.ID}) || got.RemainingTimeoutSeconds < 590 || got.RemainingTimeoutSeconds > 600 {
+		t.Fatalf("incomplete request snapshot after retry: %+v", got)
 	}
 }
 
