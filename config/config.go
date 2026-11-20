@@ -33,6 +33,9 @@ type Config struct {
 	TunnelPortRange    string   `json:"tunnel_port_range"`
 	TaskProxyPortRange string   `json:"task_proxy_port_range"`
 	OwnInfraHosts      []string `json:"own_infra_hosts"`
+	// GateMode 是伪装门控（off / detect / enforce）。空字符串表示本文件未配置，
+	// 由 ResolveGate 继续看更低优先级。优先级与未知值回落见 gate.go。
+	GateMode string `json:"gate_mode"`
 }
 
 // BaseDir is the directory that anchors all runtime artifacts (config.json and

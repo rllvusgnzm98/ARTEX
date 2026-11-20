@@ -1,6 +1,12 @@
 package db
 
-import "database/sql"
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"strings"
+	"time"
+)
 
 // Settings is a tiny key-value store for global app config the UI toggles at
 // runtime (e.g. traffic_capture). Missing keys fall back to caller defaults.
@@ -58,4 +64,30 @@ func (d *DB) SetBool(key string, val bool) error {
 		return d.SetSetting(key, "true")
 	}
 	return d.SetSetting(key, "false")
+}
+
+// LookupSetting 是 doctor 用的只读查询：短连接、不迁移、不 seed、不写库。
+// 键不存在或 settings 表尚未创建时 ok=false 且 err=nil。连接或权限失败返回 err。
+func LookupSetting(dsn, key string) (value string, ok bool, err error) {
+	if strings.TrimSpace(dsn) == "" {
+		return "", false, errors.New("空 DSN")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return "", false, err
+	}
+	defer sqlDB.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := sqlDB.PingContext(ctx); err != nil {
+		return "", false, err
+	}
+	err = sqlDB.QueryRowContext(ctx, `SELECT value FROM settings WHERE key=$1`, key).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) || isUndefinedTable(err) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return value, true, nil
 }

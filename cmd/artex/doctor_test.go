@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -36,6 +37,8 @@ func isolateConfig(t *testing.T) string {
 	}
 	t.Setenv("ARTEX_CONFIG", cfg)
 	t.Setenv("ARTEX_CALLBACK_ADDR", "")
+	t.Setenv("ARTEX_GATE_MODE", "")
+	t.Setenv("ARTEX_GATE", "")
 	return dir
 }
 
@@ -79,8 +82,14 @@ func TestRunDoctorMissingManifestDoesNotFail(t *testing.T) {
 	if strings.Contains(out, "门控将默认开启") || strings.Contains(out, "非 loopback 时默认开启") {
 		t.Fatalf("不得出现非 loopback 自动门控文案:\n%s", out)
 	}
-	if !strings.Contains(out, "本波未启用") || !strings.Contains(out, "ARTEX_GATE=1") {
-		t.Fatalf("门控提示应说明本波未启用且需显式 opt-in:\n%s", out)
+	if strings.Contains(out, "本波未启用") {
+		t.Fatalf("不得再使用未实现占位文案:\n%s", out)
+	}
+	if !strings.Contains(out, "mode=") || !strings.Contains(out, "来源=") || !strings.Contains(out, "探测计数") {
+		t.Fatalf("门控应报告 mode、来源和探测计数:\n%s", out)
+	}
+	if !strings.Contains(out, "暴露全网卡") || !strings.Contains(out, "服务未运行") {
+		t.Fatalf("默认地址应报告暴露全网卡，且无统计文件时说明服务未运行:\n%s", out)
 	}
 	if strings.Contains(out, "backend listening") {
 		t.Fatal("doctor 不得启动服务")
@@ -274,6 +283,10 @@ func TestDoctorCLIDoesNotStartServer(t *testing.T) {
 	isolateConfig(t)
 	t.Setenv("ARTEX_PG_DSN", "")
 	bin := filepath.Join(t.TempDir(), "artex")
+	if runtime.GOOS == "windows" {
+		// 无 .exe 后缀时，Windows 的 os/exec 不会把绝对路径当成可执行文件。
+		bin += ".exe"
+	}
 	build := exec.Command("go", "build", "-o", bin, "github.com/Autumn-27/artex/cmd/artex")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
@@ -295,5 +308,67 @@ func TestDoctorCLIDoesNotStartServer(t *testing.T) {
 	}
 	if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 1 {
 		t.Fatalf("无库配置时 doctor 应退出 1, err=%v\n%s", err, text)
+	}
+}
+
+func TestDoctorReportsResolvedGate(t *testing.T) {
+	isolateConfig(t)
+	t.Setenv("ARTEX_PG_DSN", "")
+	t.Setenv("ARTEX_GATE_MODE", "enforce")
+	t.Setenv("ARTEX_GATE", "0")
+	out, code := captureDoctor(t, "-data", t.TempDir(), "-addr", "127.0.0.1:8787")
+	if code != 1 {
+		t.Fatalf("无数据库应 FAIL, exit=%d\n%s", code, out)
+	}
+	if !strings.Contains(out, "mode=enforce") || !strings.Contains(out, "来源=env") {
+		t.Fatalf("env 应压过 legacy，got:\n%s", out)
+	}
+	if !strings.Contains(out, "仅本机回环") {
+		t.Fatalf("回环监听应被识别:\n%s", out)
+	}
+	if !strings.Contains(out, "服务未运行") {
+		t.Fatalf("无统计文件应说明服务未运行:\n%s", out)
+	}
+	if strings.Contains(out, "命中 0") {
+		t.Fatalf("读不到计数时不得编造零:\n%s", out)
+	}
+	if strings.Contains(out, "门控将默认开启") || strings.Contains(out, "非 loopback 时默认开启") {
+		t.Fatalf("不得出现自动开门控文案:\n%s", out)
+	}
+}
+
+func TestDoctorReadsGateStatsFile(t *testing.T) {
+	isolateConfig(t)
+	t.Setenv("ARTEX_PG_DSN", "")
+	data := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(data, "gate"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"mode":"detect","source":"default","hits":3,"allows":2,"bypasses":1,"decoys":1,"updated_at":"2026-01-02T03:04:05Z"}`
+	if err := os.WriteFile(filepath.Join(data, "gate", "stats.json"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := captureDoctor(t, "-data", data, "-addr", ":8787")
+	if !strings.Contains(out, "命中 3") || !strings.Contains(out, "放行 2") || !strings.Contains(out, "旁路 1") || !strings.Contains(out, "诱饵 1") {
+		t.Fatalf("应读到统计文件里的计数:\n%s", out)
+	}
+	if !strings.Contains(out, "2026-01-02T03:04:05Z") {
+		t.Fatalf("应读到统计文件里的更新时间:\n%s", out)
+	}
+	if strings.Contains(out, "服务未运行") {
+		t.Fatalf("有统计文件时不得说服务未运行:\n%s", out)
+	}
+}
+
+func TestDoctorGatePathNotDir(t *testing.T) {
+	isolateConfig(t)
+	t.Setenv("ARTEX_PG_DSN", "")
+	data := t.TempDir()
+	if err := os.WriteFile(filepath.Join(data, "gate"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := captureDoctor(t, "-data", data)
+	if !strings.Contains(out, "[WARN] 伪装门控") || !strings.Contains(out, "不是目录") {
+		t.Fatalf("data/gate 不是目录应 WARN:\n%s", out)
 	}
 }
