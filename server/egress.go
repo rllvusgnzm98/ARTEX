@@ -5,17 +5,23 @@ package server
 // taskFromPG / agentGuard 里通过 SetEgress 引用同一份——所以这里只需在「启动」
 // 与「LLM profile 变更」(applyLLM 是唯一漏斗)时向这一份注册/替换指纹,所有
 // 任务(含已存在的)即时生效,无需逐任务注入。注册只存哈希(见 guard/egress.go),
-// 本文件是原文唯一出现的地方,不日志、不落盘。
+// 本文件是原文唯一出现的地方:不把原文写入日志或落盘。callback_addr 过短无法
+// 注册时只记长度不足,不记原文。
 
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"log"
 	"net/url"
 	"regexp"
 	"strings"
 
 	"github.com/Autumn-27/artex/config"
 )
+
+// egressMinSecretLen 与 guard 包未导出的最短指纹长度一致。更短的串不会被
+// AddFingerprint 收下。
+const egressMinSecretLen = 8
 
 // registerEgressFingerprints 把当前平台敏感信息注册进共享 EgressGuard:
 // 激活 LLM profile 的 API key(变更时整体替换)、jwt.key 文件内容(原文/hex/base64
@@ -45,7 +51,13 @@ func (s *Server) registerEgressFingerprints() {
 		eg.AddFingerprint("pg_password", dsnPassword(dsn))
 	}
 	// config.json 的 callback_addr(反弹 shell/隧道回连地址)。
-	eg.AddFingerprint("callback_addr", config.CallbackAddr())
+	// 过短则指纹不会注册;只记长度,不记原文。随后登记平台自身 host,供回连放行。
+	cb := config.CallbackAddr()
+	eg.AddFingerprint("callback_addr", cb)
+	if cb != "" && len(cb) < egressMinSecretLen {
+		log.Printf("[egress] callback_addr 长度 %d 不足 %d，已跳过指纹注册", len(cb), egressMinSecretLen)
+	}
+	eg.AddOwnInfraHosts(config.OwnInfraHosts()...)
 }
 
 // dsnPassword 从 DSN 里取密码:兼容 URL 形态(postgres://user:pass@host/db)

@@ -460,6 +460,8 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 			log.Printf("[taskproxy] 端口池非法,按任务 MITM 关闭: %v", err)
 		} else {
 			m.taskProxy = newTaskProxyManager(dir, pgdb.NewTunnelStore(pg), m.GlobalProxy, pmin, pmax)
+			m.taskProxy.useRoE(m.proxyRoEDeps())
+			agent.TaskScopeChanged = m.InvalidateProxyRoE
 		}
 	}
 	// Reconcile the seeded browser MCP with the persisted capture state, so a
@@ -861,6 +863,58 @@ func (m *Manager) RefreshTaskProxy(taskID int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	m.taskProxy.Refresh(ctx, taskID)
+}
+
+// InvalidateProxyRoE drops one task's proxy scope cache so add_task_scope
+// takes effect before the 5s TTL.
+func (m *Manager) InvalidateProxyRoE(taskID int64) {
+	if m == nil || m.taskProxy == nil {
+		return
+	}
+	m.taskProxy.invalidateRoE(taskID)
+}
+
+// proxyRoEDeps wires the task proxy host gate to settings, task_scope and activity.
+func (m *Manager) proxyRoEDeps() roeGateDeps {
+	return roeGateDeps{
+		mode: func() string {
+			if m == nil || m.pg == nil {
+				return ""
+			}
+			v, _, _ := m.pg.GetSetting(settingRoEEnforcement)
+			return v
+		},
+		scope: func(taskID int64) ([]guard.ScopeRule, error) {
+			if m == nil || m.pg == nil {
+				return nil, fmt.Errorf("范围存储未就绪")
+			}
+			rows, err := loadTaskScopeRows(m.pg, taskID)
+			if err != nil {
+				return nil, err
+			}
+			return scopeRulesFromRows(rows), nil
+		},
+		warn: m.recordProxyRoEWarn,
+	}
+}
+
+// recordProxyRoEWarn logs a warn-mode out-of-scope proxy hit and, when the task
+// handle is still loaded, appends it to that task's activity stream.
+func (m *Manager) recordProxyRoEWarn(taskID int64, host, msg string) {
+	log.Printf("[taskproxy][roe] task %d host %s: %s", taskID, host, msg)
+	if m == nil {
+		return
+	}
+	t, ok := m.Task(strconv.FormatInt(taskID, 10))
+	if !ok || t == nil || t.Store == nil {
+		return
+	}
+	if _, err := t.Store.AppendActivity(pgdb.Activity{
+		Worker: "system", Kind: "text", Tool: "roe",
+		Summary: msg, Detail: msg,
+	}); err != nil {
+		log.Printf("[taskproxy][roe] activity 写入失败 task %d: %v", taskID, err)
+	}
 }
 
 // CloseTaskProxy destroys a task's MITM instance (task deleted/archived).

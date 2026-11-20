@@ -290,6 +290,10 @@ func (s *Server) tunnelDeployTool() actool.CoreTool {
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
+			opts.CheckTarget = func(host string, port int) error {
+				_, err := s.roeCheckHost(ctx, host, "隧道目标")
+				return err
+			}
 			opts.UsedPorts, err = s.occupiedPorts(ctx)
 			if err != nil {
 				return actool.Errorf("端口占用汇总失败：" + err.Error()), nil

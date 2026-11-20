@@ -1911,6 +1911,7 @@ func (s *Server) taskScopeAdd(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	s.m.InvalidateProxyRoE(taskID)
 	writeJSON(w, 200, ts)
 }
 
@@ -1940,6 +1941,7 @@ func (s *Server) taskScopeDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "scope row not found")
 		return
 	}
+	s.m.InvalidateProxyRoE(taskID)
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 

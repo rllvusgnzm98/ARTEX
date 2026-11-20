@@ -4,6 +4,7 @@ package tunnel
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -158,6 +159,55 @@ func TestPlanSocksPortPoolExhausted(t *testing.T) {
 	o.PortMin, o.PortMax = 20000, 20000 // 只有一个口，socks 需要两个
 	if _, err := PlanSocks(o); err == nil {
 		t.Error("端口池不够分配两个口应报错")
+	}
+}
+
+func TestPlanCheckTarget(t *testing.T) {
+	const host = "10.255.255.1"
+	const port = 8443
+
+	blocked := testOpts()
+	blocked.TargetHost, blocked.TargetPort = host, port
+	listens := 0
+	blocked.CanListen = func(int) bool {
+		listens++
+		return true
+	}
+	blocked.CheckTarget = func(gotHost string, gotPort int) error {
+		if gotHost != host || gotPort != port {
+			t.Errorf("CheckTarget(%q, %d), want %s:%d", gotHost, gotPort, host, port)
+		}
+		return fmt.Errorf("越界")
+	}
+	if _, err := PlanPortfwd(blocked); err == nil {
+		t.Fatal("CheckTarget 返回 error 时 PlanPortfwd 应失败")
+	} else if !strings.Contains(err.Error(), "范围检查未通过") || !strings.Contains(err.Error(), "10.255.255.1:8443") || !strings.Contains(err.Error(), "越界") {
+		t.Fatalf("error = %v", err)
+	}
+	if len(blocked.UsedPorts) != 0 || listens != 0 {
+		t.Fatalf("范围检查失败不得分配端口：used=%v listens=%d", blocked.UsedPorts, listens)
+	}
+
+	open := testOpts()
+	open.TargetHost, open.TargetPort = host, port
+	if _, err := PlanPortfwd(open); err != nil {
+		t.Fatalf("nil CheckTarget 应成功: %v", err)
+	}
+
+	allowed := testOpts()
+	allowed.TargetHost, allowed.TargetPort = host, port
+	allowed.CheckTarget = func(string, int) error { return nil }
+	if _, err := PlanPortfwd(allowed); err != nil {
+		t.Fatalf("范围内 CheckTarget 应成功: %v", err)
+	}
+
+	socks := testOpts()
+	socks.CheckTarget = func(string, int) error {
+		t.Fatal("PlanSocks 不得调用 CheckTarget")
+		return fmt.Errorf("越界")
+	}
+	if _, err := PlanSocks(socks); err != nil {
+		t.Fatalf("PlanSocks 应忽略 CheckTarget: %v", err)
 	}
 }
 

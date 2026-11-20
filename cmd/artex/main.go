@@ -62,6 +62,8 @@ func run() int {
 		proxy   = flag.String("proxy", "127.0.0.1:8788", "traffic recording proxy address (empty to disable)")
 	)
 	flag.Parse()
+	// 出口审查放行平台自身回连时要认监听地址；在起服务之前记下 -addr。
+	config.SetListenAddr(*addr)
 
 	// hand the build version to the server package so GET /api/health can report it
 	// to the frontend top bar.

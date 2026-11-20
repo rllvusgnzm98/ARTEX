@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -44,34 +45,88 @@ func newRoEConfig(pg *db.DB) guard.RoEConfig {
 // scopeRulesFromRows 定义见 pendingscope.go:官方 task_scope 归一,RoE 与
 // pending_scope 发现侧共用。pending_scope 仍只是范围扩张队列,不是出界行动硬闸。
 
+// loadTaskScopeRows 是 RoE 的范围读取点。生产路径走 AssetStore.ListTaskScope。
+// 测试可替换它，单独模拟读失败，同时让 roe_enforcement 仍从库里读到。
+var loadTaskScopeRows = func(pg *db.DB, taskID int64) ([]db.TaskScope, error) {
+	if pg == nil {
+		return nil, fmt.Errorf("范围存储未就绪")
+	}
+	return pg.Assets().ListTaskScope(taskID)
+}
+
+// normalizeRoEMode 把设置值收成 off|warn|strict。空值与未知值回落 warn。
+func normalizeRoEMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "off":
+		return "off"
+	case "strict":
+		return "strict"
+	default:
+		return "warn"
+	}
+}
+
+func (s *Server) roeMode() string {
+	if s == nil || s.m == nil || s.m.pg == nil {
+		return "warn"
+	}
+	raw, _, _ := s.m.pg.GetSetting(settingRoEEnforcement)
+	return normalizeRoEMode(raw)
+}
+
+// roeVerdictFor 是会话、隧道与任务代理共用的范围判定内核。
+// off 直接 ScopeUnknown；taskID<=0 或 host 为空也是 ScopeUnknown 且 err==nil；
+// ListTaskScope 失败返回 ScopeUnknown 与 err，由调用方按 strict/warn 决定。
+func (s *Server) roeVerdictFor(taskID int64, host string) (guard.ScopeVerdict, string, error) {
+	mode := s.roeMode()
+	if mode == "off" {
+		return guard.ScopeUnknown, mode, nil
+	}
+	if taskID <= 0 || strings.TrimSpace(host) == "" {
+		return guard.ScopeUnknown, mode, nil
+	}
+	if s == nil || s.m == nil || s.m.pg == nil {
+		return guard.ScopeUnknown, mode, fmt.Errorf("范围存储未就绪")
+	}
+	rows, err := loadTaskScopeRows(s.m.pg, taskID)
+	if err != nil {
+		return guard.ScopeUnknown, mode, err
+	}
+	return guard.NewScopeMatcher(scopeRulesFromRows(rows)).Check(host), mode, nil
+}
+
 // sessionRoECheck 在登记会话前校验目标 URL 的 host 是否在本任务官方范围内:
 // strict 拦截、warn 告警放行、范围未登记/范围内直接放行。非任务运行按未登记放行。
 func (s *Server) sessionRoECheck(ctx context.Context, rawURL string) (string, error) {
 	return s.roeCheckHost(ctx, hostFromURL(rawURL), "立足点目标")
 }
 
-// roeCheckHost 与 register_session / tunnel_deploy 共用:strict 拦截、warn 告警放行、fail-open。
+// roeCheckHost 与 register_session / tunnel_deploy 共用。
+// strict 拦截（含范围读失败，不得 fail-open），warn 告警放行，off 放行。
+// 非任务运行（TaskID<=0）与存储未就绪保持放行。面向调用方的错误不含 DSN。
 func (s *Server) roeCheckHost(ctx context.Context, host, kind string) (string, error) {
 	ri := agent.RunInfoFrom(ctx)
 	if ri.TaskID <= 0 || s.m == nil || s.m.pg == nil || strings.TrimSpace(host) == "" {
 		return "", nil
 	}
-	mode, _, _ := s.m.pg.GetSetting(settingRoEEnforcement)
-	if strings.EqualFold(strings.TrimSpace(mode), "off") {
+	verdict, mode, err := s.roeVerdictFor(ri.TaskID, host)
+	if mode == "off" {
 		return "", nil
 	}
-	rows, err := s.m.pg.Assets().ListTaskScope(ri.TaskID)
 	if err != nil {
-		return "", nil
+		log.Printf("[roe] task %d 范围读取失败(mode=%s): %v", ri.TaskID, mode, err)
+		if mode == "strict" {
+			return "", fmt.Errorf("RoE 授权范围检查：%s %s 范围读取失败，strict 拒绝放行（非未登记范围）。可改用 warn/off 回退。", kind, host)
+		}
+		return "⚠ RoE 授权范围检查：范围读取失败，warn 下放行（非未登记范围）。", nil
 	}
-	verdict := guard.NewScopeMatcher(scopeRulesFromRows(rows)).Check(host)
 	if verdict != guard.ScopeOut {
 		return "", nil
 	}
 	msg := fmt.Sprintf("RoE 授权范围检查：%s %s 不在本任务(task %d)已登记范围内。"+
 		"如需放行：把目标加入任务范围(add_task_scope)，或在系统设置把 roe_enforcement 改为 warn/off。",
 		kind, host, ri.TaskID)
-	if strings.EqualFold(strings.TrimSpace(mode), "strict") {
+	if mode == "strict" {
 		return "", fmt.Errorf("%s", msg)
 	}
 	return "⚠ " + msg, nil

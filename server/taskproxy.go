@@ -10,13 +10,17 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/traffic"
 	"github.com/Autumn-27/artex/tunnel"
 )
@@ -40,6 +44,74 @@ type taskProxyInst struct {
 	upstream string
 }
 
+// roeGateTTL 是任务代理范围/模式缓存的有效期。add_task_scope 成功后主动失效。
+const roeGateTTL = 5 * time.Second
+
+// roeGateDeps 是任务代理 host gate 的读取与告警依赖。测试可注入。
+type roeGateDeps struct {
+	mode  func() string
+	scope func(taskID int64) ([]guard.ScopeRule, error)
+	warn  func(taskID int64, host, msg string)
+}
+
+type roeSnap struct {
+	mode  string
+	rules []guard.ScopeRule
+	err   error
+	at    time.Time
+}
+
+// roeGateCache 按 taskID 缓存 enforcement mode 与官方范围，避免每个请求打库。
+type roeGateCache struct {
+	ttl   time.Duration
+	now   func() time.Time
+	deps  roeGateDeps
+	mu    sync.Mutex
+	snaps map[int64]roeSnap
+}
+
+func (c *roeGateCache) clock() time.Time {
+	if c != nil && c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+func (c *roeGateCache) get(taskID int64) (string, []guard.ScopeRule, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.clock()
+	if s, ok := c.snaps[taskID]; ok && now.Sub(s.at) < c.ttl {
+		return s.mode, s.rules, s.err
+	}
+	mode := "warn"
+	if c.deps.mode != nil {
+		mode = normalizeRoEMode(c.deps.mode())
+	}
+	var (
+		rules []guard.ScopeRule
+		err   error
+	)
+	if mode != "off" {
+		if c.deps.scope == nil {
+			err = fmt.Errorf("范围存储未就绪")
+		} else {
+			rules, err = c.deps.scope(taskID)
+		}
+	}
+	c.snaps[taskID] = roeSnap{mode: mode, rules: rules, err: err, at: now}
+	return mode, rules, err
+}
+
+func (c *roeGateCache) invalidate(taskID int64) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	delete(c.snaps, taskID)
+	c.mu.Unlock()
+}
+
 // taskProxyManager 按 taskID 懒建并管理任务级 MITM 实例。零值不可用。
 type taskProxyManager struct {
 	dir         string
@@ -49,6 +121,7 @@ type taskProxyManager struct {
 	portMax     int
 	mu          sync.Mutex
 	proxies     map[int64]*taskProxyInst
+	roe         *roeGateCache
 }
 
 func newTaskProxyManager(dir string, store tunnelLister, globalProxy func() string, portMin, portMax int) *taskProxyManager {
@@ -154,6 +227,9 @@ func (m *taskProxyManager) buildLocked(ctx context.Context, taskID int64) (*task
 		_ = tr.Close()
 		return nil, err
 	}
+	if gate := m.hostGate(taskID); gate != nil {
+		tr.SetHostGate(gate)
+	}
 	go func() {
 		if err := tr.Start(); err != nil {
 			log.Printf("[taskproxy] 任务 %d MITM 监听结束: %v", taskID, err)
@@ -211,6 +287,65 @@ func (m *taskProxyManager) CloseTask(taskID int64) {
 	if err := inst.tr.Close(); err != nil {
 		log.Printf("[taskproxy] 任务 %d MITM 实例关闭: %v", taskID, err)
 	}
+}
+
+// useRoE 安装任务代理的 host gate 数据源。未调用时实例不挂 gate，转发行为不变。
+func (m *taskProxyManager) useRoE(deps roeGateDeps) {
+	if m == nil {
+		return
+	}
+	m.roe = &roeGateCache{ttl: roeGateTTL, deps: deps, snaps: map[int64]roeSnap{}}
+}
+
+// invalidateRoE 丢掉一个任务的范围缓存。add_task_scope 成功后调用，使新范围立即生效。
+func (m *taskProxyManager) invalidateRoE(taskID int64) {
+	if m == nil || m.roe == nil {
+		return
+	}
+	m.roe.invalidate(taskID)
+}
+
+// hostGate 是该任务 MITM 的目标检查。nil 表示未启用。
+// strict 越界或范围读失败拒绝；warn 放行并记 activity/log；off 放行。
+func (m *taskProxyManager) hostGate(taskID int64) func(string) error {
+	if m == nil || m.roe == nil || taskID <= 0 {
+		return nil
+	}
+	return func(host string) error {
+		host = strings.TrimSpace(host)
+		if host == "" {
+			return nil
+		}
+		mode, rules, err := m.roe.get(taskID)
+		if mode == "off" {
+			return nil
+		}
+		if err != nil {
+			log.Printf("[taskproxy][roe] task %d 范围读取失败(mode=%s)", taskID, mode)
+			if mode == "strict" {
+				return fmt.Errorf("RoE 授权范围检查：主机 %s 的任务 %d 范围读取失败，strict 拒绝放行。可把目标加入任务范围，或调整 roe_enforcement 为 warn/off 回退。", host, taskID)
+			}
+			m.noteRoEWarn(taskID, host, fmt.Sprintf("⚠ RoE 授权范围检查：主机 %s 的任务 %d 范围读取失败，warn 下放行。", host, taskID))
+			return nil
+		}
+		if guard.NewScopeMatcher(rules).Check(host) != guard.ScopeOut {
+			return nil
+		}
+		msg := fmt.Sprintf("RoE 授权范围检查：主机 %s 不在任务 %d 已登记范围内。如需放行：把目标加入任务范围(add_task_scope)，或调整 roe_enforcement 为 warn/off。", host, taskID)
+		if mode == "strict" {
+			return fmt.Errorf("%s", msg)
+		}
+		m.noteRoEWarn(taskID, host, "⚠ "+msg)
+		return nil
+	}
+}
+
+func (m *taskProxyManager) noteRoEWarn(taskID int64, host, msg string) {
+	if m != nil && m.roe != nil && m.roe.deps.warn != nil {
+		m.roe.deps.warn(taskID, host, msg)
+		return
+	}
+	log.Printf("[taskproxy][roe] task %d host %s: %s", taskID, host, msg)
 }
 
 // Close 进程退出时全清（幂等）。

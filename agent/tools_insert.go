@@ -438,6 +438,11 @@ func (t *ToolSet) addCompanyScope() actool.CoreTool {
 	)
 }
 
+// TaskScopeChanged runs after add_task_scope persists at least one row.
+// The server points it at the task-proxy RoE cache so the new scope applies
+// immediately instead of waiting out the 5s TTL. nil is a no-op.
+var TaskScopeChanged func(taskID int64)
+
 // addTaskScope lets the plan agent add test scope to THE CURRENT TASK — the coverage
 // denominator and the task's authorization edge. Worker discoveries are auto-scoped
 // (precise host) by insertAssets; this tool is for DELIBERATELY WIDENING: pull a whole
@@ -490,6 +495,9 @@ func (t *ToolSet) addTaskScope() actool.CoreTool {
 			out := map[string]any{"added": added}
 			if len(errs) > 0 {
 				out["errors"] = errs
+			}
+			if len(added) > 0 && TaskScopeChanged != nil {
+				TaskScopeChanged(t.taskID)
 			}
 			return jsonResult(out)
 		},

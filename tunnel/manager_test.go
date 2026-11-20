@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -520,7 +519,7 @@ func TestDeployListenOnlyStaysDeployingUntilEntryReady(t *testing.T) {
 		t.Fatalf("入口未就绪不得晋升: %+v", held)
 	}
 
-	if err := syscall.Kill(p.ServerPID, syscall.SIGUSR1); err != nil {
+	if err := signalUSR1(p.ServerPID); err != nil {
 		t.Fatalf("SIGUSR1: %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)

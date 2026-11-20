@@ -170,7 +170,13 @@ type Traffic struct {
 	// transparent-passthrough paths honor it (go-mitmproxy's getUpstreamConn),
 	// so no host escapes it. Hot-swappable at runtime via SetUpstreamProxy.
 	upstream atomic.Pointer[url.URL]
+	// hostGate, when non-nil, rejects a target host before any upstream dial.
+	// nil means the gate is off and forwarding is unchanged. Hot-swappable.
+	hostGate atomic.Pointer[hostGateFn]
 }
+
+// hostGateFn is the RoE host check installed by SetHostGate.
+type hostGateFn func(host string) error
 
 // Open initializes the traffic tree, blob store and SQLite index under dir.
 func Open(dir, addr string) (*Traffic, error) {
@@ -218,7 +224,12 @@ func Open(dir, addr string) (*Traffic, error) {
 	// a direct dial. When a global egress proxy IS configured (SetUpstreamProxy),
 	// every captured request — intercepted AND transparently tunneled — is
 	// forwarded through it instead, so no host leaks the real source IP.
-	p.SetUpstreamProxy(func(*http.Request) (*url.URL, error) { return t.upstream.Load(), nil })
+	p.SetUpstreamProxy(func(req *http.Request) (*url.URL, error) {
+		if err := t.gateRequest(req); err != nil {
+			return nil, err
+		}
+		return t.upstream.Load(), nil
+	})
 	// Fail-open: MITM every host by default, EXCEPT ones a prior request proved we
 	// can't intercept without breaking (see maybePassthrough). Those are tunneled
 	// transparently so the request still reaches the target instead of being killed.
@@ -307,6 +318,35 @@ func (t *Traffic) ProxyAddr() string {
 		return "http://127.0.0.1" + t.addr
 	}
 	return "http://" + t.addr
+}
+
+// SetHostGate installs a target-host check. fn == nil turns the gate off.
+// The swap is atomic and takes effect on the next request. A nil gate leaves
+// both the intercept short-circuit and the passthrough dial exactly as before.
+func (t *Traffic) SetHostGate(fn func(host string) error) {
+	if fn == nil {
+		t.hostGate.Store(nil)
+		return
+	}
+	f := hostGateFn(fn)
+	t.hostGate.Store(&f)
+}
+
+// gateHost reports a gate rejection. A nil gate returns nil and does no work.
+func (t *Traffic) gateHost(host string) error {
+	p := t.hostGate.Load()
+	if p == nil || *p == nil {
+		return nil
+	}
+	return (*p)(host)
+}
+
+// gateRequest applies the host gate to a proxy request. Nil request/URL skips it.
+func (t *Traffic) gateRequest(req *http.Request) error {
+	if req == nil || req.URL == nil {
+		return nil
+	}
+	return t.gateHost(req.URL.Hostname())
 }
 
 // SetUpstreamProxy points every captured request at a global egress proxy
@@ -406,6 +446,24 @@ func (t *Traffic) DB() *sql.DB { return t.db }
 type sink struct {
 	mproxy.BaseAddon
 	t *Traffic
+}
+
+// Requestheaders rejects an out-of-scope host before the proxy dials upstream.
+// Assigning f.Response makes go-mitmproxy return that response and skip the
+// upstream request. A nil gate returns immediately.
+func (s *sink) Requestheaders(f *mproxy.Flow) {
+	if f == nil || f.Request == nil || f.Request.URL == nil {
+		return
+	}
+	err := s.t.gateHost(f.Request.URL.Hostname())
+	if err == nil {
+		return
+	}
+	f.Response = &mproxy.Response{
+		StatusCode: http.StatusForbidden,
+		Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
+		Body:       []byte(err.Error()),
+	}
 }
 
 func (s *sink) Response(f *mproxy.Flow) {

@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"log"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -105,6 +106,9 @@ func (g *Guard) SetEgress(e *EgressGuard) {
 
 // checkEgress 是 PreToolUse 第一道:对 Bash 类命令全文与 WebFetch 的 url/body
 // 做敏感指纹检查,命中 → deny。审计与文案只记 kind,不回显原文。
+// 唯一豁免:命中集合只有 callback_addr,且 roeHosts 抽出的目标非空并全部属于
+// 平台自身地址时放行(继续后续闸门,不写拦截)。抽不出 host、混有第三方 host、
+// 或同时命中其他 kind 时仍拦截。诊断日志不回显原文。
 func (g *Guard) checkEgress(ev hook.Event, cmd string) (hook.Result, bool) {
 	g.mu.Lock()
 	e := g.egress
@@ -129,10 +133,19 @@ func (g *Guard) checkEgress(ev hook.Event, cmd string) (hook.Result, bool) {
 		if text == "" {
 			continue
 		}
-		if kind, hit := e.Check(text); hit {
-			log.Printf("[guard][egress] 命中平台敏感指纹(%s),%s 外发已拦截", kind, ev.ToolName)
-			return g.block(ev.ToolName, systemBlockMessage("操作包含平台敏感信息，禁止外发"), ""), true
+		kinds := e.CheckKinds(text)
+		if len(kinds) == 0 {
+			continue
 		}
+		if len(kinds) == 1 && kinds[0] == "callback_addr" {
+			hosts := roeHosts(ev.ToolName, ev.Input, cmd)
+			if len(hosts) > 0 && e.OwnsAllHosts(hosts) {
+				log.Printf("[guard][egress] 仅命中 callback_addr 且目标均属平台自身地址，%s 放行", ev.ToolName)
+				continue
+			}
+		}
+		log.Printf("[guard][egress] 命中平台敏感指纹(%s),%s 外发已拦截", strings.Join(kinds, ","), ev.ToolName)
+		return g.block(ev.ToolName, systemBlockMessage("操作包含平台敏感信息，禁止外发"), ""), true
 	}
 	return hook.Result{}, false
 }

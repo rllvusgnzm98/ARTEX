@@ -12,6 +12,9 @@ package guard
 import (
 	"crypto/sha256"
 	"crypto/subtle"
+	"net"
+	"sort"
+	"strings"
 	"sync"
 )
 
@@ -33,10 +36,12 @@ type EgressGuard struct {
 	fps []egressFingerprint
 	// byLen 是按原文长度分组的指纹索引,Check 时只需对文本里每个长度各滑一次窗。
 	byLen map[int][]int // length → fps 下标
+	// own 是平台自身 host（已归一）。与 fps 共用 mu。
+	own map[string]struct{}
 }
 
 func NewEgressGuard() *EgressGuard {
-	return &EgressGuard{byLen: map[int][]int{}}
+	return &EgressGuard{byLen: map[int][]int{}, own: map[string]struct{}{}}
 }
 
 // AddFingerprint 注册一条敏感指纹(内部做哈希,不存原文)。空串/过短串静默跳过;
@@ -96,4 +101,104 @@ func (e *EgressGuard) Check(text string) (kind string, hit bool) {
 		}
 	}
 	return "", false
+}
+
+// CheckKinds 返回 text 命中的全部 kind。去重后按字典序排列，多次调用顺序稳定。
+// 无命中返回 nil。比对方式与 Check 相同，不改变 Check 的返回语义。
+func (e *EgressGuard) CheckKinds(text string) []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if len(e.fps) == 0 || len(text) < egressMinSecretLen {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var kinds []string
+	for length, idxs := range e.byLen {
+		if length > len(text) {
+			continue
+		}
+		for i := 0; i+length <= len(text); i++ {
+			sum := sha256.Sum256([]byte(text[i : i+length]))
+			for _, idx := range idxs {
+				if subtle.ConstantTimeCompare(sum[:], e.fps[idx].sum[:]) == 1 {
+					k := e.fps[idx].kind
+					if _, ok := seen[k]; ok {
+						continue
+					}
+					seen[k] = struct{}{}
+					kinds = append(kinds, k)
+				}
+			}
+		}
+	}
+	sort.Strings(kinds)
+	return kinds
+}
+
+// AddOwnInfraHosts 登记平台自身 host。大小写不敏感，去端口、去 IPv6 方括号、
+// 去尾部点；空串跳过。与指纹集共用同一把锁。
+func (e *EgressGuard) AddOwnInfraHosts(hosts ...string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.own == nil {
+		e.own = map[string]struct{}{}
+	}
+	for _, h := range hosts {
+		key := normalizeOwnHost(h)
+		if key == "" {
+			continue
+		}
+		e.own[key] = struct{}{}
+	}
+}
+
+// IsOwnInfraHost 报告 host 是否已登记为平台自身地址（先按 AddOwnInfraHosts 的规则归一）。
+func (e *EgressGuard) IsOwnInfraHost(host string) bool {
+	key := normalizeOwnHost(host)
+	if key == "" {
+		return false
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	_, ok := e.own[key]
+	return ok
+}
+
+// OwnsAllHosts 仅当 hosts 非空且每一个都是平台自身 host 时为 true。
+func (e *EgressGuard) OwnsAllHosts(hosts []string) bool {
+	if len(hosts) == 0 {
+		return false
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	for _, h := range hosts {
+		key := normalizeOwnHost(h)
+		if key == "" {
+			return false
+		}
+		if _, ok := e.own[key]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// normalizeOwnHost 归一自身 host：去空白、去端口、去 IPv6 方括号、去尾部点、转小写。
+// 空结果表示应跳过。
+func normalizeOwnHost(h string) string {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(h); err == nil {
+		h = host
+	}
+	if strings.HasPrefix(h, "[") {
+		if i := strings.IndexByte(h, ']'); i >= 0 {
+			h = h[1:i]
+		}
+	}
+	h = strings.TrimSpace(h)
+	h = strings.TrimRight(h, ".")
+	return strings.ToLower(h)
 }

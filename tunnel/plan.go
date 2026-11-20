@@ -67,6 +67,9 @@ type PlanOpts struct {
 	UsedPorts    map[int]bool        // 已占端口（活隧道台账）
 	CanListen    func(port int) bool // 真实可绑检查；nil 跳过
 	DataDir      string              // 平台侧隧道工作目录（authfile/日志）
+	// CheckTarget 在生成 portfwd 计划前校验目标。nil 表示不检查。
+	// socks 的 VerifyAddr 只是健康检查，PlanSocks 不调用它。
+	CheckTarget func(host string, port int) error
 }
 
 // newAuth 生成 auth 凭据：user 固定 "artex",pass 为 crypto/rand 16 字节 hex。
@@ -174,6 +177,12 @@ func PlanPortfwd(o *PlanOpts) (*Plan, error) {
 	}
 	if o.TargetHost == "" || o.TargetPort <= 0 {
 		return nil, fmt.Errorf("portfwd 需要 target_host 与 target_port")
+	}
+	if o.CheckTarget != nil {
+		if err := o.CheckTarget(o.TargetHost, o.TargetPort); err != nil {
+			return nil, fmt.Errorf("portfwd 目标 %s 范围检查未通过: %w",
+				net.JoinHostPort(o.TargetHost, strconv.Itoa(o.TargetPort)), err)
+		}
 	}
 	p, err := o.base(KindPortfwd)
 	if err != nil {

@@ -32,6 +32,7 @@ type Config struct {
 	CallbackAddr       string   `json:"callback_addr"`
 	TunnelPortRange    string   `json:"tunnel_port_range"`
 	TaskProxyPortRange string   `json:"task_proxy_port_range"`
+	OwnInfraHosts      []string `json:"own_infra_hosts"`
 }
 
 // BaseDir is the directory that anchors all runtime artifacts (config.json and
