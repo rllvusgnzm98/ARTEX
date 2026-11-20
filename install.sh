@@ -8,6 +8,20 @@ ok(){   printf '\033[32m[+]\033[0m %s\n' "$*"; }
 warn(){ printf '\033[33m[!]\033[0m %s\n' "$*"; }
 die(){  printf '\033[31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 ask(){  local p="$1" d="${2:-}" a; read -rp "$p${d:+ [$d]}: " a; echo "${a:-$d}"; }
+
+# 构建源留空 = 官方。ARTEX_GOPROXY / ARTEX_NPM_REGISTRY 不可达时回退官方源。
+run_go_build() {
+  local proxy="${ARTEX_GOPROXY:-https://proxy.golang.org,direct}"
+  if GOPROXY="$proxy" GOSUMDB="${ARTEX_GOSUMDB:-sum.golang.org}" CGO_ENABLED=0 "$@"; then
+    return 0
+  fi
+  if [ -n "${ARTEX_GOPROXY:-}" ] && [ "$proxy" != "https://proxy.golang.org,direct" ]; then
+    warn "GOPROXY 不可达，回退官方源"
+    GOPROXY="https://proxy.golang.org,direct" GOSUMDB="${ARTEX_GOSUMDB:-sum.golang.org}" CGO_ENABLED=0 "$@"
+    return
+  fi
+  return 1
+}
 rand(){ head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24; }
 
 # ── docker 环境检测 / 自动安装 ───────────────────
@@ -96,13 +110,21 @@ JSON
   # 内嵌前端需要 node 出静态产物
   if command -v npm >/dev/null 2>&1; then
     info "构建前端静态产物…"
-    ( cd web && npm ci && npm run build:static )
+    if [ -n "${ARTEX_NPM_REGISTRY:-}" ]; then
+      if ! ( cd web && npm ci --registry "$ARTEX_NPM_REGISTRY" ); then
+        warn "NPM 镜像不可达，回退官方源"
+        ( cd web && npm ci )
+      fi
+    else
+      ( cd web && npm ci )
+    fi
+    ( cd web && npm run build:static )
     rm -rf server/webui/dist && cp -r web/out server/webui/dist
     info "编译内嵌单二进制…"
-    CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
+    run_go_build go build -tags embedui -trimpath -o artex ./cmd/artex
   else
     warn "未检测到 npm：将编译**不内嵌前端**的后端（前端需另跑 npm run dev）"
-    CGO_ENABLED=0 go build -o artex ./cmd/artex
+    run_go_build go build -o artex ./cmd/artex
   fi
   ok "编译完成 → ./artex"
 

@@ -78,7 +78,7 @@ jobs:
 
   # ③ 汇总所有 zip → 创建 GitHub Release
   release:
-    needs: binaries
+    needs: [binaries, checks]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -99,10 +99,10 @@ jobs:
   # ④ 多架构镜像 → 推 Docker Hub（复用 binaries 编好的 Linux 二进制，
   #    镜像里只装工具 + 放二进制；arm64 仅需模拟 apt 层，构建快很多）
   docker:
-    needs: binaries
+    needs: [binaries, checks]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4 # 取 Dockerfile 与 skills/
+      - uses: actions/checkout@v4 # 取 Dockerfile、skills/、packaging/tools-manifest.json
       - uses: actions/download-artifact@v4
         with:
           name: bin-linux-amd64
@@ -131,5 +131,29 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # 构建源来自仓库 Variables（不是 Secrets）。留空 = 官方源，不可达时镜像内回退。
+          build-args: |
+            APT_MIRROR=${{ vars.APT_MIRROR }}
+            NODE_MAJOR=${{ vars.NODE_MAJOR }}
+            NODESOURCE_URL=${{ vars.NODESOURCE_URL }}
+            NPM_REGISTRY=${{ vars.NPM_REGISTRY }}
+            PLAYWRIGHT_DOWNLOAD_HOST=${{ vars.PLAYWRIGHT_DOWNLOAD_HOST }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # ⑤ 工具清单与技能 frontmatter。不连数据库；doctor 的集成用例在无 DSN 时自行跳过。
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Shell syntax
+        run: bash -n build.sh install.sh update.sh tools-manifest.sh
+      - name: Manifest, skill format, doctor
+        run: |
+          go test ./tools -count=1
+          go test ./server -run Skills -count=1
+          go test ./cmd/artex -count=1

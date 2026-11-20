@@ -65,6 +65,7 @@ func runDoctor(args []string) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	addr := fs.String("addr", doctorDefaultAddr, "HTTP listen address（与主程序 -addr 同义，默认 :8787）")
 	dataDir := fs.String("data", filepath.Join(config.BaseDir(), "data"), "data directory（与主程序 -data 同义）")
+	strictTools := fs.Bool("strict-tools", false, "非 optional 工具缺失或哈希不匹配时记 FAIL（默认只 WARN）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -144,48 +145,78 @@ func runDoctor(args []string) int {
 		check(docWarn, "工具清单", "packaging/tools-manifest.json 缺失——隧道工具按默认路径检查，军火库无法汇总")
 	}
 
-	// 4. 隧道工具（chisel/suo5/ligolo-*）：存在性 + （清单钉了哈希时）sha256
-	// 缺失一律 WARN，不得 FAIL，不得静默必装。
+	// 4. 隧道工具（chisel/suo5/ligolo-*）：存在性 + （清单钉了哈希时）sha256。
+	// 缺失默认 WARN。-strict-tools 时，非 optional 的缺失/哈希不匹配为 FAIL。
+	// 平台不符直接 SKIP，不当成 mismatch。
 	{
 		var parts []string
 		worst := docOK
+		saw, applicable := false, 0
 		for _, r := range results {
 			if r.Entry.Category != "tunnel" {
 				continue
 			}
+			saw = true
+			if r.Status == tools.StatusNotApplicable {
+				continue
+			}
+			applicable++
 			parts = append(parts, doctorToolNote(r))
-			if r.Status == tools.StatusMissing || r.Status == tools.StatusMismatch {
+			bad := r.Status == tools.StatusMissing || r.Status == tools.StatusMismatch
+			if bad && *strictTools && !r.Entry.Optional {
+				worst = docFail
+			} else if bad && worst != docFail {
 				worst = docWarn
 			}
 		}
-		if len(parts) == 0 {
+		switch {
+		case !saw:
 			check(docSkip, "隧道工具", "清单中无隧道项")
-		} else {
+		case applicable == 0:
+			check(docSkip, "隧道工具", "当前平台不适用，已跳过")
+		default:
 			check(worst, "隧道工具", strings.Join(parts, "; "))
 		}
 	}
 
-	// 5. 军火库工具存在性汇总（存在 X/Y）。缺失只 WARN；哈希不匹配也必须 WARN，
-	// 不能因为「不是 missing」就算进 present 并在全在时打 OK。不得因此 FAIL。
+	// 5. 军火库工具存在性汇总（存在 X/Y）。缺失默认 WARN；哈希不匹配也必须 WARN，
+	// 不能因为「不是 missing」就算进 present 并在全在时打 OK。
+	// -strict-tools 时，非 optional 的缺失/不匹配改为 FAIL。平台不符不计入分母。
 	{
 		var present, missing, mismatched []string
+		saw := false
+		skippedPlatform := 0
+		strictProblem := false
 		for _, r := range results {
 			if r.Entry.Category != "arsenal" {
+				continue
+			}
+			saw = true
+			if r.Status == tools.StatusNotApplicable {
+				skippedPlatform++
 				continue
 			}
 			switch r.Status {
 			case tools.StatusMissing:
 				missing = append(missing, r.Entry.Name)
+				if *strictTools && !r.Entry.Optional {
+					strictProblem = true
+				}
 			case tools.StatusMismatch:
 				mismatched = append(mismatched, r.Entry.Name)
+				if *strictTools && !r.Entry.Optional {
+					strictProblem = true
+				}
 			default:
 				present = append(present, r.Entry.Name)
 			}
 		}
 		total := len(present) + len(missing) + len(mismatched)
 		switch {
-		case total == 0:
+		case !saw:
 			check(docSkip, "军火库工具", "清单缺失，无法汇总")
+		case total == 0 && skippedPlatform > 0:
+			check(docSkip, "军火库工具", "当前平台不适用，已跳过")
 		case len(missing) == 0 && len(mismatched) == 0:
 			check(docOK, "军火库工具", fmt.Sprintf("存在 %d/%d", len(present), total))
 		default:
@@ -201,7 +232,11 @@ func runDoctor(args []string) int {
 			if len(missing) > 0 {
 				note += "——按需补齐到 " + filepath.Join(*dataDir, "tools")
 			}
-			check(docWarn, "军火库工具", note)
+			st := docWarn
+			if strictProblem {
+				st = docFail
+			}
+			check(st, "军火库工具", note)
 		}
 	}
 
@@ -346,6 +381,8 @@ func doctorToolNote(r tools.CheckResult) string {
 		return fmt.Sprintf("%s 存在（未钉 sha256, %s)", r.Entry.Name, r.Path)
 	case tools.StatusMismatch:
 		return fmt.Sprintf("%s 哈希不匹配（期望 %s 实际 %s；可能自编译，仅警告）", r.Entry.Name, r.Entry.SHA256, r.Actual)
+	case tools.StatusNotApplicable:
+		return fmt.Sprintf("%s 当前平台不适用（清单 %s），已跳过", r.Entry.Name, r.Entry.Platform)
 	default:
 		return fmt.Sprintf("%s 缺失（期望 %s）", r.Entry.Name, r.Path)
 	}

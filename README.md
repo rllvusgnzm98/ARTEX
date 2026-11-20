@@ -95,6 +95,28 @@ docker compose up -d          # 拉取 autumn27/artex 镜像 + postgres
 
 镜像已含常用工具（ripgrep/curl/vim/npm/nmap…）；`./skills` 与 `./data` 以绑定挂载持久化。
 
+本地构建运行镜像时，先按 Dockerfile 头注释准备好 `dist/<arch>/artex`，再：
+
+```bash
+docker build -t artex:local .
+```
+
+构建参数默认全空，即官方源（Debian apt、NodeSource、npm、Playwright 浏览器下载）。需要镜像时用 `--build-arg`；**源不可达会自动回退官方源**：apt 先备份 `sources.list` / `debian.sources`，`apt-get update` 失败则还原后再 `apt-get -o Acquire::Retries=3`；npm 与 Playwright 是 `if ! 镜像安装; then 官方安装; fi`。`NODE_MAJOR` 留空仍安装官方 Node 20。
+
+```bash
+docker build -t artex:local \
+  --build-arg APT_MIRROR=mirrors.aliyun.com \
+  --build-arg NODE_MAJOR=20 \
+  --build-arg NODESOURCE_URL=https://deb.nodesource.com \
+  --build-arg NPM_REGISTRY=https://registry.npmmirror.com \
+  --build-arg PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright \
+  .
+```
+
+`NODESOURCE_URL` 与 `PLAYWRIGHT_DOWNLOAD_HOST` 按你实际的镜像填写，留空就是官方地址。源码编译脚本认同一组环境变量：`ARTEX_GOPROXY`（留空 = `https://proxy.golang.org,direct`）、`ARTEX_GOSUMDB`、`ARTEX_NPM_REGISTRY`，不可达同样回退官方源。GitHub Actions 的 docker job 从仓库 Variables（不是 Secrets）读同名 build-arg。
+
+本机没有 Docker 时只能静态审查 Dockerfile，不能把「写了 ARG」当成已经构建成功。
+
 远程 MCP 可在系统设置中选择 `http`（Streamable HTTP）或 `sse`（旧版 SSE）。
 旧版 SSE 服务通常使用 `GET /sse` 建立事件流，再通过服务返回的
 `/message?sessionId=...` 接收 JSON-RPC 请求；配置时将 URL 填为 `/sse`，请求头按
@@ -102,7 +124,7 @@ docker compose up -d          # 拉取 autumn27/artex 镜像 + postgres
 
 ### 方式三：下载预编译二进制（Releases）
 
-到 [Releases](https://github.com/Autumn-27/ARTEX/releases) 下载对应平台的 zip，解压后得到 `artex` + `start.sh`（Windows 为 `start.bat`）+ `skills/` + `config.example.json`：
+到 [Releases](https://github.com/Autumn-27/ARTEX/releases) 下载对应平台的 zip，解压后得到 `artex` + `start.sh`（Windows 为 `start.bat`）+ `skills/` + `packaging/tools-manifest.json` + `config.example.json`：
 
 ```bash
 cp config.example.json config.json   # 填好 database 连接

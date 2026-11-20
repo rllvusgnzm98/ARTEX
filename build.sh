@@ -17,7 +17,10 @@
 #   ARTEX_UPX_ARGS="--best --lzma"    Arguments passed to UPX.
 #   ARTEX_SKIP_FRONTEND=1             Reuse server/webui/dist (for CI artifact builds).
 #   ARTEX_SKIP_NPM_CI=1               Skip npm ci while rebuilding the frontend.
+#   ARTEX_GOPROXY=                    Go module proxy. Empty = https://proxy.golang.org,direct.
+#                                     An unreachable mirror falls back to the official proxy.
 #   ARTEX_GOSUMDB=sum.golang.org      Go checksum database.
+#   ARTEX_NPM_REGISTRY=               npm registry. Empty = official. Unreachable mirror falls back.
 set -euo pipefail
 
 cd "$(cd "$(dirname "$0")" && pwd)"
@@ -118,7 +121,14 @@ else
   command -v rsync >/dev/null 2>&1 || die "未检测到 rsync"
   info "构建前端静态资源"
   if [ "${ARTEX_SKIP_NPM_CI:-0}" != "1" ]; then
-    (cd web && npm ci)
+    if [ -n "${ARTEX_NPM_REGISTRY:-}" ]; then
+      if ! (cd web && npm ci --registry "$ARTEX_NPM_REGISTRY"); then
+        warn "NPM 镜像不可达，回退官方源"
+        (cd web && npm ci)
+      fi
+    else
+      (cd web && npm ci)
+    fi
   fi
   (cd web && npm run build:static)
   info "同步前端资源到 server/webui/dist"
@@ -182,6 +192,8 @@ package_binary() {
     chmod +x "$package_root/start.sh"
   fi
   cp -R skills "$package_root/"
+  mkdir -p "$package_root/packaging"
+  cp packaging/tools-manifest.json "$package_root/packaging/tools-manifest.json"
   cp config.example.json "$package_root/"
   if [ -f README.md ]; then cp README.md "$package_root/"; fi
   (cd "$ARTEX_PACKAGE_DIR" && zip -q -r -9 "$(basename "$archive")" "$(basename "$package_root")")
@@ -212,16 +224,28 @@ build_target() {
   mkdir -p "$(dirname "$output")"
 
   info "编译 ${goos}/${goarch}，版本 ${ARTEX_BUILD_VERSION}"
-  GOSUMDB="$ARTEX_GOSUMDB" \
-  CGO_ENABLED=0 \
-  GOOS="$goos" \
-  GOARCH="$goarch" \
-  go build \
-    -tags embedui \
-    -trimpath \
-    -ldflags "-s -w -buildid= -X main.version=${ARTEX_BUILD_VERSION}" \
-    -o "$output" \
-    ./cmd/artex
+  build_once() {
+    GOPROXY="$1" \
+    GOSUMDB="$ARTEX_GOSUMDB" \
+    CGO_ENABLED=0 \
+    GOOS="$goos" \
+    GOARCH="$goarch" \
+    go build \
+      -tags embedui \
+      -trimpath \
+      -ldflags "-s -w -buildid= -X main.version=${ARTEX_BUILD_VERSION}" \
+      -o "$output" \
+      ./cmd/artex
+  }
+  proxy="${ARTEX_GOPROXY:-https://proxy.golang.org,direct}"
+  if ! build_once "$proxy"; then
+    if [ -n "${ARTEX_GOPROXY:-}" ] && [ "$proxy" != "https://proxy.golang.org,direct" ]; then
+      warn "GOPROXY 不可达，回退官方源"
+      build_once "https://proxy.golang.org,direct" || die "编译失败：${goos}/${goarch}"
+    else
+      die "编译失败：${goos}/${goarch}"
+    fi
+  fi
 
   compress_binary "$output" "$goos"
   if command -v file >/dev/null 2>&1; then file "$output"; fi
