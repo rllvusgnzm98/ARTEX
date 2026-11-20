@@ -47,7 +47,8 @@ type Task struct {
 	PlanHeartbeatSeconds int `json:"plan_heartbeat_seconds"`
 	// CoverageEnabled 是「资产覆盖度功能」总开关(默认 true)。false 时：不计算/不展示测试
 	// 覆盖度、不自动累积 task_scope(source=auto)、不给 agent 开放 add_task_scope/
-	// list_untested_assets、态势里不注入 coverage 块(scope 字段仍保留)。company 关联
+	// list_untested_assets、态势里不注入 coverage 块。scope 明细由 task_scope 接口按需查询，
+	// overview 只给计数。company 关联
 	// (task_scope kind=company)与此开关无关，永不受影响。见 db/task_scope.go。
 	CoverageEnabled bool `json:"coverage_enabled"`
 }
