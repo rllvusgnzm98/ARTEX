@@ -42,6 +42,11 @@ type CredentialRecord struct {
 	Source      string    `json:"source"`
 	Verified    bool      `json:"verified"`
 	CreatedAt   time.Time `json:"created_at"`
+	// 以下三项只由 ListInherited 填充，credentials 表没有这些列。
+	// 自有行为零值；继承行 Inherited 为 true，并带来源任务与相关性依据。
+	Inherited    bool   `json:"inherited,omitempty"`
+	SourceTaskID int64  `json:"source_task_id,omitempty"`
+	ScopeBasis   string `json:"scope_basis,omitempty"`
 }
 
 // ValidCredType 校验凭据类型。

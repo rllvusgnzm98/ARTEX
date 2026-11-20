@@ -1479,3 +1479,28 @@ CREATE INDEX IF NOT EXISTS idx_credentials_task ON credentials(task_id);
 -- honeypot_evidence: 命中签名证据,JSON 数组文本,合并去重。
 ALTER TABLE assets ADD COLUMN IF NOT EXISTS honeypot_score REAL NOT NULL DEFAULT 0;
 ALTER TABLE assets ADD COLUMN IF NOT EXISTS honeypot_evidence TEXT NOT NULL DEFAULT '';
+
+-- =====================================================================
+-- 凭据继承（外网→内网移交，只追加 IF NOT EXISTS）
+-- =====================================================================
+-- 子任务引用父任务已有凭据，不复制 secret。tasks 与 credentials 的生产删除
+-- 都是 DELETE 行（credentials.task_id 本身没有外键，历史孤儿凭据要保留，
+-- 这里不补那条 FK）。继承行用 ON DELETE CASCADE 跟着父任务、子任务、凭据一起走。
+CREATE TABLE IF NOT EXISTS credential_inheritances (
+    id             BIGSERIAL PRIMARY KEY,
+    child_task_id  BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    source_task_id BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    credential_id  BIGINT NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
+    scope_basis    TEXT NOT NULL CHECK (scope_basis IN
+                       ('foothold_host','same_segment','domain','company','manual')),
+    score          DOUBLE PRECISION NOT NULL DEFAULT 0,
+    state          TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','revoked')),
+    reason         TEXT NOT NULL DEFAULT '',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at     TIMESTAMPTZ,
+    UNIQUE (child_task_id, credential_id)
+);
+CREATE INDEX IF NOT EXISTS idx_credential_inheritances_child_active
+    ON credential_inheritances(child_task_id) WHERE state = 'active';
+CREATE INDEX IF NOT EXISTS idx_credential_inheritances_credential
+    ON credential_inheritances(credential_id);

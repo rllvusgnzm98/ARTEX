@@ -6,6 +6,7 @@ package server
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -125,7 +126,8 @@ func applyHandoffScope(as *db.AssetStore, childID, sessionID int64, hostIP strin
 	return nil
 }
 
-// POST /api/sessions/{id}/handoff — 外网→内网任务移交，返回 {task_id}。
+// POST /api/sessions/{id}/handoff — 外网→内网任务移交。
+// 返回 {task_id, credentials_inherited}。凭据继承失败只记日志，不改变移交结果。
 func (s *Server) sessionHandoff(w http.ResponseWriter, r *http.Request) {
 	if !s.intranetSessionsReady(w) {
 		return
@@ -194,10 +196,17 @@ func (s *Server) sessionHandoff(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	inherited, ierr := s.inheritCredentials(rec.CreatedByTask, newID)
+	if ierr != nil {
+		log.Printf("[handoff] inherit credentials parent=%d child=%d: %v", rec.CreatedByTask, newID, ierr)
+	}
 	// 测试夹具可不装配 engine；有引擎时再走与 spawn_task 相同的建后流程。
 	if s.engine != nil {
 		s.launchTask(t, desc+" "+goal, false)
 	}
 	s.auditIntranet(r, "handoff session=%d host=%s → task=%s(来源任务 %s)", rec.ID, hostIP, t.ID, srcTask.ID)
-	writeJSON(w, 200, map[string]any{"task_id": t.ID})
+	writeJSON(w, 200, map[string]any{
+		"task_id":               t.ID,
+		"credentials_inherited": inherited,
+	})
 }
