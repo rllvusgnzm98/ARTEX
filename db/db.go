@@ -374,8 +374,21 @@ ON CONFLICT DO NOTHING`, r.kind, r.pattern, r.note); err != nil {
 // default — the user turns them on per-agent when needed. scopesentry additionally
 // declares `mcps: ScopeSentry`, which only takes effect once it's made visible and
 // that MCP is enabled/configured.
+//
+// Hackbots Toolkit 落地的技能默认绑定如下。种子是 ON CONFLICT DO NOTHING，
+// 用户在页面关闭后，重启不会把绑定写回去。
+//
+//	auto + pentest + worker：js-endpoint-extraction、lazy-chunk-downloader、jshero、
+//	  content-discovery-wordlist、api-surface-recon（以及既有的 api-recon）
+//	pentest + auto：api-fingerprint-caido（依赖可选的本机 Caido，未启动时技能自己返回 blocked）
 var builtinSkillVisibility = map[string][]string{
-	"api-recon": {"auto", "pentest", "worker"},
+	"api-recon":                  {"auto", "pentest", "worker"},
+	"api-surface-recon":          {"auto", "pentest", "worker"},
+	"content-discovery-wordlist": {"auto", "pentest", "worker"},
+	"js-endpoint-extraction":     {"auto", "pentest", "worker"},
+	"jshero":                     {"auto", "pentest", "worker"},
+	"lazy-chunk-downloader":      {"auto", "pentest", "worker"},
+	"api-fingerprint-caido":      {"pentest", "auto"},
 }
 
 // seedBuiltinSkillVisibility binds the shipped built-in skills to their default
