@@ -3,6 +3,7 @@
 // a few fields the backend serializes differently (e.g. created_at as a unix int)
 // are passed through and formatted at the call site.
 
+import { auth, refresh } from "@/lib/auth";
 import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
@@ -118,7 +119,7 @@ function getToken(): string | null {
   return localStorage.getItem("artex_token");
 }
 
-export async function http<T>(path: string, init?: RequestInit): Promise<T> {
+export async function http<T>(path: string, init?: RequestInit, retried = false): Promise<T> {
   if (MOCK) return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
   const token = getToken();
   const r = await fetch(`/api${path}`, {
@@ -130,9 +131,11 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
     },
   });
   if (r.status === 401) {
+    if (!retried && (await refresh())) {
+      return http<T>(path, init, true);
+    }
     if (typeof window !== "undefined") {
-      localStorage.removeItem("artex_token");
-      document.cookie = "artex_token=; path=/; max-age=0";
+      auth.clearToken();
       window.location.href = "/login";
     }
     throw new Error("未授权");
@@ -149,6 +152,9 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
       // Keep the status-based fallback for empty or non-JSON error responses.
     }
     throw new Error(message);
+  }
+  if (r.headers.get("X-ARTEX-Refresh") === "1") {
+    void refresh();
   }
   if (r.status === 204) return undefined as T;
   return r.json();

@@ -3,7 +3,7 @@
 import * as React from "react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { sseUrl } from "@/lib/api";
+import { useAuthedEventSource } from "@/hooks/use-authed-event-source";
 import { MOCK } from "@/lib/mock/enabled";
 import type { LogLine } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -60,12 +60,10 @@ export default function LogsPage() {
   // Live tail via SSE. on connect, replays whatever is in the ring (includes
   // DB-restored history from the last 100 rows written before restart).
   React.useEffect(() => {
-    if (MOCK) {
-      setLines(MOCK_LOGS);
-      return;
-    }
-    const es = new EventSource(sseUrl("/api/logs/stream?since=0"));
-    es.onmessage = (e) => {
+    if (MOCK) setLines(MOCK_LOGS);
+  }, []);
+  useAuthedEventSource(MOCK ? null : "/api/logs/stream?since=0", {
+    onmessage: (e) => {
       if (pausedRef.current) return;
       try {
         const l = JSON.parse(e.data) as LogLine;
@@ -73,9 +71,8 @@ export default function LogsPage() {
       } catch {
         /* ignore malformed frame */
       }
-    };
-    return () => es.close();
-  }, []);
+    },
+  });
 
   // Mark "has more" once we have any db_id in view.
   React.useEffect(() => {

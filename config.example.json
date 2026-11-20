@@ -1,5 +1,5 @@
 {
-  "_comment": "复制为 config.json（或用环境变量 ARTEX_CONFIG 指定其它路径）。本文件含 database、skill_dir，以及可选的 own_infra_hosts；LLM 等其余配置走环境变量或应用内设置，不在此文件。",
+  "_comment": "复制为 config.json（或用环境变量 ARTEX_CONFIG 指定其它路径）。本文件含 database、skill_dir、可选的 own_infra_hosts，以及 JWT 签名寿命/轮换；LLM 等其余配置走环境变量或应用内设置，不在此文件。",
 
   "_comment_database": "PostgreSQL 连接。优先级：环境变量 ARTEX_PG_DSN > 本文件 database。两种写法二选一：(A) 填下面的分字段；(B) 只填 database.dsn 一个完整连接串。",
   "database": {
@@ -25,5 +25,13 @@
   "own_infra_hosts": [],
 
   "_comment_gate_mode": "伪装门控（可选）。取值 off（关闭，响应与未接入相同）、detect（只计数和限频日志，响应逐字节不变）、enforce（无有效旁路时前端外壳返回诱饵 404；/api 与 /s 不受影响；本机回环始终放行）。优先级从高到低：环境变量 ARTEX_GATE_MODE > 设置表 settings.gate_mode > 本字段 gate_mode > 旧环境变量 ARTEX_GATE（1=enforce，0=off）> 默认 detect。未知值按 detect，并记下命中的那一层来源。enforce 必须显式配置；删除本字段即不从配置文件提供取值。off 或 detect 可随时退回。",
-  "gate_mode": "detect"
+  "gate_mode": "detect",
+
+  "_comment_jwt": "JWT 签名寿命与签名密钥轮换。只轮换 keyDir/jwt.keyring.json 里的 HS256 签名密钥，绝不改 jwt.key（它同时是 sessions/credentials 的 AES 主密钥和出口指纹）。优先级：环境变量 > 本文件字段 > 默认值。解析失败回落默认，不采用非法值。时长用 Go time.ParseDuration 语法（如 168h），不支持 d 后缀。",
+  "_comment_jwt_ttl": "访问令牌寿命。环境变量 ARTEX_JWT_TTL，默认 168h（7 天）。0 或解析失败回落默认。",
+  "jwt_ttl": "168h",
+  "_comment_jwt_rotation_period": "签名密钥按龄轮换周期。环境变量 ARTEX_JWT_ROTATION_PERIOD，默认 720h。0 关闭自动轮换（启动检查与 6h 循环都不再轮换）；手动 POST /api/auth/rotate-key 仍可用。解析失败回落 720h。",
+  "jwt_rotation_period": "720h",
+  "_comment_jwt_grace": "轮换后加在 TTL 之外的宽限。环境变量 ARTEX_JWT_GRACE，默认 24h。旧键 retire_at = now + TTL + grace，且不短于 7 天，例行轮换不断已签发的会话。0 表示不加额外宽限（仍受 7 天下限约束）。解析失败回落 24h。",
+  "jwt_grace": "24h"
 }

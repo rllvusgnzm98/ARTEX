@@ -45,9 +45,10 @@ type Server struct {
 	engine *Engine
 	ctx    context.Context
 
-	skillDir string // root directory for skill subdirectories
-	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
-	gate     *Gate  // 伪装门控；nil 表示未初始化，Handler 不改写 UI 行为
+	skillDir string      // root directory for skill subdirectories
+	jwtKey   []byte      // jwt.key 原文：AES 主密钥、无 kid 令牌验签、出口指纹。轮换签名密钥时不动它
+	jwtRing  *jwtKeyRing // HS256 签名钥匙环；nil 时签发/验签退回 jwtKey
+	gate     *Gate       // 伪装门控；nil 表示未初始化，Handler 不改写 UI 行为
 
 	sessReg   *session.Registry   // 立足点会话注册表；nil = DB 未就绪
 	sessStore *db.SessionStore    // 会话落库访问层（secret AES-GCM，密钥由 jwtKey 派生）
@@ -276,7 +277,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	go s.reconcileConcurrency()
 	s.startTaskArchiveWorker()
 	s.wireInterceptReviewer()      // LLM 兜底审批:未命中拦截规则的命令交给模型判定
-	s.registerEgressFingerprints() // 出口敏感指纹(只存哈希);profile/jwt 已就绪后注册
+	s.bootJWTKeyRing(keyDir)       // 签名钥匙环；按龄轮换，并启动可停止的 6h 检查
+	s.registerEgressFingerprints() // 出口敏感指纹(只存哈希);profile/jwt/钥匙环已就绪后注册
 	return s
 }
 
@@ -679,6 +681,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/auth/init", s.authInit)
 	mux.HandleFunc("POST /api/auth/login", s.authLogin)
 	mux.HandleFunc("POST /api/auth/change-password", s.authChangePassword)
+	mux.HandleFunc("POST /api/auth/refresh", s.authRefresh)
+	mux.HandleFunc("POST /api/auth/rotate-key", s.authRotateKey)
 
 	mux.HandleFunc("GET /api/health", s.health)
 	mux.HandleFunc("GET /api/stats", s.stats)
@@ -3943,6 +3947,7 @@ func cors(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Expose-Headers", jwtRefreshHeader)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(204)
 			return

@@ -36,6 +36,11 @@ type Config struct {
 	// GateMode 是伪装门控（off / detect / enforce）。空字符串表示本文件未配置，
 	// 由 ResolveGate 继续看更低优先级。优先级与未知值回落见 gate.go。
 	GateMode string `json:"gate_mode"`
+	// JWT 签名寿命与轮换。环境变量优先；见 JWTTTL / JWTRotationPeriod / JWTGrace。
+	// 这些字段不轮换 jwt.key（AES 主密钥）。
+	JWTTTL            string `json:"jwt_ttl"`
+	JWTRotationPeriod string `json:"jwt_rotation_period"`
+	JWTGrace          string `json:"jwt_grace"`
 }
 
 // BaseDir is the directory that anchors all runtime artifacts (config.json and

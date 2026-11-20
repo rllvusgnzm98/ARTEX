@@ -16,7 +16,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
-import { api, sseUrl } from "@/lib/api";
+import { useAuthedEventSource } from "@/hooks/use-authed-event-source";
+import { api } from "@/lib/api";
 import type { UpdateCheck, UpdateProgress } from "@/lib/types";
 
 /** 等待新版本上线的最长时间。一次升级要经过三次进程启动（暂存 → 换装 → 新版），
@@ -44,6 +45,9 @@ export function UpdateCard() {
   // 与 progress 分开：暂存完成后进程就没了，SSE 会断，此时要切到轮询 /api/health。
   const [restarting, setRestarting] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
+  const [updateStream, setUpdateStream] = React.useState<string | null>(null);
+  const [updateStreamGen, setUpdateStreamGen] = React.useState(0);
+  const updateFrom = React.useRef("");
 
   // quiet 同时决定要不要绕过后端缓存：进页面时的自动检查用缓存（顶栏刚查过），
   // 用户手动点「检查更新」则强制回源，否则刚发布的版本要等缓存过期才看得到。
@@ -98,10 +102,12 @@ export function UpdateCard() {
   }, []);
 
   // 订阅更新进度。SSE 不走 Next 的 /api 重写（那层会缓冲，事件推不出来）。
-  const openStream = React.useCallback(
-    (fromVersion: string) => {
-      const es = new EventSource(sseUrl("/api/update/stream"));
-      es.onmessage = (ev) => {
+  // onerror 时钩子会刷新令牌并重建连接；进程真的退出后刷新失败，连接停在这里，
+  // 交给 /api/health 轮询判断是否已经换上新版本。
+  useAuthedEventSource(
+    updateStream,
+    {
+      onmessage: (ev) => {
         let p: UpdateProgress;
         try {
           p = JSON.parse(ev.data) as UpdateProgress;
@@ -110,24 +116,18 @@ export function UpdateCard() {
         }
         setProgress(p);
         if (p.phase === "failed") {
-          es.close();
+          setUpdateStream(null);
           setBusy(false);
           toast.error("更新失败：" + (p.error || p.message));
           return;
         }
         if (p.phase === "staged") {
-          es.close();
-          void waitForNewVersion(fromVersion);
+          setUpdateStream(null);
+          void waitForNewVersion(updateFrom.current);
         }
-      };
-      es.onerror = () => {
-        // 进程退出时 SSE 必然断开。如果已经进入等待重启，这属于正常现象，
-        // 交给 /api/health 轮询继续判定即可。
-        es.close();
-      };
-      return es;
+      },
     },
-    [waitForNewVersion],
+    updateStreamGen,
   );
 
   const doUpdate = () => {
@@ -145,9 +145,11 @@ export function UpdateCard() {
 
     setBusy(true);
     setProgress({ phase: "downloading", percent: 0, message: "准备中…" });
-    const es = openStream(from);
+    updateFrom.current = from;
+    setUpdateStreamGen((n) => n + 1);
+    setUpdateStream("/api/update/stream");
     api.applyUpdate().catch((e) => {
-      es.close();
+      setUpdateStream(null);
       setBusy(false);
       setProgress(null);
       toast.error("启动更新失败：" + (e as Error).message);

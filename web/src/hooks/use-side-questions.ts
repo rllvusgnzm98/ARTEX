@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { toast } from "sonner";
 
-import { sseUrl } from "@/lib/api";
+import { useAuthedEventSource } from "@/hooks/use-authed-event-source";
 import { isBtwCommand, type SideExchange, type SideHistory, sideAPI } from "@/lib/side-questions";
 
 // crypto.randomUUID 仅在安全上下文可用(https/localhost);经 IP+http 访问时降级。
@@ -124,29 +124,34 @@ export function useSideQuestions(parent: string | null) {
     return () => clearInterval(timer);
   }, [open, parent, load]);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: Reconnect after a clear attempt invalidates older callbacks.
+  const subscribedEpoch = useRef(epoch.current);
   useEffect(() => {
-    if (!runningID) return;
-    const version = epoch.current;
-    const stream = new EventSource(sseUrl(`/api/side-questions/${runningID}/events`));
-    stream.addEventListener("snapshot", (event) => {
-      if (version !== epoch.current) return;
-      try {
-        const item = JSON.parse((event as MessageEvent).data) as SideExchange;
-        if (item.id !== runningID) return;
-        setItems((old) => merge(old, [item]));
-        restoreFailedDraft([item]);
-        if (item.status !== "running") stream.close();
-      } catch {
-        setError("旁路数据解析失败，请重新打开面板");
-      }
-    });
-    stream.addEventListener("cleared", () => {
-      stream.close();
-      if (version === epoch.current) setItems([]);
-    });
-    return () => stream.close();
-  }, [runningID, streamEpoch, restoreFailedDraft]);
+    subscribedEpoch.current = epoch.current;
+  }, [runningID, streamEpoch]);
+  useAuthedEventSource(
+    runningID ? `/api/side-questions/${runningID}/events` : null,
+    {
+      listeners: {
+        snapshot: (event, es) => {
+          if (subscribedEpoch.current !== epoch.current) return;
+          try {
+            const item = JSON.parse(event.data) as SideExchange;
+            if (item.id !== runningID) return;
+            setItems((old) => merge(old, [item]));
+            restoreFailedDraft([item]);
+            if (item.status !== "running") es.close();
+          } catch {
+            setError("旁路数据解析失败，请重新打开面板");
+          }
+        },
+        cleared: (_event, es) => {
+          es.close();
+          if (subscribedEpoch.current === epoch.current) setItems([]);
+        },
+      },
+    },
+    streamEpoch,
+  );
 
   const ask = async (input: string) => {
     const question = input.trim();
