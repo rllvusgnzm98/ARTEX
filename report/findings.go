@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/db"
 )
@@ -126,18 +127,36 @@ var unsafeFilenameChars = regexp.MustCompile(`[^\p{Han}\p{L}\p{N}._-]+`)
 func FindingFilename(f *db.DBFinding) string {
 	sev := nz(f.Severity, "info")
 	title := findingTitle(f)
-	name := fmt.Sprintf("%s_%s_#%d", sev, title, f.ID)
+	name := fmt.Sprintf("%s_%s", sev, title)
 	name = unsafeFilenameChars.ReplaceAllString(name, "_")
 	name = strings.Trim(name, "._")
 	if name == "" {
-		name = fmt.Sprintf("finding_%d", f.ID)
+		name = "finding"
 	}
 	// 防御性:再剥一层路径,杜绝 zip slip。
 	name = path.Base(name)
-	if len(name) > 120 {
-		name = name[:120]
+	// 发现 ID 必须留在文件名里;超长时只截标题,而且必须按完整 UTF-8 字符切,
+	// 否则 zip 条目名会出现非法编码(中文标题尤其容易被切在字符中间)。
+	suffix := fmt.Sprintf("_#%d", f.ID)
+	const maxLen = 120
+	if len(name)+len(suffix) > maxLen {
+		budget := maxLen - len(suffix)
+		if budget < 0 {
+			budget = 0
+		}
+		if budget > len(name) {
+			budget = len(name)
+		}
+		for budget > 0 && !utf8.ValidString(name[:budget]) {
+			budget--
+		}
+		name = strings.TrimRight(name[:budget], "._")
 	}
-	return name + ".md"
+	base := name + suffix
+	if base == "" || base == suffix {
+		base = fmt.Sprintf("finding%s", suffix)
+	}
+	return base + ".md"
 }
 
 // FindingsCSV 把一批 findings 渲染成 CSV(带 UTF-8 BOM,便于 Excel 正确识别中文)。

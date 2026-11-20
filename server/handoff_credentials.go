@@ -21,15 +21,20 @@ const (
 
 // inheritCredentials 把父任务自有凭据里与子任务立足点相关的那些记到继承表。
 // 默认只收 verified；ARTEX_INHERIT_UNVERIFIED=1 时再收未验证的 hash_nt。
-// 返回成功写入的条数。调用方在失败时只记日志，仍完成移交。
-func (s *Server) inheritCredentials(parentTaskID, childTaskID int64) (int, error) {
+// 返回成功写入的条数与父任务凭据里因解密失败被跳过的条数——后者不等于
+// “没有相关凭据”，调用方要把它区分展示。调用方在失败时只记日志，仍完成移交。
+func (s *Server) inheritCredentials(parentTaskID, childTaskID int64) (inherited, skipped int, err error) {
 	if s == nil || s.credStore == nil {
-		return 0, nil
+		return 0, 0, nil
 	}
 	ctx := context.Background()
 	listed, err := s.credStore.ListByTask(ctx, parentTaskID)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
+	}
+	skipped = len(listed.Skipped)
+	if skipped > 0 {
+		log.Printf("[handoff] 父任务 %d 有 %d 条凭据解密失败，已跳过继承（子任务 %d）", parentTaskID, skipped, childTaskID)
 	}
 	allowUnverifiedHash := os.Getenv(inheritUnverifiedEnv) == "1"
 	eligible := make([]*db.CredentialRecord, 0, len(listed.Items))
@@ -39,30 +44,30 @@ func (s *Server) inheritCredentials(parentTaskID, childTaskID int64) (int, error
 		}
 	}
 	if len(eligible) == 0 {
-		return 0, nil
+		return 0, skipped, nil
 	}
 	if s.m == nil || s.m.Assets() == nil || s.m.PG() == nil {
-		return 0, fmt.Errorf("asset store 未启用")
+		return 0, skipped, fmt.Errorf("asset store 未启用")
 	}
 	childScopes, err := s.m.Assets().ListTaskScope(childTaskID)
 	if err != nil {
-		return 0, err
+		return 0, skipped, err
 	}
 	hostIP := childFootholdIP(childScopes)
 	if hostIP == "" {
-		return 0, fmt.Errorf("子任务 %d 没有立足点 /32", childTaskID)
+		return 0, skipped, fmt.Errorf("子任务 %d 没有立足点 /32", childTaskID)
 	}
 	parentScopes, err := s.m.Assets().ListTaskScope(parentTaskID)
 	if err != nil {
-		return 0, err
+		return 0, skipped, err
 	}
 	domain, err := footholdDomain(ctx, s.m.PG(), hostIP)
 	if err != nil {
-		return 0, err
+		return 0, skipped, err
 	}
 	hosts, err := s.credentialHosts(eligible)
 	if err != nil {
-		return 0, err
+		return 0, skipped, err
 	}
 	picks := selectInherited(eligible, hosts, hostIP, domain, companyIDs(parentScopes))
 	if len(picks) > maxInheritedCreds {
@@ -88,7 +93,7 @@ func (s *Server) inheritCredentials(parentTaskID, childTaskID int64) (int, error
 		}
 		n++
 	}
-	return n, first
+	return n, skipped, first
 }
 
 func credEligible(c *db.CredentialRecord, allowUnverifiedHash bool) bool {

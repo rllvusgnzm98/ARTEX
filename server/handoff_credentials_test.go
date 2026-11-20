@@ -197,6 +197,41 @@ func TestHandoffInheritsVerifiedCredentials(t *testing.T) {
 	}
 }
 
+// 父任务凭据密文解不开时，移交不能只回 credentials_inherited=0：
+// 那和“没有相关凭据”看起来一样，操作员会以为本来就没有可继承的东西。
+func TestHandoffReportsUndecryptableCredentials(t *testing.T) {
+	env := startHandoffCreds(t, "203.0.113.88")
+	host := env.ipAsset("203.0.113.88")
+	id := env.cred(&db.CredentialRecord{
+		Username: "corrupt", CredType: db.CredPassword, Verified: true, HostAssetID: host,
+	})
+	if _, err := env.m.PG().Exec(`UPDATE credentials SET secret='broken-ciphertext' WHERE id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/"+itoa(env.sess)+"/handoff", nil)
+	req.SetPathValue("id", itoa(env.sess))
+	w := httptest.NewRecorder()
+	env.s.sessionHandoff(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("handoff 状态码=%d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	taskID, _ := body["task_id"].(string)
+	if taskID == "" {
+		t.Fatalf("应返回 task_id: %s", w.Body.String())
+	}
+	env.child = mustTaskID(t, taskID)
+	if got, _ := body["credentials_inherited"].(float64); got != 0 {
+		t.Fatalf("解不开的凭据不应被继承, inherited=%v body=%s", got, w.Body.String())
+	}
+	if got, _ := body["credentials_skipped"].(float64); got != 1 {
+		t.Fatalf("应报告 1 条解密失败, skipped=%v body=%s", got, w.Body.String())
+	}
+}
 func TestHandoffInheritUnverifiedHashNT(t *testing.T) {
 	env := startHandoffCreds(t, "203.0.113.20")
 	t.Setenv(inheritUnverifiedEnv, "1")

@@ -75,6 +75,7 @@ type Gate struct {
 	statsPath    string
 	persistEvery time.Duration
 	lastPersist  time.Time
+	flushPending atomic.Bool // 节流窗口内已安排一次补偿写
 }
 
 // initGate 在 Server 构造时解析模式。settings 读失败只跳过该层，不把已有的
@@ -413,11 +414,32 @@ func (g *Gate) persist() {
 	}
 	now := g.clock()
 	g.persistMu.Lock()
-	if g.persistEvery > 0 && !g.lastPersist.IsZero() && now.Sub(g.lastPersist) < g.persistEvery {
-		g.persistMu.Unlock()
+	if g.persistEvery > 0 && !g.lastPersist.IsZero() {
+		if wait := g.persistEvery - now.Sub(g.lastPersist); wait > 0 {
+			g.persistMu.Unlock()
+			// 节流窗口内的最后一次计数不能丢：补一次到期写盘，确保
+			// data/gate/stats.json 最终会追平内存计数（doctor 读的是这个文件）。
+			g.scheduleFlush(wait)
+			return
+		}
+	}
+	g.persistMu.Unlock()
+	g.writeSnapshot(now)
+}
+
+// scheduleFlush 只安排一次补偿写；写入本身不经过节流判断。
+func (g *Gate) scheduleFlush(wait time.Duration) {
+	if !g.flushPending.CompareAndSwap(false, true) {
 		return
 	}
-	g.lastPersist = now
+	time.AfterFunc(wait, func() {
+		g.flushPending.Store(false)
+		g.writeSnapshot(g.clock())
+	})
+}
+
+// writeSnapshot 立即写盘。调用方负责节流判断与 lastPersist 更新。
+func (g *Gate) writeSnapshot(now time.Time) {
 	path := g.statsPath
 	snap := config.GateStatsSnapshot{
 		Mode:      g.mode,
@@ -428,6 +450,8 @@ func (g *Gate) persist() {
 		Decoys:    g.decoys.Load(),
 		UpdatedAt: now.UTC(),
 	}
+	g.persistMu.Lock()
+	g.lastPersist = now
 	g.persistMu.Unlock()
 	if err := writeGateStats(path, snap); err != nil {
 		g.logLimited("统计快照写入失败")

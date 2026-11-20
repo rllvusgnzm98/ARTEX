@@ -493,3 +493,35 @@ func TestGateStatsFileUsesSharedSnapshot(t *testing.T) {
 		t.Fatalf("快照时间 %s", snap.UpdatedAt)
 	}
 }
+
+// 节流窗口里的最后一次计数不能永远留在内存：到期要补写，doctor 才能追平。
+func TestGateStatsTrailingFlushAfterThrottle(t *testing.T) {
+	dir := t.TempDir()
+	when := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	g := newGate(config.GateModeDetect, config.GateSourceDefault, []byte("flush-key"), dir)
+	g.now = func() time.Time { return when }
+	g.persistEvery = 40 * time.Millisecond
+
+	g.hits.Add(1)
+	g.persist()
+	g.hits.Add(1)
+	g.persist() // 窗口内：只安排补偿写
+
+	snap, err := config.ReadGateStats(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Hits != 1 {
+		t.Fatalf("节流窗口内不应立即写盘, hits=%d", snap.Hits)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		snap, err = config.ReadGateStats(dir)
+		if err == nil && snap.Hits == 2 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("补偿写没有追平内存计数, 最后快照 %+v", snap)
+}

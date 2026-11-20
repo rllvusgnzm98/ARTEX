@@ -358,10 +358,12 @@ func (s *Server) intranetSyncInheritedCredentials(w http.ResponseWriter, r *http
 		return
 	}
 	total := 0
+	skipped := 0
 	var first error
 	for _, parentID := range parents {
-		n, ierr := s.inheritCredentials(parentID, taskID)
+		n, sk, ierr := s.inheritCredentials(parentID, taskID)
 		total += n
+		skipped += sk
 		if ierr != nil && first == nil {
 			first = ierr
 		}
@@ -373,7 +375,7 @@ func (s *Server) intranetSyncInheritedCredentials(w http.ResponseWriter, r *http
 	if first != nil {
 		log.Printf("[credentials] resync inherit task=%d partial: %v", taskID, first)
 	}
-	writeJSON(w, 200, map[string]any{"inherited": total})
+	writeJSON(w, 200, map[string]any{"inherited": total, "skipped": skipped})
 }
 
 // DELETE /api/tasks/{id}/credentials/inherit/{credID} — 撤销一条仍有效的继承。不存在返回 404。

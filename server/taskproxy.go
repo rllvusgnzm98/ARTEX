@@ -323,9 +323,9 @@ func (m *taskProxyManager) hostGate(taskID int64) func(string) error {
 		if err != nil {
 			log.Printf("[taskproxy][roe] task %d 范围读取失败(mode=%s)", taskID, mode)
 			if mode == "strict" {
-				return fmt.Errorf("RoE 授权范围检查：主机 %s 的任务 %d 范围读取失败，strict 拒绝放行。可把目标加入任务范围，或调整 roe_enforcement 为 warn/off 回退。", host, taskID)
+				return fmt.Errorf("RoE 授权范围检查：主机 %s 的任务 %d 范围读取失败（不是未登记范围），strict 拒绝放行。可改用 roe_enforcement=warn/off 回退，或先确认数据库可用。", host, taskID)
 			}
-			m.noteRoEWarn(taskID, host, fmt.Sprintf("⚠ RoE 授权范围检查：主机 %s 的任务 %d 范围读取失败，warn 下放行。", host, taskID))
+			m.noteRoEWarn(taskID, host, fmt.Sprintf("⚠ RoE 授权范围检查：主机 %s 的任务 %d 范围读取失败（不是未登记范围），warn 下已放行。", host, taskID))
 			return nil
 		}
 		if guard.NewScopeMatcher(rules).Check(host) != guard.ScopeOut {

@@ -196,7 +196,7 @@ func (s *Server) sessionHandoff(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	inherited, ierr := s.inheritCredentials(rec.CreatedByTask, newID)
+	inherited, skipped, ierr := s.inheritCredentials(rec.CreatedByTask, newID)
 	if ierr != nil {
 		log.Printf("[handoff] inherit credentials parent=%d child=%d: %v", rec.CreatedByTask, newID, ierr)
 	}
@@ -208,5 +208,6 @@ func (s *Server) sessionHandoff(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"task_id":               t.ID,
 		"credentials_inherited": inherited,
+		"credentials_skipped":   skipped,
 	})
 }
