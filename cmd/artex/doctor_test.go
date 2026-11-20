@@ -7,8 +7,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/Autumn-27/artex/server"
 )
 
 func captureDoctor(t *testing.T, args ...string) (out string, code int) {
@@ -505,4 +508,108 @@ func TestDoctorGatePathNotDir(t *testing.T) {
 	if !strings.Contains(out, "[WARN] 伪装门控") || !strings.Contains(out, "不是目录") {
 		t.Fatalf("data/gate 不是目录应 WARN:\n%s", out)
 	}
+}
+
+// doctorHackbotsTests 把脚本目录指到临时目录，避免依赖真实 skills/ 内容。
+func writeDoctorScripts(t *testing.T, skillDir string, count int) {
+	t.Helper()
+	paths := server.HackbotsScriptPaths()
+	if len(paths) == 0 {
+		t.Fatal("Hackbots 工具清单为空")
+	}
+	if count > len(paths) {
+		count = len(paths)
+	}
+	for _, rel := range paths[:count] {
+		full := filepath.Join(skillDir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// 技能目录整体不存在 = 本次部署没带技能包：SKIP，且 strict 也不得升级为 FAIL，
+// 否则没装技能包的部署会被预检判死。
+func TestDoctorHackbotsMissingSkillDirIsSkip(t *testing.T) {
+	dsn, ok := isolateDoctorDB(t)
+	if !ok {
+		return
+	}
+	t.Setenv("ARTEX_PG_DSN", dsn)
+	t.Setenv("ARTEX_SKILL_DIR", filepath.Join(t.TempDir(), "absent"))
+	out, code := captureDoctor(t, "-data", t.TempDir(), "-strict-tools")
+	if code != 0 {
+		t.Fatalf("技能目录缺失不得 FAIL, exit=%d\n%s", code, out)
+	}
+	if !strings.Contains(out, "[SKIP] Hackbots 工具") || !strings.Contains(out, "技能目录不存在") {
+		t.Fatalf("技能目录缺失应 SKIP:\n%s", out)
+	}
+}
+
+// 目录在但脚本缺失：默认 WARN，-strict-tools 下 FAIL。
+func TestDoctorHackbotsMissingScripts(t *testing.T) {
+	dsn, ok := isolateDoctorDB(t)
+	if !ok {
+		return
+	}
+	t.Setenv("ARTEX_PG_DSN", dsn)
+	skillDir := t.TempDir()
+	t.Setenv("ARTEX_SKILL_DIR", skillDir)
+	out, code := captureDoctor(t, "-data", t.TempDir())
+	if code != 0 {
+		t.Fatalf("默认脚本缺失应为 WARN, exit=%d\n%s", code, out)
+	}
+	if !strings.Contains(out, "[WARN] Hackbots 工具") || !strings.Contains(out, "缺失: ") {
+		t.Fatalf("脚本缺失应 WARN 并列出缺失项:\n%s", out)
+	}
+
+	out, code = captureDoctor(t, "-data", t.TempDir(), "-strict-tools")
+	if code != 1 {
+		t.Fatalf("strict 下脚本缺失应 FAIL, exit=%d\n%s", code, out)
+	}
+	if !strings.Contains(out, "[FAIL] Hackbots 工具") {
+		t.Fatalf("strict 应报 FAIL:\n%s", out)
+	}
+}
+
+// 脚本齐全时不得再报缺失（解释器是否装好由机器决定，只断言脚本计数）。
+func TestDoctorHackbotsScriptsPresent(t *testing.T) {
+	dsn, ok := isolateDoctorDB(t)
+	if !ok {
+		return
+	}
+	t.Setenv("ARTEX_PG_DSN", dsn)
+	skillDir := t.TempDir()
+	t.Setenv("ARTEX_SKILL_DIR", skillDir)
+	writeDoctorScripts(t, skillDir, len(server.HackbotsScriptPaths()))
+	out, _ := captureDoctor(t, "-data", t.TempDir())
+	total := len(server.HackbotsScriptPaths())
+	if !strings.Contains(out, "脚本 "+strconv.Itoa(total)+"/"+strconv.Itoa(total)+" 存在") {
+		t.Fatalf("脚本齐全时应报告 %d/%d:\n%s", total, total, out)
+	}
+	if strings.Contains(out, "缺失: ") {
+		t.Fatalf("脚本齐全时不得报缺失:\n%s", out)
+	}
+}
+
+// isolateDoctorDB 复用当前 ARTEX_PG_DSN：Hackbots 项只在数据库可连接时才不会被
+// PostgreSQL 的 FAIL 掩盖退出码。没有数据库时跳过（与其它 doctor 集成测试一致）。
+// 同时把外部工具清单指到空清单，避免隧道工具缺失干扰 Hackbots 项的断言。
+func isolateDoctorDB(t *testing.T) (string, bool) {
+	t.Helper()
+	dsn := strings.TrimSpace(os.Getenv("ARTEX_PG_DSN"))
+	if dsn == "" {
+		t.Skip("no ARTEX_PG_DSN — skipping doctor integration")
+		return "", false
+	}
+	isolateConfig(t)
+	man := filepath.Join(t.TempDir(), "tools-manifest.json")
+	if err := os.WriteFile(man, []byte(`{"tools":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARTEX_TOOLS_MANIFEST", man)
+	return dsn, true
 }

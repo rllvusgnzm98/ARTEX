@@ -16,6 +16,7 @@ import (
 
 	"github.com/Autumn-27/artex/config"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/server"
 	"github.com/Autumn-27/artex/tools"
 )
 
@@ -269,6 +270,18 @@ func runDoctor(args []string) int {
 		check(docWarn, "回连地址", "ARTEX_CALLBACK_ADDR 未设置——隧道回连平台不可用；立足点功能不受影响")
 	}
 
+	// 8. Hackbots 脚本工具：随包脚本是否落在 skills/ 下、解释器是否可用。
+	// doctor 只读，不能走 config.SkillDir()（它会在缺省时创建目录）。
+	// 技能目录整体不存在说明本次部署没带技能包：SKIP 而不是 FAIL。
+	// 目录在但脚本缺失/解释器不可用：默认 WARN，-strict-tools 升级为 FAIL。
+	{
+		st, note := doctorHackbots(doctorSkillDir())
+		if st == docWarn && *strictTools {
+			st = docFail
+		}
+		check(st, "Hackbots 工具", note)
+	}
+
 	// 汇总：有 FAIL 才退出码 1
 	var nOK, nWarn, nFail, nSkip int
 	for _, it := range items {
@@ -289,6 +302,72 @@ func runDoctor(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// doctorSkillDir 只读地解析技能根目录：与 config.SkillDir() 优先级相同
+// （env ARTEX_SKILL_DIR > config.json 的 skill_dir > BaseDir()/skills），但不会
+// 创建目录 —— doctor 是只读预检，不能有副作用。
+func doctorSkillDir() string {
+	if v := strings.TrimSpace(os.Getenv("ARTEX_SKILL_DIR")); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(config.Load().SkillDir); v != "" {
+		return v
+	}
+	return filepath.Join(config.BaseDir(), "skills")
+}
+
+// doctorHackbots 检查随包侦察脚本与解释器。技能目录整体不存在时返回 SKIP
+// （本次部署没带技能包，不是故障）；脚本缺失或解释器不可用返回 WARN，由调用方
+// 在 -strict-tools 下升级为 FAIL。
+func doctorHackbots(skillDir string) (doctorStatus, string) {
+	if st, err := os.Stat(skillDir); err != nil || !st.IsDir() {
+		return docSkip, "技能目录不存在（" + skillDir + "）——本次部署未带 Hackbots 脚本"
+	}
+	scripts := server.HackbotsScriptPaths()
+	if len(scripts) == 0 {
+		return docSkip, "工具清单为空"
+	}
+	var missing []string
+	needPython, needNode := false, false
+	for _, rel := range scripts {
+		if _, err := os.Stat(filepath.Join(skillDir, filepath.FromSlash(rel))); err != nil {
+			missing = append(missing, rel)
+			continue
+		}
+		switch strings.ToLower(filepath.Ext(rel)) {
+		case ".py":
+			needPython = true
+		case ".js", ".mjs":
+			needNode = true
+		}
+	}
+	var bits []string
+	bits = append(bits, fmt.Sprintf("脚本 %d/%d 存在（%s）", len(scripts)-len(missing), len(scripts), skillDir))
+	failed := len(missing) > 0
+	if failed {
+		bits = append(bits, "缺失: "+strings.Join(missing, ", "))
+	}
+	if needPython {
+		if p := server.DetectPythonInterpreter(); p != "" {
+			bits = append(bits, "python="+p)
+		} else {
+			bits = append(bits, "python 未找到（.py 工具不可用，可在 UI 设置 python_interpreter）")
+			failed = true
+		}
+	}
+	if needNode {
+		if p := server.DetectNodeInterpreter(); p != "" {
+			bits = append(bits, "node="+p)
+		} else {
+			bits = append(bits, "node 未找到（.js 工具不可用，可在 UI 设置 node_interpreter）")
+			failed = true
+		}
+	}
+	if failed {
+		return docWarn, strings.Join(bits, "；")
+	}
+	return docOK, strings.Join(bits, "；")
 }
 
 // doctorCamouflage 汇总当前解析结果、监听是否暴露全网卡、data/gate 权限和

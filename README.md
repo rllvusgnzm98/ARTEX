@@ -59,6 +59,7 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 - **换 JWT 密钥不再把在线用户踢下线。** 新旧签名密钥可以同时存在、定时轮换；前端收到 401 会自己续期重试，SSE 断线自动重连。加密用的 `jwt.key` 不动。
 - **伪装门控真的有了。** 默认 `detect`，只统计不拦响应；显式配成 `enforce` 才对外返回假 404。本机访问和登录后拿到的 10 分钟临时通行证不受影响。
 - **部署更省事。** 构建可配镜像源（不通自动回退官方）；工具清单钉版本、验哈希；`artex doctor -strict-tools` 能当部署门禁；技能文件格式有测试兜底，坏文件不会拖垮整组技能。
+- **内置了一组本地 JS / API 侦察技能。** 脚本随仓库分发，启动时登记成命令工具，不调用 Codex 或 Claude。Caido 没开时采集会直接说明找不到 CLI，不会编造流量。
 
 逐条细节和状态见 [docs/待办任务.md](docs/待办任务.md)。
 
@@ -75,6 +76,23 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 - 在「**资产同步**」页填 ScopeSentry 的地址与 API Key，接入数据源；
 - 按**项目**或**任务**维度选择要同步的目标与资产类型（域名 / 子域 / IP / 端口 / 站点 / 端点…）；
 - 一键导入并按公司资产范围归并，直接进入 ARTEX 的资产图供 agent 探索使用。
+
+## 内置侦察技能（Hackbots）
+
+`skills/` 里多了六组本地侦察技能。脚本只用系统自带的 Python 标准库和 Node 内置模块，不调用 Codex、Claude 或其他外部 agent：
+
+| 技能 | 做什么 |
+| --- | --- |
+| `js-endpoint-extraction` | 从已经下载到本地的 JS 里抽 API 路径和 URL |
+| `lazy-chunk-downloader` | 从 bundle 还原懒加载 chunk；可先 `dry_run` 只列名单 |
+| `jshero` | chunk 发现、凭据/汇聚点扫描、多轮合并、出报告 |
+| `content-discovery-wordlist` | 内容发现词表怎么用、边界在哪 |
+| `api-surface-recon` | 把流量和 JS 收成一张 API 面清单 |
+| `api-fingerprint-caido` | 只生成 HTTP 指纹探测计划；拉 Caido 流量需要本机 Caido 已在抓包 |
+
+启动时这些脚本会登记成命令工具（同名记录已存在则不覆盖，页面上改过的绑定和禁用会留着）。`auto` / `pentest` / `worker` 默认可看到侦察链；Caido 相关技能和工具只给 `pentest` 和 `auto`。`artex doctor` 会检查脚本是否在位，以及 python / node 能不能找到。Windows 上商店占位的 `python3` 不算可用解释器。
+
+来源和改了什么见 [packaging/hackbots/NOTICE.md](packaging/hackbots/NOTICE.md)。
 
 ---
 
