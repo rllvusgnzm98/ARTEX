@@ -54,10 +54,10 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 
 - **不再误拦自己的回连地址。** 反弹 shell、隧道回连用的平台地址出现在命令里时，出口检查会认出“这是自己的地址”并放行；第三方地址照旧拦。
 - **范围检查进了代理和隧道。** 会话登记、端口转发、任务代理都会按任务范围判断：`strict` 越界直接拒绝（范围读不到也拒绝），`warn` 只告警，`off` 不查。注意它只管走 HTTP(S) 代理的流量，nmap/ssh 这类直连不经它。
-- **蜜罐规则不再把真 FTP、真 Apache 当蜜罐。** 三条过宽的签名已收紧，并加了校准测试（真实服务必须 0 分）。确认是蜜罐时，worker 会收到“这个方向别继续”的明确提示，必要时 guard 直接拦。
+- **蜜罐规则不再把真 FTP、真 Apache 当蜜罐。** 三条过宽的签名已收紧，并加了校准测试（真实服务必须 0 分）。确认是蜜罐时，执行任务的 AI 会收到“这个方向别继续”的明确提示；需要时平台会直接拦下这类操作。
 - **外网转内网会带上父任务的凭据。** 只继承已验证的、和立足点相关的（同主机 / 同网段 / 同域 / 同企业），最多 20 条；列表里能看到“继承自 #任务”。验证状态只认平台探针成功，不认模型自己说。
-- **换 JWT 密钥不再把在线用户踢下线。** 签名密钥可以多代并存、定时轮换；前端收到 401 会自己续期重试，SSE 断线自动重连。加密用的 `jwt.key` 不动。
-- **伪装门控真的有了。** 默认 `detect`，只统计不拦响应；显式配成 `enforce` 才对外返回假 404。本机访问和登录后拿到的一次性旁路不受影响。
+- **换 JWT 密钥不再把在线用户踢下线。** 新旧签名密钥可以同时存在、定时轮换；前端收到 401 会自己续期重试，SSE 断线自动重连。加密用的 `jwt.key` 不动。
+- **伪装门控真的有了。** 默认 `detect`，只统计不拦响应；显式配成 `enforce` 才对外返回假 404。本机访问和登录后拿到的 10 分钟临时通行证不受影响。
 - **部署更省事。** 构建可配镜像源（不通自动回退官方）；工具清单钉版本、验哈希；`artex doctor -strict-tools` 能当部署门禁；技能文件格式有测试兜底，坏文件不会拖垮整组技能。
 
 逐条细节和状态见 [docs/待办任务.md](docs/待办任务.md)。
@@ -271,8 +271,8 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 
   代理层只拦走 HTTP(S) 代理的请求。nmap、ssh 或 chisel 里放行 `.*` 的转发不经过它，别把它当成出站防火墙。
 - **出口检查**：平台自己的回连地址、监听地址、`127.0.0.1` / `::1` / `localhost` 默认放行；还有别的自身地址，就加到 `config.json` 的 `own_infra_hosts` 数组里。
-- **伪装门控**：`config.json` 的 `gate_mode` 或环境变量 `ARTEX_GATE_MODE`，取值 `off` / `detect`（默认）/ `enforce`。切 `enforce` 之前先用 `detect` 跑几天，看看 `artex doctor` 和 `GET /api/gate/stats` 里的探测计数。需要进 UI 时，登录后调一次 `POST /api/gate/bypass` 拿 10 分钟旁路；本机访问本来就不拦。
-- **JWT**：`ARTEX_JWT_TTL`（默认 168h）、`ARTEX_JWT_ROTATION_PERIOD`（默认 720h，`0` 关闭自动轮换）、`ARTEX_JWT_GRACE`（默认 24h，轮换后旧密钥多留一天）。只换签名密钥，不动 `jwt.key`；首次轮换后如果回退到旧版本，旧版不认识新的 key id，需要重新登录一次。
+- **伪装门控**：`config.json` 的 `gate_mode` 或环境变量 `ARTEX_GATE_MODE`，取值 `off` / `detect`（默认）/ `enforce`。切 `enforce` 之前先用 `detect` 跑几天，看看 `artex doctor` 和 `GET /api/gate/stats` 里的探测计数。需要打开页面时，登录后调一次 `POST /api/gate/bypass`，会拿到一张 10 分钟的临时通行证；本机访问本来就不拦。
+- **JWT**：`ARTEX_JWT_TTL`（默认 168h）、`ARTEX_JWT_ROTATION_PERIOD`（默认 720h，`0` 关闭自动轮换）、`ARTEX_JWT_GRACE`（默认 24h，轮换后旧密钥多留一天）。只换签名密钥，不动 `jwt.key`；首次轮换后如果回退到旧版本，旧版不认识新的密钥编号，需要重新登录一次。
 - **凭据继承**：默认只继承 `verified=true` 的凭据。要连未验证的 NTLM hash 一起带过去，设 `ARTEX_INHERIT_UNVERIFIED=1`。
 - **工具校验**：平时 `artex doctor` 缺工具只 WARN；部署流水线上加 `-strict-tools`，非可选工具缺失或哈希不符就 FAIL。
 
