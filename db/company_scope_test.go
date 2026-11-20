@@ -332,16 +332,26 @@ func TestCompanyScopeAttribution(t *testing.T) {
 	})
 
 	uniq := startMax + 1
-	root := fmt.Sprintf("scopetest%d.com", uniq)
+	// 每次运行用独立标签：复用同一个库重复跑（-count=2 或连跑两次）时，
+	// 上一次残留的公司 scope 不能把这一次的资产先归走。
+	tag := time.Now().UnixNano()
+	root := fmt.Sprintf("scopetest%d.com", tag)
 	sub := "api." + root
-	ipIn := "198.51.100.9"
+	third := int(tag%200) + 1
+	cidr := fmt.Sprintf("10.77.%d.0/24", third)
+	ipIn := fmt.Sprintf("10.77.%d.9", third)
 	ipOut := "203.0.113.9"
 	outDomain := fmt.Sprintf("other%d.net", uniq)
 
-	cid, _, err := cs.UpsertCompany(fmt.Sprintf("ScopeCo %d", uniq), "")
+	cid, _, err := cs.UpsertCompany(fmt.Sprintf("ScopeCo %d", tag), "")
 	if err != nil {
 		t.Fatalf("UpsertCompany: %v", err)
 	}
+	t.Cleanup(func() {
+		if _, err := cs.DeleteCompanyWithAssets(cid, true); err != nil {
+			t.Logf("cleanup company %d: %v", cid, err)
+		}
+	})
 
 	// a pre-existing asset (inserted BEFORE any scope) — must be back-filled.
 	preID, err := as.UpsertSubdomain(UpsertSubdomainReq{Domain: sub})
@@ -354,7 +364,7 @@ func TestCompanyScopeAttribution(t *testing.T) {
 		t.Fatalf("pre-scope asset should be unattributed, got %v", *preCompanyID)
 	}
 
-	cs.AddScope(cid, []string{root, "198.51.100.0/24"}, "unit test")
+	cs.AddScope(cid, []string{root, cidr}, "unit test")
 
 	mustCid := func(id int64, want int64, label string) {
 		var cID *int64
