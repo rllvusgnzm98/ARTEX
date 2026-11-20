@@ -80,7 +80,12 @@ export function CredsTab({
                     <td className="max-w-xs truncate px-3 py-2" title={c.source}>
                       {c.source || "—"}
                     </td>
-                    <td className="px-3 py-2">{c.task_id || "—"}</td>
+                    <td className="px-3 py-2">
+                      {c.task_id || "—"}
+                      {c.inherited ? (
+                        <span className="text-muted-foreground ml-2 text-xs">继承自 #{c.source_task_id}</span>
+                      ) : null}
+                    </td>
                     <td className="px-3 py-2 whitespace-nowrap">{fmtTime(c.created_at)}</td>
                   </tr>
                 ),

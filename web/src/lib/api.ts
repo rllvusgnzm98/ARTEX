@@ -1350,7 +1350,7 @@ export const api = {
   teardownTunnel: (id: string | number) =>
     post<{ tunnel_id: number; state: string }>(`/tunnels/${encodeURIComponent(String(id))}/teardown`),
   handoffSession: (id: string | number) =>
-    post<{ task_id: string }>(`/sessions/${encodeURIComponent(String(id))}/handoff`),
+    post<{ task_id: string; credentials_inherited?: number }>(`/sessions/${encodeURIComponent(String(id))}/handoff`),
   credentials: (taskId?: string) =>
     get<Partial<CredentialList>>(`/credentials${taskQuery(taskId)}`).then((r) => ({
       items: arr(r.items),

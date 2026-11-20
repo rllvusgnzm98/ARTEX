@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
@@ -96,7 +98,8 @@ func (s *Server) addCredentialTool() actool.CoreTool {
 func (s *Server) listCredentialsTool() actool.CoreTool {
 	return actool.Build(actool.Spec{
 		Name: "list_credentials",
-		Description: "列出本任务已登记的全部凭据（脱敏：不返回明文 secret，只给 secret_masked）。" +
+		Description: "列出本任务自有凭据，以及仍有效的继承凭据（脱敏：不返回明文 secret，只给 secret_masked）。" +
+			"每条带 inherited、source_task_id、scope_basis；自有条目 inherited=false。" +
 			"要在本任务复用某条凭据，用 credential_reuse_plan 拿带必要字段的建议。",
 		Schema: map[string]any{
 			"type":       "object",
@@ -109,7 +112,7 @@ func (s *Server) listCredentialsTool() actool.CoreTool {
 			if ri.TaskID <= 0 {
 				return actool.Errorf("list_credentials 需要任务上下文"), nil
 			}
-			listed, err := s.credStore.ListByTask(ctx, ri.TaskID)
+			listed, err := s.credStore.ListInherited(ctx, ri.TaskID)
 			if err != nil {
 				return actool.Errorf("读取凭据失败:" + err.Error()), nil
 			}
@@ -126,8 +129,9 @@ func (s *Server) listCredentialsTool() actool.CoreTool {
 func (s *Server) credentialReusePlanTool() actool.CoreTool {
 	return actool.Build(actool.Spec{
 		Name: "credential_reuse_plan",
-		Description: "【凭据复用打分】对本任务已登记凭据 × 本任务已发现主机资产跑复用打分" +
+		Description: "【凭据复用打分】对本任务自有凭据和仍有效的继承凭据 × 本任务范围内的主机资产跑复用打分" +
 			"（同网段/域凭据/服务重叠/PtH/已验证），返回得分最高的 top 10 条建议。" +
+			"只带官方范围、资产记在来源任务上的子任务也能出候选。" +
 			"每条建议含工人在本任务复用所需的必要字段（含 secret）；这些字段只出现在本工具返回中，不得写入列表或日志。",
 		Schema: map[string]any{
 			"type":       "object",
@@ -140,7 +144,7 @@ func (s *Server) credentialReusePlanTool() actool.CoreTool {
 			if ri.TaskID <= 0 {
 				return actool.Errorf("credential_reuse_plan 需要任务上下文"), nil
 			}
-			listed, err := s.credStore.ListByTask(ctx, ri.TaskID)
+			listed, err := s.credStore.ListInherited(ctx, ri.TaskID)
 			if err != nil {
 				return actool.Errorf("读取凭据失败:" + err.Error()), nil
 			}
@@ -153,7 +157,7 @@ func (s *Server) credentialReusePlanTool() actool.CoreTool {
 				}
 				return actool.Text("本任务还没有登记凭据(add_credential 先登记),无复用建议"), nil
 			}
-			assets, err := s.m.pg.Assets().QueryByTask(ri.TaskID, "ip", 2000, 0)
+			assets, err := s.m.pg.Assets().QueryDSLInScope("", "ip", ri.TaskID, 2000, 0)
 			if err != nil {
 				return actool.Errorf("读取资产失败:" + err.Error()), nil
 			}
@@ -251,7 +255,7 @@ func (s *Server) intranetListCredentials(w http.ResponseWriter, r *http.Request)
 	var listed db.CredentialList
 	var err error
 	if taskID > 0 {
-		listed, err = s.credStore.ListByTask(r.Context(), taskID)
+		listed, err = s.credStore.ListInherited(r.Context(), taskID)
 	} else {
 		listed, err = s.credStore.ListAll(r.Context())
 	}
@@ -261,4 +265,168 @@ func (s *Server) intranetListCredentials(w http.ResponseWriter, r *http.Request)
 	}
 	items, skipped := db.PublicCredentials(listed)
 	writeJSON(w, 200, map[string]any{"items": items, "skipped": skipped})
+}
+
+// observeCredentialVerified 只在平台已经观测到成功（例如 register_session 探针通过并落库）之后调用。
+// 凭据属于本任务，或 credential_inheritances 上有指向本任务的 active 行，才 SetVerified(true)。
+// 模型文本、越权 id、读取失败都不置位。credID<=0 表示调用方没要求处理。
+// 返回的 warning 非空时是非致命说明；verified 为 true 表示已经置位。
+func (s *Server) observeCredentialVerified(ctx context.Context, taskID, credID int64) (warning string, verified bool) {
+	if credID <= 0 {
+		return "", false
+	}
+	if s == nil || s.credStore == nil {
+		return "credential_id 已忽略：凭据子系统未就绪", false
+	}
+	if taskID <= 0 {
+		return "credential_id 已忽略：当前没有任务上下文", false
+	}
+	rec, err := s.credStore.Get(ctx, credID)
+	if err != nil {
+		log.Printf("[credentials] verify lookup id=%d task=%d: %v", credID, taskID, err)
+		return "credential_id 已忽略：凭据读取失败", false
+	}
+	belongs := rec != nil && rec.TaskID == taskID
+	if !belongs {
+		metas, merr := s.credStore.ListInheritedMeta(ctx, taskID)
+		if merr != nil {
+			log.Printf("[credentials] verify inherit lookup id=%d task=%d: %v", credID, taskID, merr)
+			return "credential_id 已忽略：继承关系读取失败", false
+		}
+		for _, m := range metas {
+			if m.CredentialID == credID {
+				belongs = true
+				break
+			}
+		}
+	}
+	if !belongs {
+		return "credential_id 不属于本任务，已忽略，不影响本次登记", false
+	}
+	if err := s.credStore.SetVerified(ctx, credID, true); err != nil {
+		log.Printf("[credentials] SetVerified id=%d task=%d: %v", credID, taskID, err)
+		return "凭据属于本任务，但标记已验证失败", false
+	}
+	return "", true
+}
+
+// workerCredentialSeed 渲染本任务仍有效的继承凭据线索。查失败或没有继承凭据时返回空串，
+// 不带 secret，也不影响 worker 启动。
+func (s *Server) workerCredentialSeed(ctx context.Context, taskID int64) string {
+	if s == nil || s.credStore == nil || taskID <= 0 {
+		return ""
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	metas, err := s.credStore.ListInheritedMeta(ctx, taskID)
+	if err != nil {
+		log.Printf("[credentials] worker credential seed task=%d: %v", taskID, err)
+		return ""
+	}
+	return agent.RenderWorkerCredentialSeed(metas)
+}
+
+// POST /api/tasks/{id}/credentials/inherit — 从父任务 / 来源任务幂等重同步继承。
+// 无父任务、无来源任务时返回 inherited=0，不报 500。
+func (s *Server) intranetSyncInheritedCredentials(w http.ResponseWriter, r *http.Request) {
+	if s.credStore == nil {
+		writeErr(w, 503, "凭据子系统未就绪(DB 未连接)")
+		return
+	}
+	if s.m == nil || s.m.PG() == nil {
+		writeErr(w, 503, "任务管理器未就绪")
+		return
+	}
+	taskID, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	task, err := s.m.PG().GetTask(taskID)
+	if err != nil {
+		writeErr(w, 500, "任务读取失败: "+err.Error())
+		return
+	}
+	if task == nil {
+		writeErr(w, 404, "任务不存在")
+		return
+	}
+	parents := credentialParentTaskIDs(task)
+	if len(parents) == 0 {
+		writeJSON(w, 200, map[string]any{"inherited": 0})
+		return
+	}
+	total := 0
+	var first error
+	for _, parentID := range parents {
+		n, ierr := s.inheritCredentials(parentID, taskID)
+		total += n
+		if ierr != nil && first == nil {
+			first = ierr
+		}
+	}
+	if first != nil && total == 0 {
+		writeErr(w, 500, "凭据继承失败: "+first.Error())
+		return
+	}
+	if first != nil {
+		log.Printf("[credentials] resync inherit task=%d partial: %v", taskID, first)
+	}
+	writeJSON(w, 200, map[string]any{"inherited": total})
+}
+
+// DELETE /api/tasks/{id}/credentials/inherit/{credID} — 撤销一条仍有效的继承。不存在返回 404。
+func (s *Server) intranetRevokeInheritedCredential(w http.ResponseWriter, r *http.Request) {
+	if s.credStore == nil {
+		writeErr(w, 503, "凭据子系统未就绪(DB 未连接)")
+		return
+	}
+	taskID, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	credID, err := pathID(r, "credID")
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	if err := s.credStore.RevokeInherited(r.Context(), taskID, credID); err != nil {
+		if strings.Contains(err.Error(), "没有可撤销的继承凭据") {
+			writeErr(w, 404, err.Error())
+			return
+		}
+		writeErr(w, 500, "撤销继承失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"revoked": true})
+}
+
+// credentialParentTaskIDs 合并 parent_ref 与直接来源任务，去掉自身和重复项。
+func credentialParentTaskIDs(task *db.Task) []int64 {
+	if task == nil {
+		return nil
+	}
+	seen := map[int64]struct{}{}
+	out := []int64{}
+	add := func(id int64) {
+		if id <= 0 || id == task.ID {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	if task.ParentRef != "" {
+		if id, err := strconv.ParseInt(task.ParentRef, 10, 64); err == nil {
+			add(id)
+		}
+	}
+	for _, id := range task.SourceTaskIDs {
+		add(id)
+	}
+	return out
 }

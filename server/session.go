@@ -171,10 +171,11 @@ func (s *Server) registerSessionTool() actool.CoreTool {
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"url":      strParam("立足点完整 URL，含协议（必填）"),
-				"password": strParam("连接参数名（POST 字段名，默认 cmd；加密通道不需要）"),
-				"lang":     strParam("通道类型：php / phpcmd / jsp / aspx / auto（默认 auto）；phpenc / jspenc（已有加密通道）"),
-				"secret":   strParam("已有加密通道的密钥（仅 phpenc/jspenc 必填）"),
+				"url":           strParam("立足点完整 URL，含协议（必填）"),
+				"password":      strParam("连接参数名（POST 字段名，默认 cmd；加密通道不需要）"),
+				"lang":          strParam("通道类型：php / phpcmd / jsp / aspx / auto（默认 auto）；phpenc / jspenc（已有加密通道）"),
+				"secret":        strParam("已有加密通道的密钥（仅 phpenc/jspenc 必填）"),
+				"credential_id": map[string]any{"type": "integer", "description": "可选。仅当平台探针成功并完成登记后，若该凭据属于本任务或已继承进本任务，才标记为已验证。0 或缺省不处理。模型自称已验证不会被采纳；不属于本任务的 id 只附加非致命提示，不影响登记成功。"},
 			},
 			"required": []any{"url"},
 		},
@@ -182,10 +183,11 @@ func (s *Server) registerSessionTool() actool.CoreTool {
 		Permissions: sessionPerm,
 		Run: func(ctx context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
 			var a struct {
-				URL      string `json:"url"`
-				Password string `json:"password"`
-				Lang     string `json:"lang"`
-				Secret   string `json:"secret"`
+				URL          string `json:"url"`
+				Password     string `json:"password"`
+				Lang         string `json:"lang"`
+				Secret       string `json:"secret"`
+				CredentialID int64  `json:"credential_id"`
 			}
 			_ = json.Unmarshal(in, &a)
 			a.URL = strings.TrimSpace(a.URL)
@@ -251,6 +253,12 @@ func (s *Server) registerSessionTool() actool.CoreTool {
 			}
 			if warn != "" {
 				out["roe_warning"] = warn
+			}
+			// 置位只跟这次已经成功的探针走。不读模型给出的 verified/说明文本。
+			if note, ok := s.observeCredentialVerified(ctx, ri.TaskID, a.CredentialID); note != "" {
+				out["credential_warning"] = note
+			} else if ok {
+				out["credential_verified"] = true
 			}
 			return jsonResult(out)
 		},

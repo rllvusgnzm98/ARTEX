@@ -97,6 +97,9 @@ type Worker struct {
 	// uaFn 解析本任务稳定分配的客户端 UA,经 BashEnv 注入 ARTEX_UA。
 	// 同一任务始终同一个 UA;nil = 不注入。
 	uaFn func(taskID int64) string
+
+	// credentialSeedFn 每次 run 渲染继承凭据线索。nil、空串或查询失败都不改变系统提示。
+	credentialSeedFn func(ctx context.Context, taskID int64) string
 }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
@@ -163,6 +166,22 @@ func (w *Worker) uaForTask(taskID int64) string {
 		return ""
 	}
 	return w.uaFn(taskID)
+}
+
+// SetCredentialSeed 接入继承凭据线索。每次 run 现查；返回空串或未设置时不改系统提示。
+// 解析失败由调用方吞掉并返回空串，不阻断 worker。
+func (w *Worker) SetCredentialSeed(fn func(ctx context.Context, taskID int64) string) {
+	if w == nil {
+		return
+	}
+	w.credentialSeedFn = fn
+}
+
+func (w *Worker) credentialSeedBlock(ctx context.Context, taskID int64) string {
+	if w == nil || w.credentialSeedFn == nil {
+		return ""
+	}
+	return w.credentialSeedFn(ctx, taskID)
 }
 
 // SetConstraintInject wires a resolver deciding whether this task's operation
@@ -514,6 +533,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// 进场预塞：与本意图相关的已确认事实 + 已确认可达但未兑现的下一跳。
 	// 压缩/预取失败只打「图谱不完整」标记，fail-soft，不阻断进场、不写目标失败。
 	sysBody += RenderWorkerEntrySeed(LoadWorkerEntrySeed(ts, as, intent))
+	sysBody += w.credentialSeedBlock(ctx, taskID) // 无继承凭据或查询失败时为空串
 	sysBody += "\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。"
 	system, boundary := deferredSystem(sysBody, def)
 	// 任务级 deadline(经 ctx 注入)夹逼本 run 的墙钟预算 + 决定收尾词(见 taskclock.go)。

@@ -957,6 +957,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tunnels", s.intranetListTunnels)
 	mux.HandleFunc("POST /api/tunnels/{id}/teardown", s.intranetTeardownTunnel)
 	mux.HandleFunc("GET /api/credentials", s.intranetListCredentials)
+	mux.HandleFunc("POST /api/tasks/{id}/credentials/inherit", s.intranetSyncInheritedCredentials)
+	mux.HandleFunc("DELETE /api/tasks/{id}/credentials/inherit/{credID}", s.intranetRevokeInheritedCredential)
 	mux.HandleFunc("POST /api/stage", s.stageCreate)
 	mux.HandleFunc("GET /api/stage", s.stageList)
 	mux.HandleFunc("DELETE /api/stage/{token}", s.stageDelete)

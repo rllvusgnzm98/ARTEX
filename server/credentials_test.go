@@ -13,6 +13,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/session"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -135,6 +136,9 @@ func TestCredentialToolsListRedactsReuseIncludesSecret(t *testing.T) {
 		OpenPorts: []db.PortService{{Port: 22, Service: "ssh"}},
 	}); err != nil {
 		t.Fatalf("UpsertIP cand: %v", err)
+	}
+	if _, err := m.Assets().AddAgentScope(taskID, "cidr", "10.0.0.0/24", "fixture reuse scope", "manual"); err != nil {
+		t.Fatalf("AddAgentScope: %v", err)
 	}
 
 	cs := db.NewCredentialStore(m.PG(), []byte("intranet-test-master-key"))
@@ -329,4 +333,454 @@ func TestCredentialReusePlanEmptyVsUndecryptable(t *testing.T) {
 		t.Fatalf("list_credentials: err=%v res=%s", err, listRes.Flatten())
 	}
 	assertNoSecretMaterial(t, []byte(listRes.Flatten()), logBuf.String())
+}
+
+func TestCredentialInheritedVisibleToListAndReusePlan(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	t.Cleanup(func() { m.Close() })
+
+	parent, err := m.CreateTaskWithOptions("inherited cred parent", "fixture", db.TaskCreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := m.CreateTaskWithOptions("inherited cred child", "fixture", db.TaskCreateOptions{
+		SourceTaskIDs: []int64{mustTaskID(t, parent.ID)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentID := mustTaskID(t, parent.ID)
+	childID := mustTaskID(t, child.ID)
+	t.Cleanup(func() {
+		_ = m.PG().DeleteTask(childID)
+		_ = m.PG().DeleteTask(parentID)
+	})
+
+	srcID, err := m.Assets().UpsertIP(db.UpsertIPReq{IP: "10.9.1.5", TaskID: parentID})
+	if err != nil {
+		t.Fatalf("UpsertIP src: %v", err)
+	}
+	if _, err := m.Assets().UpsertIP(db.UpsertIPReq{
+		IP: "10.9.1.9", TaskID: parentID,
+		OpenPorts: []db.PortService{{Port: 22, Service: "ssh"}},
+	}); err != nil {
+		t.Fatalf("UpsertIP cand: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = m.PG().Exec(`DELETE FROM assets WHERE ip IN ('10.9.1.5','10.9.1.9')`)
+	})
+	// 子任务只有范围，资产仍记在父任务上。候选必须走范围内查询才能出现。
+	if _, err := m.Assets().AddAgentScope(childID, "cidr", "10.9.1.0/24", "child scope only", "manual"); err != nil {
+		t.Fatal(err)
+	}
+
+	const inheritedSecret = "inherited-plan-secret"
+	const ownSecret = "own-plan-secret"
+	cs := db.NewCredentialStore(m.PG(), []byte("intranet-test-master-key"))
+	inheritedID, err := cs.Create(context.Background(), &db.CredentialRecord{
+		TaskID: parentID, Username: "inherited-admin", CredType: db.CredPassword,
+		Secret: inheritedSecret, Domain: "FIXTURE", Source: "10.9.1.5 fixture source ssh",
+		HostAssetID: srcID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownID, err := cs.Create(context.Background(), &db.CredentialRecord{
+		TaskID: childID, Username: "child-own", CredType: db.CredPassword,
+		Secret: ownSecret, Source: "child fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cs.Delete(context.Background(), inheritedID)
+		_ = cs.Delete(context.Background(), ownID)
+	})
+	if err := cs.Inherit(context.Background(), db.CredentialInheritance{
+		ChildTaskID: childID, SourceTaskID: parentID, CredentialID: inheritedID,
+		ScopeBasis: db.InheritDomain, Score: 120, Reason: "fixture",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Server{credStore: cs, m: m}
+	ctx := agent.WithRunInfo(context.Background(), agent.RunInfo{TaskID: childID})
+	listRes, err := s.listCredentialsTool().Call(ctx, json.RawMessage(`{}`), &actool.ToolContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listOut := toolResultJSON(t, listRes)
+	listRaw, _ := json.Marshal(listOut)
+	if strings.Contains(string(listRaw), inheritedSecret) || strings.Contains(string(listRaw), ownSecret) {
+		t.Fatalf("list_credentials 不得回显明文: %s", listRaw)
+	}
+	creds, _ := listOut["credentials"].([]any)
+	var sawInherited, sawOwn bool
+	for _, item := range creds {
+		row, _ := item.(map[string]any)
+		id, _ := row["id"].(float64)
+		switch int64(id) {
+		case inheritedID:
+			sawInherited = true
+			if row["inherited"] != true {
+				t.Fatalf("继承条目 inherited 应为 true: %#v", row)
+			}
+			src, _ := row["source_task_id"].(float64)
+			if int64(src) != parentID || row["scope_basis"] != db.InheritDomain {
+				t.Fatalf("继承元数据不符: %#v", row)
+			}
+			if _, ok := row["secret"]; ok {
+				t.Fatalf("列表不得含 secret 字段: %#v", row)
+			}
+		case ownID:
+			sawOwn = true
+			if row["inherited"] != false {
+				t.Fatalf("自有条目 inherited 应为 false: %#v", row)
+			}
+		}
+	}
+	if !sawInherited || !sawOwn {
+		t.Fatalf("列表应同时含继承凭据和自有凭据: %s", listRaw)
+	}
+
+	planRes, err := s.credentialReusePlanTool().Call(ctx, json.RawMessage(`{}`), &actool.ToolContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planOut := toolResultJSON(t, planRes)
+	planRaw, _ := json.Marshal(planOut)
+	sugs, _ := planOut["suggestions"].([]any)
+	var sawPlan bool
+	for _, item := range sugs {
+		row, _ := item.(map[string]any)
+		id, _ := row["cred_id"].(float64)
+		if int64(id) != inheritedID {
+			continue
+		}
+		sawPlan = true
+		if row["secret"] != inheritedSecret || row["username"] != "inherited-admin" {
+			t.Fatalf("复用建议应带继承凭据的必要字段: %#v", row)
+		}
+	}
+	if !sawPlan {
+		t.Fatalf("范围内的继承凭据应出现在 credential_reuse_plan: %s", planRaw)
+	}
+	if strings.Contains(db.RedactCredentialPayload("credential_reuse_plan", string(planRaw)), inheritedSecret) {
+		t.Fatalf("活动日志清洗后不得含继承凭据明文: %s", planRaw)
+	}
+}
+
+func TestCredentialRegisterSessionSetsVerified(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	t.Cleanup(func() { m.Close() })
+	parent, err := m.CreateTaskWithOptions("verify parent", "fixture", db.TaskCreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := m.CreateTaskWithOptions("verify child", "fixture", db.TaskCreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := m.CreateTaskWithOptions("verify other", "fixture", db.TaskCreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentID := mustTaskID(t, parent.ID)
+	childID := mustTaskID(t, child.ID)
+	otherID := mustTaskID(t, other.ID)
+	t.Cleanup(func() {
+		_ = m.PG().DeleteTask(childID)
+		_ = m.PG().DeleteTask(parentID)
+		_ = m.PG().DeleteTask(otherID)
+	})
+	if _, err := m.Assets().AddAgentScope(childID, "ip", "127.0.0.1", "loopback foothold", "manual"); err != nil {
+		t.Fatal(err)
+	}
+
+	cs := db.NewCredentialStore(m.PG(), []byte("intranet-test-master-key"))
+	ownID, err := cs.Create(context.Background(), &db.CredentialRecord{
+		TaskID: childID, Username: "own-user", CredType: db.CredPassword,
+		Secret: "own-register-secret", Source: "fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inheritedID, err := cs.Create(context.Background(), &db.CredentialRecord{
+		TaskID: parentID, Username: "inherited-user", CredType: db.CredPassword,
+		Secret: "inherited-register-secret", Source: "fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignID, err := cs.Create(context.Background(), &db.CredentialRecord{
+		TaskID: otherID, Username: "foreign-user", CredType: db.CredPassword,
+		Secret: "foreign-register-secret", Source: "fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unseenID, err := cs.Create(context.Background(), &db.CredentialRecord{
+		TaskID: childID, Username: "unseen-user", CredType: db.CredPassword,
+		Secret: "unseen-register-secret", Source: "fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cs.Delete(context.Background(), ownID)
+		_ = cs.Delete(context.Background(), inheritedID)
+		_ = cs.Delete(context.Background(), foreignID)
+		_ = cs.Delete(context.Background(), unseenID)
+	})
+	if err := cs.Inherit(context.Background(), db.CredentialInheritance{
+		ChildTaskID: childID, SourceTaskID: parentID, CredentialID: inheritedID,
+		ScopeBasis: db.InheritManual, Score: 5, Reason: "fixture",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		cmd := r.Form.Get("cmd")
+		cmd = strings.TrimPrefix(cmd, "echo ")
+		cmd = strings.TrimSuffix(strings.TrimSpace(cmd), "2>&1")
+		cmd = strings.TrimSpace(cmd)
+		cmd = strings.ReplaceAll(cmd, "$((40+2))", "42")
+		_, _ = w.Write([]byte(cmd))
+	}))
+	t.Cleanup(origin.Close)
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(dead.Close)
+
+	ss := db.NewSessionStore(m.PG(), []byte("intranet-test-master-key"))
+	s := &Server{
+		credStore: cs, m: m,
+		sessStore: ss, sessReg: session.NewRegistry(),
+	}
+	ctx := agent.WithRunInfo(context.Background(), agent.RunInfo{TaskID: childID})
+	tool := s.registerSessionTool()
+
+	register := func(url string, credID int64, extra map[string]any) (map[string]any, actool.Result) {
+		t.Helper()
+		body := map[string]any{"url": url, "lang": "phpcmd", "verified": true, "note": "模型自称已经验证"}
+		if credID > 0 {
+			body["credential_id"] = credID
+		}
+		for k, v := range extra {
+			body[k] = v
+		}
+		raw, _ := json.Marshal(body)
+		res, err := tool.Call(ctx, raw, &actool.ToolContext{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.IsError {
+			return nil, res
+		}
+		return toolResultJSON(t, res), res
+	}
+	assertVerified := func(id int64, want bool) {
+		t.Helper()
+		got, err := cs.Get(context.Background(), id)
+		if err != nil || got == nil {
+			t.Fatalf("读取凭据 %d: %v", id, err)
+		}
+		if got.Verified != want {
+			t.Fatalf("凭据 %d verified=%v, 想要 %v", id, got.Verified, want)
+		}
+	}
+
+	out, _ := register(origin.URL+"/own.php", ownID, nil)
+	if out["credential_verified"] != true || out["credential_warning"] != nil {
+		t.Fatalf("本任务凭据应被平台置为已验证: %#v", out)
+	}
+	if _, ok := out["session_id"]; !ok {
+		t.Fatalf("登记应成功: %#v", out)
+	}
+	assertVerified(ownID, true)
+	assertVerified(inheritedID, false)
+
+	out, _ = register(origin.URL+"/inherited.php", inheritedID, nil)
+	if out["credential_verified"] != true {
+		t.Fatalf("已继承凭据应被平台置为已验证: %#v", out)
+	}
+	assertVerified(inheritedID, true)
+
+	out, _ = register(origin.URL+"/foreign.php", foreignID, nil)
+	if _, ok := out["session_id"]; !ok {
+		t.Fatalf("越权 credential_id 不得影响登记成功: %#v", out)
+	}
+	warn, _ := out["credential_warning"].(string)
+	if !strings.Contains(warn, "不属于本任务") || out["credential_verified"] == true {
+		t.Fatalf("越权 id 应给出非致命提示且不置位: %#v", out)
+	}
+	assertVerified(foreignID, false)
+	flat, _ := json.Marshal(out)
+	if strings.Contains(string(flat), "foreign-register-secret") || strings.Contains(string(flat), "own-register-secret") {
+		t.Fatalf("登记结果不得回显凭据明文: %s", flat)
+	}
+
+	if _, res := register(dead.URL+"/miss.php", unseenID, nil); !res.IsError {
+		t.Fatal("探针失败时应登记失败")
+	}
+	assertVerified(unseenID, false)
+	assertVerified(foreignID, false)
+}
+
+func TestCredentialInheritAPIIdempotentRevokeAndNoParent(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	t.Cleanup(func() { m.Close() })
+	parent, err := m.CreateTaskWithOptions("api inherit parent", "fixture", db.TaskCreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentID := mustTaskID(t, parent.ID)
+	bySource, err := m.CreateTaskWithOptions("api inherit by source", "fixture", db.TaskCreateOptions{
+		SourceTaskIDs: []int64{parentID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byParent, err := m.CreateTaskWithOptions("api inherit by parent", "fixture", db.TaskCreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lone, err := m.CreateTaskWithOptions("api inherit lone", "fixture", db.TaskCreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceChild := mustTaskID(t, bySource.ID)
+	parentChild := mustTaskID(t, byParent.ID)
+	loneID := mustTaskID(t, lone.ID)
+	t.Cleanup(func() {
+		_ = m.PG().DeleteTask(sourceChild)
+		_ = m.PG().DeleteTask(parentChild)
+		_ = m.PG().DeleteTask(loneID)
+		_ = m.PG().DeleteTask(parentID)
+	})
+	if err := m.PG().SetParentRef(parentChild, strconv.FormatInt(parentID, 10)); err != nil {
+		t.Fatal(err)
+	}
+
+	host, err := m.Assets().UpsertIP(db.UpsertIPReq{IP: "198.51.100.40", TaskID: parentID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = m.PG().Exec(`DELETE FROM assets WHERE id=$1`, host) })
+	for _, id := range []int64{sourceChild, parentChild} {
+		if _, err := m.Assets().AddAgentScope(id, "ip", "198.51.100.40", "handoff 立足点", "manual"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cs := db.NewCredentialStore(m.PG(), []byte("intranet-test-master-key"))
+	const secret = "inherit-api-secret-value"
+	credID, err := cs.Create(context.Background(), &db.CredentialRecord{
+		TaskID: parentID, Username: "api-admin", CredType: db.CredPassword,
+		Secret: secret, Verified: true, HostAssetID: host, Source: "fixture",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cs.Delete(context.Background(), credID) })
+	s := &Server{credStore: cs, m: m}
+
+	post := func(taskID int64) (code int, inherited int, raw string) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/api/tasks/"+strconv.FormatInt(taskID, 10)+"/credentials/inherit", nil)
+		req.SetPathValue("id", strconv.FormatInt(taskID, 10))
+		w := httptest.NewRecorder()
+		s.intranetSyncInheritedCredentials(w, req)
+		raw = w.Body.String()
+		var body map[string]any
+		_ = json.Unmarshal(w.Body.Bytes(), &body)
+		n, _ := body["inherited"].(float64)
+		return w.Code, int(n), raw
+	}
+	activeCount := func(taskID int64) int {
+		t.Helper()
+		var n int
+		if err := m.PG().QueryRow(`SELECT count(*) FROM credential_inheritances WHERE child_task_id=$1 AND credential_id=$2 AND state='active'`, taskID, credID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	code, n, raw := post(sourceChild)
+	if code != http.StatusOK || n != 1 {
+		t.Fatalf("来源任务重同步应继承 1 条: code=%d body=%s", code, raw)
+	}
+	code, again, raw := post(sourceChild)
+	if code != http.StatusOK || again != n {
+		t.Fatalf("重同步应幂等: code=%d first=%d second=%d body=%s", code, n, again, raw)
+	}
+	if got := activeCount(sourceChild); got != 1 {
+		t.Fatalf("active 继承行应仍是 1, got %d", got)
+	}
+
+	code, n, raw = post(parentChild)
+	if code != http.StatusOK || n != 1 {
+		t.Fatalf("仅 parent_ref 的子任务应继承 1 条: code=%d body=%s", code, raw)
+	}
+
+	items, _, listRaw := doListCredentials(t, s.intranetListCredentials, "/api/credentials?task_id="+strconv.FormatInt(sourceChild, 10))
+	if strings.Contains(string(listRaw), secret) {
+		t.Fatalf("列表不得含明文: %s", listRaw)
+	}
+	var saw bool
+	for _, item := range items {
+		row, _ := item.(map[string]any)
+		id, _ := row["id"].(float64)
+		if int64(id) != credID {
+			continue
+		}
+		saw = true
+		src, _ := row["source_task_id"].(float64)
+		if row["inherited"] != true || int64(src) != parentID || row["scope_basis"] == "" {
+			t.Fatalf("API 列表应带继承字段: %#v", row)
+		}
+	}
+	if !saw {
+		t.Fatalf("撤销前列表应含继承凭据: %s", listRaw)
+	}
+
+	del := httptest.NewRequest(http.MethodDelete, "/api/tasks/"+strconv.FormatInt(sourceChild, 10)+"/credentials/inherit/"+strconv.FormatInt(credID, 10), nil)
+	del.SetPathValue("id", strconv.FormatInt(sourceChild, 10))
+	del.SetPathValue("credID", strconv.FormatInt(credID, 10))
+	dw := httptest.NewRecorder()
+	s.intranetRevokeInheritedCredential(dw, del)
+	if dw.Code != http.StatusOK {
+		t.Fatalf("撤销应成功: code=%d body=%s", dw.Code, dw.Body.String())
+	}
+	items, _, listRaw = doListCredentials(t, s.intranetListCredentials, "/api/credentials?task_id="+strconv.FormatInt(sourceChild, 10))
+	for _, item := range items {
+		row, _ := item.(map[string]any)
+		id, _ := row["id"].(float64)
+		if int64(id) == credID {
+			t.Fatalf("撤销后列表不应再含该凭据: %s", listRaw)
+		}
+	}
+	dw = httptest.NewRecorder()
+	s.intranetRevokeInheritedCredential(dw, del)
+	if dw.Code != http.StatusNotFound {
+		t.Fatalf("再次撤销应 404: code=%d body=%s", dw.Code, dw.Body.String())
+	}
+
+	code, n, raw = post(loneID)
+	if code != http.StatusOK || n != 0 {
+		t.Fatalf("无父任务应返回 0 而不是错误: code=%d body=%s", code, raw)
+	}
+	if strings.Contains(raw, "500") {
+		t.Fatalf("无父任务响应体不应像 500: %s", raw)
+	}
 }

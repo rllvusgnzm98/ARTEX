@@ -275,21 +275,26 @@ func MaskSecret(s string) string {
 }
 
 // PublicCredential 是控制台列表 / list_credentials 用的脱敏视图，不含明文 secret。
+// inherited/source_task_id/scope_basis 来自 ListInherited：自有条目 inherited=false，
+// 其余为零值。无法解密的占位不走这里。
 func PublicCredential(c *CredentialRecord) map[string]any {
 	if c == nil {
 		return map[string]any{}
 	}
 	return map[string]any{
-		"id":            c.ID,
-		"task_id":       c.TaskID,
-		"username":      c.Username,
-		"cred_type":     c.CredType,
-		"secret_masked": MaskSecret(c.Secret),
-		"domain":        c.Domain,
-		"source":        c.Source,
-		"verified":      c.Verified,
-		"host_asset_id": c.HostAssetID,
-		"created_at":    c.CreatedAt,
+		"id":             c.ID,
+		"task_id":        c.TaskID,
+		"username":       c.Username,
+		"cred_type":      c.CredType,
+		"secret_masked":  MaskSecret(c.Secret),
+		"domain":         c.Domain,
+		"source":         c.Source,
+		"verified":       c.Verified,
+		"host_asset_id":  c.HostAssetID,
+		"created_at":     c.CreatedAt,
+		"inherited":      c.Inherited,
+		"source_task_id": c.SourceTaskID,
+		"scope_basis":    c.ScopeBasis,
 	}
 }
 

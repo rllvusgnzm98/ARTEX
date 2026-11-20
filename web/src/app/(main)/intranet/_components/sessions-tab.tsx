@@ -78,7 +78,11 @@ export function SessionsTab({
     api
       .handoffSession(target.id)
       .then((r) => {
-        setNotice(`已创建内网子任务 #${r.task_id}（初始官方范围仅立足点 /32）`);
+        const inherited =
+          typeof r.credentials_inherited === "number" && Number.isFinite(r.credentials_inherited)
+            ? r.credentials_inherited
+            : 0;
+        setNotice(`已创建内网子任务 #${r.task_id}（初始官方范围仅立足点 /32，继承凭据 ${inherited} 条）`);
         setHandoffTarget(null);
         onReload();
       })

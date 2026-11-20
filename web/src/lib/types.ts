@@ -1719,6 +1719,12 @@ export interface Credential {
   verified?: boolean;
   host_asset_id?: number;
   created_at?: string;
+  /** 仍有效的继承凭据。自有条目为 false 或缺省。 */
+  inherited?: boolean;
+  /** 继承来源任务。自有条目为 0 或缺省。 */
+  source_task_id?: number;
+  /** 继承相关性依据，如 foothold_host / same_segment / domain。 */
+  scope_basis?: string;
   /** 无法解密的占位行：只含 id 与此状态，无密文。 */
   status?: "undecryptable";
 }
