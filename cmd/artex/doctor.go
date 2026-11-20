@@ -7,9 +7,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"time"
 
 	"github.com/Autumn-27/artex/config"
 	"github.com/Autumn-27/artex/db"
@@ -65,7 +68,7 @@ func runDoctor(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	_ = addr // 保留与主程序同义的 -addr，供运维对照；:8787 不是告警条件。
+	// -addr 与主程序同义。:8787（全网卡）本身不是失败条件，只在伪装门控项里如实报告。
 
 	fmt.Printf("ARTEX doctor —— 部署预检（只读，不启动服务、不写 DB）\n\n")
 	var items []doctorItem
@@ -202,9 +205,18 @@ func runDoctor(args []string) int {
 		}
 	}
 
-	// 6. 伪装门控本波未启用。必须显式 ARTEX_GATE=1 才会开启，默认关闭。
-	// :8787（全网卡）不是告警条件；不要把「非 loopback 将默认开门控」写进来。
-	check(docOK, "伪装门控", "本波未启用；必须显式设置 ARTEX_GATE=1 才会开启，默认关闭")
+	// 6. 伪装门控：按与运行时相同的优先级解析 mode/来源，并读 data/gate 的权限和
+	// 统计快照。快照不存在就说明服务未运行，不把缺文件写成「命中 0」。
+	settingsValue, settingsSet, settingsNote := "", false, ""
+	if dsnErr != nil || !dbOK {
+		settingsNote = "settings 未读（数据库不可达）"
+	} else if v, ok, err := db.LookupSetting(dsn, config.GateModeSettingKey); err != nil {
+		settingsNote = "settings 读取失败: " + err.Error()
+	} else if ok && strings.TrimSpace(v) != "" {
+		settingsValue, settingsSet = v, true
+	}
+	gateStatus, gateNote := doctorCamouflage(*dataDir, *addr, settingsValue, settingsSet, settingsNote)
+	check(gateStatus, "伪装门控", gateNote)
 
 	// 7. ARTEX_CALLBACK_ADDR：隧道回连平台用
 	// systemd 部署常用 EnvironmentFile 注入（packaging/artex.service 约定
@@ -242,6 +254,87 @@ func runDoctor(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// doctorCamouflage 汇总当前解析结果、监听是否暴露全网卡、data/gate 权限和
+// 已落盘的探测计数。计数只来自统计文件；读不到就说明未运行，不编造零值。
+func doctorCamouflage(dataDir, addr, settingsValue string, settingsSet bool, settingsNote string) (doctorStatus, string) {
+	res := config.ResolveGate(settingsValue, settingsSet)
+	var b strings.Builder
+	fmt.Fprintf(&b, "mode=%s 来源=%s", res.Mode, res.Source)
+	if settingsNote != "" {
+		fmt.Fprintf(&b, "；%s", settingsNote)
+	}
+	fmt.Fprintf(&b, "；%s", doctorListenNote(addr))
+	dirNote, dirStatus := doctorGateDir(dataDir)
+	fmt.Fprintf(&b, "；%s；%s", dirNote, doctorGateStatsNote(dataDir, res))
+	b.WriteString("；off/detect 不改响应；enforce 需显式配置。回环始终放行。旁路：POST /api/gate/bypass（需登录，不写日志）")
+	return dirStatus, b.String()
+}
+
+// doctorListenNote 描述 -addr 是否绑在全网卡上。只报告事实，不把 :8787 当成失败。
+func doctorListenNote(addr string) string {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		if strings.HasPrefix(strings.TrimSpace(addr), ":") {
+			return "监听 " + addr + "，暴露全网卡"
+		}
+		return "监听地址无法解析: " + addr
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" {
+		return "监听 " + addr + "，暴露全网卡"
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsUnspecified() {
+			return "监听 " + addr + "，暴露全网卡"
+		}
+		if ip.IsLoopback() {
+			return "监听 " + addr + "，仅本机回环"
+		}
+	}
+	return "监听 " + addr + "，绑定 " + host
+}
+
+// doctorGateDir 检查 data/gate。目录不存在表示当前没在用落盘统计，不是故障。
+func doctorGateDir(dataDir string) (string, doctorStatus) {
+	dir := filepath.Join(dataDir, "gate")
+	st, err := os.Stat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "data/gate 不存在（未使用）", docOK
+		}
+		return "data/gate 无法检查: " + err.Error(), docWarn
+	}
+	if !st.IsDir() {
+		return "data/gate 不是目录", docWarn
+	}
+	perm := st.Mode().Perm()
+	note := fmt.Sprintf("data/gate 权限 %04o", perm)
+	// Windows 的权限位不能表示「其他用户可写」，避免把每个目录都打成 WARN。
+	if runtime.GOOS != "windows" && perm&0o022 != 0 {
+		return note + "（组或其他用户可写）", docWarn
+	}
+	return note, docOK
+}
+
+// doctorGateStatsNote 读取 data/gate/stats.json。文件不存在时明确说服务未运行。
+func doctorGateStatsNote(dataDir string, res config.GateResolution) string {
+	snap, err := config.ReadGateStats(dataDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "探测计数不可读：服务未运行"
+		}
+		return "探测计数不可读：" + err.Error()
+	}
+	when := "更新时间缺失"
+	if !snap.UpdatedAt.IsZero() {
+		when = "更新于 " + snap.UpdatedAt.UTC().Format(time.RFC3339)
+	}
+	note := fmt.Sprintf("探测计数 命中 %d · 放行 %d · 旁路 %d · 诱饵 %d（%s）", snap.Hits, snap.Allows, snap.Bypasses, snap.Decoys, when)
+	if snap.Mode != "" && (snap.Mode != res.Mode || (snap.Source != "" && snap.Source != res.Source)) {
+		note += fmt.Sprintf("；快照 mode=%s 来源=%s", snap.Mode, snap.Source)
+	}
+	return note
 }
 
 // doctorToolNote 渲染单个工具的自检片段（doctor 报告用）。

@@ -47,6 +47,7 @@ type Server struct {
 
 	skillDir string // root directory for skill subdirectories
 	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
+	gate     *Gate  // 伪装门控；nil 表示未初始化，Handler 不改写 UI 行为
 
 	sessReg   *session.Registry   // 立足点会话注册表；nil = DB 未就绪
 	sessStore *db.SessionStore    // 会话落库访问层（secret AES-GCM，密钥由 jwtKey 派生）
@@ -163,6 +164,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
 	s.initSideQuestions()
 	s.initStage(dataDir) // 受管文件投递暂存；失败降级为关闭，不影响启动
+	s.initGate(dataDir)  // 伪装门控；解析失败保持 detect，不阻断启动
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
 	s.applyRetryPolicy()
@@ -974,14 +976,26 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/intercept/judge", s.interceptSetJudgeConfig)
 	mux.HandleFunc("GET /api/intercept/judge/usage", s.interceptJudgeUsage) // 兜底审批累计 token 用量
 
+	// 伪装门控的观测/签发走现有 /api 鉴权。gate 为 nil（零值 Server）时不注册，
+	// 避免给未初始化的 Handler 增加新路由。
+	if s.gate != nil {
+		mux.HandleFunc("GET /api/gate/stats", s.gateStats)
+		mux.HandleFunc("POST /api/gate/bypass", s.gateBypass)
+	}
+
 	// /api/* goes through CORS + JWT; everything else is served by the embedded
 	// frontend (public — auth is enforced client-side and on the API). With the
 	// no-embed build the webui handler just 404s (run `next dev` separately).
+	// 门控只包前端外壳。/api/* 与 GET /s/{token}/{name} 挂在更具体的路由上，不经过 WrapUI。
 	api := cors(s.requireAuth(mux))
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
 	root.HandleFunc("GET /s/{token}/{name}", s.stageDownload) // token 路径，无 JWT
-	root.Handle("/", s.webuiHandler())
+	ui := s.webuiHandler()
+	if s.gate != nil {
+		ui = s.gate.WrapUI(ui)
+	}
+	root.Handle("/", ui)
 	return root
 }
 

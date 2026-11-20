@@ -22,5 +22,8 @@
   "skill_dir": "/opt/artex/skills",
 
   "_comment_own_infra_hosts": "平台自身 host（可选，字符串数组）。出口审查在命令只命中 callback_addr、且目标 host 全部属于平台自身时放行。自动包含 callback 主机、监听地址和 127.0.0.1、::1、localhost；这里补充额外地址（可写 host:port 或带方括号的 IPv6，按 host 归一）。留空数组或删除本字段即可。",
-  "own_infra_hosts": []
+  "own_infra_hosts": [],
+
+  "_comment_gate_mode": "伪装门控（可选）。取值 off（关闭，响应与未接入相同）、detect（只计数和限频日志，响应逐字节不变）、enforce（无有效旁路时前端外壳返回诱饵 404；/api 与 /s 不受影响；本机回环始终放行）。优先级从高到低：环境变量 ARTEX_GATE_MODE > 设置表 settings.gate_mode > 本字段 gate_mode > 旧环境变量 ARTEX_GATE（1=enforce，0=off）> 默认 detect。未知值按 detect，并记下命中的那一层来源。enforce 必须显式配置；删除本字段即不从配置文件提供取值。off 或 detect 可随时退回。",
+  "gate_mode": "detect"
 }
