@@ -43,3 +43,42 @@ func TestExtractHosts(t *testing.T) {
 		}
 	}
 }
+
+func TestExtractHostsShellHintCLIs(t *testing.T) {
+	cases := []struct {
+		name string
+		cmd  string
+		want []string
+	}{
+		{"ffuf -u URL", `ffuf -u https://api.example.com/FUZZ -w /tmp/words.txt`, []string{"api.example.com"}},
+		{"feroxbuster --url", `feroxbuster --url https://files.example.com/`, []string{"files.example.com"}},
+		{"gobuster dir -u", `gobuster dir -u https://www.example.com/ -w /tmp/words.txt`, []string{"www.example.com"}},
+		{"gobuster dns -d", `gobuster dns -d internal.example.com`, []string{"internal.example.com"}},
+		{"sqlmap -u", `sqlmap -u https://app.example.com/item`, []string{"app.example.com"}},
+		{"nuclei -u URL", `nuclei -u https://scan.example.com`, []string{"scan.example.com"}},
+		{"nuclei -u 裸主机", `nuclei -u scan.example.com`, []string{"scan.example.com"}},
+		{"whatweb 位置参数", `whatweb shop.example.com`, []string{"shop.example.com"}},
+		{"commix -u", `commix -u https://app.example.com/page`, []string{"app.example.com"}},
+		{"katana --url=", `katana --url=https://site.example.com`, []string{"site.example.com"}},
+		{"nxc smb IP", `nxc smb 10.0.0.7`, []string{"10.0.0.7"}},
+		{"nxc smb 主机名", `nxc smb dc.example.com`, []string{"dc.example.com"}},
+		{"nxc CIDR 仍不提取", `nxc smb 192.168.1.0/24`, nil},
+		{"impacket-psexec user@ip", `impacket-psexec administrator@10.0.0.8`, []string{"10.0.0.8"}},
+		{"impacket-wmiexec user@host", `impacket-wmiexec user@win.example.com`, []string{"win.example.com"}},
+		{"impacket-smbclient", `impacket-smbclient user@10.0.0.9`, []string{"10.0.0.9"}},
+		{"impacket-secretsdump", `impacket-secretsdump user@dc.example.com`, []string{"dc.example.com"}},
+		{"impacket-GetUserSPNs -dc-ip", `impacket-GetUserSPNs example/user -dc-ip 10.0.0.10`, []string{"10.0.0.10"}},
+		{"工具路径 + ffuf", `/usr/bin/ffuf -u https://api.example.com/`, []string{"api.example.com"}},
+		{"sudo nxc", `sudo nxc smb 10.3.3.3`, []string{"10.3.3.3"}},
+		{"curl -u 用户名不当目标", `curl -u admin:secret https://real.example.com/`, []string{"real.example.com"}},
+	}
+	for _, c := range cases {
+		got := ExtractHosts(c.cmd)
+		if len(got) == 0 {
+			got = nil
+		}
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: ExtractHosts(%q) = %v, want %v", c.name, c.cmd, got, c.want)
+		}
+	}
+}
