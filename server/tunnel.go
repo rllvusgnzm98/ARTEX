@@ -323,17 +323,17 @@ func (s *Server) tunnelDeployTool() actool.CoreTool {
 				return actool.Errorf("kind 必填：socks | portfwd"), nil
 			}
 			if err != nil {
-				return actool.Errorf("计划生成失败：" + err.Error()), nil
+				return actool.Errorf(withRoEWarn(roeWarn, "计划生成失败："+err.Error())), nil
 			}
 			if s.tunnels.mgr == nil {
-				return actool.Errorf("隧道运行时未就绪"), nil
+				return actool.Errorf(withRoEWarn(roeWarn, "隧道运行时未就绪")), nil
 			}
 			rec, derr := s.tunnels.mgr.Deploy(ctx, plan)
 			if rec == nil && derr != nil {
-				return actool.Errorf("部署失败：" + derr.Error()), nil
+				return actool.Errorf(withRoEWarn(roeWarn, "部署失败："+derr.Error())), nil
 			}
 			if rec == nil {
-				return actool.Errorf("部署失败：无台账行"), nil
+				return actool.Errorf(withRoEWarn(roeWarn, "部署失败：无台账行")), nil
 			}
 			out := map[string]any{
 				"tunnel_id": rec.ID,

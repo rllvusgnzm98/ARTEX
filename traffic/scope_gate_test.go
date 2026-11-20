@@ -3,12 +3,17 @@ package traffic
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -149,51 +154,71 @@ func TestScopeGateBlocksForwardsAndNilMatchesBaseline(t *testing.T) {
 	}
 }
 
-func TestScopeGatePassthroughConnectDoesNotDial(t *testing.T) {
+func TestScopeGatePassthroughDeniedReturnsReasonAndAllowStillDials(t *testing.T) {
 	tr, proxyURL := startScopeProxy(t)
 	proxyAddr := proxyURL[len("http://"):]
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// localhost 才能带 DNS SAN。上游同时听 127.0.0.1 和 ::1，放行后的拨号无论走哪边都能数到。
+	ln4, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = ln.Close() })
+	port := ln4.Addr().(*net.TCPAddr).Port
 	var accepts atomic.Int32
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			accepts.Add(1)
-			c.Close()
-		}
-	}()
-	target := ln.Addr().String()
-	tr.pass.Store("127.0.0.1", struct{}{})
+	serveAccepts(t, ln4, &accepts)
+	if ln6, err6 := net.Listen("tcp", net.JoinHostPort("::1", strconv.Itoa(port))); err6 == nil {
+		serveAccepts(t, ln6, &accepts)
+	}
+	target := net.JoinHostPort("localhost", strconv.Itoa(port))
+	tr.pass.Store("localhost", struct{}{})
 
+	const denied = "RoE 授权范围检查：越界主机 localhost"
+	var mu sync.Mutex
 	var seen []string
 	tr.SetHostGate(func(host string) error {
+		mu.Lock()
 		seen = append(seen, host)
-		return fmt.Errorf("越界 %s", host)
+		mu.Unlock()
+		return fmt.Errorf("%s", denied)
 	})
-	status, err := rawCONNECT(proxyAddr, target)
-	if err != nil {
-		t.Fatalf("blocked CONNECT: %v", err)
+	blocked := getVia(t, trustedProxyClient(t, tr, proxyURL, "localhost"), "https://"+target+"/x")
+	if blocked.status != http.StatusForbidden {
+		t.Fatalf("透传越界 status=%d body=%q", blocked.status, blocked.body)
 	}
-	if status != http.StatusBadGateway {
-		t.Fatalf("透传越界 status=%d, want 502", status)
+	if !bytes.Contains(blocked.body, []byte("RoE")) || !bytes.Contains(blocked.body, []byte(denied)) {
+		t.Fatalf("透传越界正文缺少闸门原因: %q", blocked.body)
 	}
 	time.Sleep(200 * time.Millisecond)
 	if accepts.Load() != 0 {
 		t.Fatalf("越界仍拨了上游 accepts=%d", accepts.Load())
 	}
-	if len(seen) == 0 {
+	mu.Lock()
+	gotSeen := append([]string(nil), seen...)
+	mu.Unlock()
+	if len(gotSeen) == 0 {
 		t.Fatal("透传越界没有调用 gate")
 	}
-	for _, host := range seen {
-		if host != "127.0.0.1" {
-			t.Fatalf("gate host = %#v", seen)
+	for _, host := range gotSeen {
+		if host != "localhost" {
+			t.Fatalf("gate host = %#v", gotSeen)
 		}
+	}
+
+	// 放行必须回到原来的 pass 表行为：仍然透传，并且会拨上游。
+	tr.SetHostGate(func(string) error { return nil })
+	status, err := rawCONNECT(proxyAddr, target)
+	if err != nil {
+		t.Fatalf("放行 CONNECT: %v", err)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("放行 CONNECT status=%d, want 200", status)
+	}
+	deadline := time.Now().Add(time.Second)
+	for accepts.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	allowedAccepts := accepts.Load()
+	if allowedAccepts == 0 {
+		t.Fatal("gate 放行后透传没有拨到上游")
 	}
 
 	tr.SetHostGate(nil)
@@ -204,12 +229,56 @@ func TestScopeGatePassthroughConnectDoesNotDial(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("nil gate CONNECT status=%d, want 200", status)
 	}
-	deadline := time.Now().Add(time.Second)
-	for accepts.Load() == 0 && time.Now().Before(deadline) {
+	deadline = time.Now().Add(time.Second)
+	for accepts.Load() <= allowedAccepts && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	if accepts.Load() == 0 {
+	if accepts.Load() <= allowedAccepts {
 		t.Fatal("nil gate 透传没有拨到上游")
+	}
+}
+
+func serveAccepts(t *testing.T, ln net.Listener, accepts *atomic.Int32) {
+	t.Helper()
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepts.Add(1)
+			c.Close()
+		}
+	}()
+}
+
+func trustedProxyClient(t *testing.T, tr *Traffic, proxyURL, serverName string) *http.Client {
+	t.Helper()
+	pemBytes, err := os.ReadFile(tr.CACertPath())
+	if err != nil {
+		t.Fatalf("read CA %s: %v", tr.CACertPath(), err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		t.Fatalf("CA %s 不是 PEM", tr.CACertPath())
+	}
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(u),
+			TLSClientConfig: &tls.Config{
+				RootCAs:    pool,
+				ServerName: serverName,
+				NextProtos: []string{"http/1.1"},
+			},
+			DisableKeepAlives: true,
+			ForceAttemptHTTP2: false,
+		},
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/Autumn-27/artex/agent"
@@ -129,7 +130,38 @@ func (s *Server) roeCheckHost(ctx context.Context, host, kind string) (string, e
 	if mode == "strict" {
 		return "", fmt.Errorf("%s", msg)
 	}
-	return "⚠ " + msg, nil
+	warn := "⚠ " + msg
+	// 后续探针/部署可能失败，到那时调用方拿不到这个返回值。先留痕。
+	s.recordRoEWarn(ri.TaskID, host, warn)
+	return warn, nil
+}
+
+// recordRoEWarn 沿用 recordProxyRoEWarn：先打结构化日志，任务句柄还在时再写
+// activity。没有句柄（或 Store 为空）时日志仍然留下，不改调用方拿到的 ⚠ 文案。
+func (s *Server) recordRoEWarn(taskID int64, host, msg string) {
+	log.Printf("[roe] task %d host %s: %s", taskID, host, msg)
+	if s == nil || s.m == nil {
+		return
+	}
+	t, ok := s.m.Task(strconv.FormatInt(taskID, 10))
+	if !ok || t == nil || t.Store == nil {
+		return
+	}
+	if _, err := t.Store.AppendActivity(db.Activity{
+		Worker: "system", Kind: "text", Tool: "roe",
+		Summary: msg, Detail: msg,
+	}); err != nil {
+		log.Printf("[roe] activity 写入失败 task %d: %v", taskID, err)
+	}
+}
+
+// withRoEWarn 把 warn 越界文案留在后续失败的结果里。warn 为空时原样返回，
+// strict/off 以及范围内放行的错误文案不变。
+func withRoEWarn(warn, msg string) string {
+	if warn == "" {
+		return msg
+	}
+	return warn + "\n" + msg
 }
 
 func hostFromURL(raw string) string {

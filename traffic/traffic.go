@@ -225,6 +225,8 @@ func Open(dir, addr string) (*Traffic, error) {
 	// every captured request — intercepted AND transparently tunneled — is
 	// forwarded through it instead, so no host leaks the real source IP.
 	p.SetUpstreamProxy(func(req *http.Request) (*url.URL, error) {
+		// A passthrough dial still stops here. Denied hosts are forced onto the
+		// intercept path below so the client is not left with this empty 502.
 		if err := t.gateRequest(req); err != nil {
 			return nil, err
 		}
@@ -233,7 +235,16 @@ func Open(dir, addr string) (*Traffic, error) {
 	// Fail-open: MITM every host by default, EXCEPT ones a prior request proved we
 	// can't intercept without breaking (see maybePassthrough). Those are tunneled
 	// transparently so the request still reaches the target instead of being killed.
+	// A host-gate error is the exception. handleConnect runs Requestheaders before
+	// shouldIntercept, then ignores f.Response on the passthrough branch and turns
+	// a dial error into WriteHeader(502) with an empty body. Forcing intercept
+	// (and, in Requestheaders, skipping the dial-first upstream cert lookup) makes
+	// CONNECT return 200 and lets the inner Requestheaders answer 403 with the
+	// reason. A nil error (allow, or no gate) keeps the pass-table decision.
 	p.SetShouldInterceptRule(func(req *http.Request) bool {
+		if err := t.gateRequest(req); err != nil {
+			return true
+		}
 		_, tunnel := t.pass.Load(hostOnly(req.Host))
 		return !tunnel
 	})
@@ -458,6 +469,13 @@ func (s *sink) Requestheaders(f *mproxy.Flow) {
 	err := s.t.gateHost(f.Request.URL.Hostname())
 	if err == nil {
 		return
+	}
+	// Default MITM looks up the upstream certificate before answering CONNECT.
+	// A gate error there is only WriteHeader(502) with an empty body. Skipping
+	// that lookup keeps the rejection on the lazy path: CONNECT 200, then this
+	// same 403 (with the reason) on the inner request. Allowed hosts are unchanged.
+	if f.Request.Method == http.MethodConnect && f.ConnContext != nil && f.ConnContext.ClientConn != nil {
+		f.ConnContext.ClientConn.UpstreamCert = false
 	}
 	f.Response = &mproxy.Response{
 		StatusCode: http.StatusForbidden,

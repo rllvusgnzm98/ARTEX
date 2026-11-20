@@ -206,14 +206,14 @@ func (s *Server) registerSessionTool() actool.CoreTool {
 					a.Secret = strings.TrimSpace(a.Password)
 				}
 				if a.Secret == "" {
-					return actool.Errorf("加密通道（" + a.Lang + "）登记需要既有密钥：把 secret（或 password）参数填为已有密钥"), nil
+					return actool.Errorf(withRoEWarn(warn, "加密通道（"+a.Lang+"）登记需要既有密钥：把 secret（或 password）参数填为已有密钥")), nil
 				}
 				sh, info, err = session.ProbeEnc(ctx, a.URL, a.Lang, a.Secret)
 			} else {
 				sh, info, err = session.Probe(ctx, a.URL, a.Password, a.Lang)
 			}
 			if err != nil {
-				return actool.Errorf("探测失败：" + err.Error()), nil
+				return actool.Errorf(withRoEWarn(warn, "探测失败："+err.Error())), nil
 			}
 			secret, _ := json.Marshal(sh.Secret())
 			ri := agent.RunInfoFrom(ctx)
@@ -223,7 +223,7 @@ func (s *Server) registerSessionTool() actool.CoreTool {
 			}
 			id, err := s.sessStore.Create(ctx, rec)
 			if err != nil {
-				return actool.Errorf("会话落库失败：" + err.Error()), nil
+				return actool.Errorf(withRoEWarn(warn, "会话落库失败："+err.Error())), nil
 			}
 			sh.SetID(id)
 			s.sessReg.Add(sh)
