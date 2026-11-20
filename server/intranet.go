@@ -25,6 +25,22 @@ import (
 
 // auditIntranet 打人工操作审计日志:操作者(JWT subject)/来源地址/动作明细。
 // 人工 exec/write/teardown/delete 必走这里;失败也记(结果含在明细里)。
+// operatorName 从当前请求的 JWT 取 subject。有钥匙环时按 kid 选键，轮换后的令牌仍能记操作者。
+func (s *Server) operatorName(r *http.Request) string {
+	if s != nil && s.useKeyRing() {
+		claims, ok := s.jwtRing.verify(extractToken(r))
+		if !ok || claims == nil || claims.Subject == "" {
+			return "unknown"
+		}
+		return claims.Subject
+	}
+	var key []byte
+	if s != nil {
+		key = s.jwtKey
+	}
+	return intranetOperator(r, key)
+}
+
 func intranetOperator(r *http.Request, key []byte) string {
 	tok := extractToken(r)
 	if tok == "" || len(key) == 0 {
@@ -44,7 +60,7 @@ func intranetOperator(r *http.Request, key []byte) string {
 }
 
 func (s *Server) auditIntranet(r *http.Request, format string, args ...any) {
-	op := intranetOperator(r, s.jwtKey)
+	op := s.operatorName(r)
 	log.Printf("[intranet] op=%s remote=%s %s", op, r.RemoteAddr, fmt.Sprintf(format, args...))
 }
 

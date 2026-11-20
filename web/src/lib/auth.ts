@@ -44,3 +44,34 @@ export const auth = {
     }
   },
 };
+
+let refreshFlight: Promise<boolean> | null = null;
+
+async function refreshOnce(): Promise<boolean> {
+  if (typeof window === "undefined") return false;
+  const current = localStorage.getItem(TOKEN_KEY);
+  if (!current || current === "mock-demo") return false;
+  try {
+    const r = await fetch("/api/auth/refresh", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${current}` },
+    });
+    if (!r.ok) return false;
+    const data = (await r.json()) as { token?: string };
+    if (!data.token) return false;
+    auth.setToken(data.token);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// refresh 单飞：并发的 401 和 SSE 重连共用同一次续期。
+export function refresh(): Promise<boolean> {
+  if (!refreshFlight) {
+    refreshFlight = refreshOnce().finally(() => {
+      refreshFlight = null;
+    });
+  }
+  return refreshFlight;
+}

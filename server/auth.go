@@ -2,7 +2,10 @@ package server
 
 import (
 	"crypto/rand"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"net/http"
@@ -12,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Autumn-27/artex/config"
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -83,17 +87,34 @@ func loadOrCreateJWTKey(keyDir, dataDir string) ([]byte, error) {
 	return buf, nil
 }
 
-// signJWT issues a 7-day HS256 token for user ARTEX.
+// currentJWTTTL 是访问令牌寿命。配置缺失或非法时用历史常量 7 天。
+func currentJWTTTL() time.Duration {
+	if d := config.JWTTTL(); d > 0 {
+		return d
+	}
+	return jwtTTL
+}
+
+// signJWT issues an HS256 token for user ARTEX. 寿命来自 ARTEX_JWT_TTL（默认 7 天）。
+// 空密钥直接返回错误，不触碰签名库。旧调用点和测试继续用这个包装，不写 kid。
 func signJWT(key []byte) (string, error) {
+	if len(key) == 0 {
+		return "", fmt.Errorf("empty jwt key")
+	}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
 		Subject:   "ARTEX",
-		ExpiresAt: jwt.NewNumericDate(time.Now().Add(jwtTTL)),
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(currentJWTTTL())),
 		IssuedAt:  jwt.NewNumericDate(time.Now()),
 	}).SignedString(key)
 }
 
-// verifyJWT returns true when tokenStr is a valid, non-expired HS256 token.
+// verifyJWT returns true when tokenStr is a valid, non-expired HMAC token signed
+// with key. 空密钥或空令牌返回 false。这是给旧调用点和 &Server{jwtKey:...} 测试的
+// 包装；带 kid 的钥匙环验签走 jwtKeyRing.verify。
 func verifyJWT(tokenStr string, key []byte) bool {
+	if tokenStr == "" || len(key) == 0 {
+		return false
+	}
 	t, err := jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method")
@@ -101,6 +122,53 @@ func verifyJWT(tokenStr string, key []byte) bool {
 		return key, nil
 	})
 	return err == nil && t.Valid
+}
+
+// useKeyRing 报告是否走钥匙环。jwtKey 为空（测试零值或未装载）时退回 signJWT/verifyJWT。
+func (s *Server) useKeyRing() bool {
+	return s != nil && s.jwtRing != nil && len(s.jwtKey) > 0
+}
+
+// issueToken 签发访问令牌。有钥匙环时 header 带 kid；否则退回 signJWT。
+func (s *Server) issueToken() (string, time.Time, error) {
+	if s.useKeyRing() {
+		return s.jwtRing.sign()
+	}
+	var key []byte
+	if s != nil {
+		key = s.jwtKey
+	}
+	tok, err := signJWT(key)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return tok, time.Now().Add(currentJWTTTL()), nil
+}
+
+// authenticate 验签。有钥匙环时按 kid 选键；jwtKey 为空或未装载钥匙环时退回 verifyHS256(jwtKey)。
+func (s *Server) authenticate(tokenStr string) (*jwt.RegisteredClaims, bool) {
+	if s.useKeyRing() {
+		return s.jwtRing.verify(tokenStr)
+	}
+	var key []byte
+	if s != nil {
+		key = s.jwtKey
+	}
+	return verifyHS256(tokenStr, key)
+}
+
+// noteRefresh 在剩余寿命不足 TTL/3 时让客户端无感续期。
+func noteRefresh(w http.ResponseWriter, claims *jwt.RegisteredClaims) {
+	if w == nil || claims == nil || claims.ExpiresAt == nil {
+		return
+	}
+	ttl := currentJWTTTL()
+	if ttl <= 0 {
+		return
+	}
+	if time.Until(claims.ExpiresAt.Time) < ttl/3 {
+		w.Header().Set(jwtRefreshHeader, "1")
+	}
 }
 
 // extractToken reads the JWT from Authorization: Bearer header,
@@ -129,10 +197,12 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 			writeErr(w, 401, "未授权")
 			return
 		}
-		if !verifyJWT(tok, s.jwtKey) {
+		claims, ok := s.authenticate(tok)
+		if !ok {
 			writeErr(w, 401, "token 无效或已过期")
 			return
 		}
+		noteRefresh(w, claims)
 		h.ServeHTTP(w, r)
 	})
 }
@@ -197,7 +267,7 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "密码已设置")
 		return
 	}
-	tok, err := signJWT(s.jwtKey)
+	tok, _, err := s.issueToken()
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")
 		return
@@ -213,7 +283,7 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	if !verifyJWT(extractToken(r), s.jwtKey) {
+	if _, ok := s.authenticate(extractToken(r)); !ok {
 		writeErr(w, 401, "未授权")
 		return
 	}
@@ -289,10 +359,57 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 401, "用户名或密码错误")
 		return
 	}
-	tok, err := signJWT(s.jwtKey)
+	tok, _, err := s.issueToken()
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"token": tok})
+}
+
+// POST /api/auth/refresh — 自校验当前令牌，用 active 键重签。retiring 键上的客户端
+// 由此升到当前键。/api/auth/* 被 requireAuth 放行，所以令牌必须在这里验。
+func (s *Server) authRefresh(w http.ResponseWriter, r *http.Request) {
+	claims, ok := s.authenticate(extractToken(r))
+	if !ok {
+		writeErr(w, 401, "token 无效或已过期")
+		return
+	}
+	tok, exp, err := s.issueToken()
+	if err != nil {
+		writeErr(w, 500, "token 生成失败")
+		return
+	}
+	noteRefresh(w, claims)
+	writeJSON(w, 200, map[string]any{"token": tok, "expires_at": exp.Unix()})
+}
+
+// POST /api/auth/rotate-key — 手动轮换签名密钥。可选 {"revoke_previous":true}
+// 立即作废上一把。同样在 /api/auth/* 下放行，因此这里自行验签。不触及 jwt.key。
+func (s *Server) authRotateKey(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.authenticate(extractToken(r)); !ok {
+		writeErr(w, 401, "未授权")
+		return
+	}
+	var req struct {
+		RevokePrevious bool `json:"revoke_previous"`
+	}
+	if r.Body != nil {
+		err := json.NewDecoder(r.Body).Decode(&req)
+		if err != nil && !errors.Is(err, io.EOF) {
+			writeErr(w, 400, "请求格式错误")
+			return
+		}
+	}
+	if !s.useKeyRing() || s.jwtRing.degraded {
+		writeErr(w, 503, "签名密钥环不可用")
+		return
+	}
+	if err := s.jwtRing.rotate(req.RevokePrevious); err != nil {
+		log.Printf("[auth] JWT 手动轮换失败: %v", err)
+		writeErr(w, 500, "轮换失败")
+		return
+	}
+	s.registerEgressFingerprints()
+	writeJSON(w, 200, map[string]any{"ok": true, "active": s.jwtRing.activeKID()})
 }

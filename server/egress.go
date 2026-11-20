@@ -39,11 +39,27 @@ func (s *Server) registerEgressFingerprints() {
 			eg.AddFingerprint("llm_api_key", p.APIKey)
 		}
 	}
-	// jwt.key:32 字节签名密钥,出现在命令文本里通常是原文/hex/base64 之一。
-	if len(s.jwtKey) > 0 {
-		eg.AddFingerprint("jwt_key", string(s.jwtKey))
-		eg.AddFingerprint("jwt_key", hex.EncodeToString(s.jwtKey))
-		eg.AddFingerprint("jwt_key", base64.StdEncoding.EncodeToString(s.jwtKey))
+	// 存活签名密钥：jwt.key（无 kid 令牌与 AES 主密钥）以及钥匙环里 active/retiring 的键。
+	// 先整类摘掉再登记，轮换或 revoke 后已失效的密钥不再留下指纹。
+	eg.RemoveKind("jwt_key")
+	seenSecret := map[string]struct{}{}
+	addJWT := func(secret []byte) {
+		if len(secret) == 0 {
+			return
+		}
+		if _, ok := seenSecret[string(secret)]; ok {
+			return
+		}
+		seenSecret[string(secret)] = struct{}{}
+		eg.AddFingerprint("jwt_key", string(secret))
+		eg.AddFingerprint("jwt_key", hex.EncodeToString(secret))
+		eg.AddFingerprint("jwt_key", base64.StdEncoding.EncodeToString(secret))
+	}
+	addJWT(s.jwtKey)
+	if s.jwtRing != nil {
+		for _, sec := range s.jwtRing.liveSecrets() {
+			addJWT(sec)
+		}
 	}
 	// gate 入口路径属伪装门控,本刀不实现、不注册。
 	// PG DSN 中的密码(env ARTEX_PG_DSN 或 config.json,与启动解析同一来源)。

@@ -49,8 +49,9 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { useAuthedEventSource } from "@/hooks/use-authed-event-source";
 import { useSideQuestions } from "@/hooks/use-side-questions";
-import { api, sseUrl } from "@/lib/api";
+import { api } from "@/lib/api";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
 import { MOCK } from "@/lib/mock/enabled";
 import { isBtwCommand } from "@/lib/side-questions";
@@ -643,7 +644,8 @@ export function SessionsTab({ taskId }: { taskId: string }) {
 
   // Refs backing SSE/loading without re-render churn.
   const snapshotRef = React.useRef(0); // task-level snapshot cursor → SSE since=
-  const esRef = React.useRef<EventSource | null>(null);
+  const sseAliveRef = React.useRef(false);
+  const [activityStream, setActivityStream] = React.useState<string | null>(null);
   const activeKeyRef = React.useRef(mainSessionKey(0)); // current session key (for SSE dispatch/unread)
   const atBottomRef = React.useRef(true); // transcript pinned to bottom?
   const llmToastSeqRef = React.useRef<Set<number>>(new Set());
@@ -869,6 +871,68 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     return () => clearInterval(id);
   }, []);
 
+  useAuthedEventSource(activityStream, {
+    onopen: () => setSseLive(true),
+    onerror: () => setSseLive(false),
+    onmessage: (e) => {
+      let a: Activity;
+      try {
+        a = JSON.parse(e.data) as Activity;
+      } catch {
+        return; // ignore malformed frame
+      }
+      if ((a.kind === "llm_switch" || a.kind === "llm_failover") && !llmToastSeqRef.current.has(a.seq)) {
+        llmToastSeqRef.current.add(a.seq);
+        const transition = a.metadata?.llm_transition;
+        if (transition?.mode === "exhausted" || a.is_error) {
+          toast.error(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
+        } else if (transition?.mode === "automatic") {
+          toast.success(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
+        } else {
+          toast.info(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
+        }
+        void api
+          .taskLLMResolution(taskId)
+          .then((value) => {
+            if (sseAliveRef.current) setLLMResolutions(value);
+          })
+          .catch(() => {
+            // The periodic resolver poll will retry if this event-triggered refresh fails.
+          });
+      }
+      const k = sessionKeyOf(a);
+      setStore((prev) => {
+        const cur = prev[k] ?? emptyState();
+        const activeK = activeKeyRef.current;
+        // Merge into sessions that are loaded, actively loading, or the current
+        // view (so returning is instant + a frame that lands mid-load isn't lost).
+        // A cold, inactive session also keeps a tiny accounting tail so the
+        // sidebar can add the latest unfinished usage without loading history.
+        if (!cur.loaded && !cur.loading && k !== activeK) {
+          const accountingItems =
+            a.kind === "usage" || a.kind === "result" ? mergeBySeq(cur.items, [a]).slice(-4) : cur.items;
+          return {
+            ...prev,
+            [k]: { ...cur, items: accountingItems, lastTs: a.ts, unread: cur.unread + 1 },
+          };
+        }
+        let items = mergeBySeq(cur.items, [a]);
+        // Memory bound: trim oldest when over cap (older re-fetched on scroll-up),
+        // but never while the user is reading this session's history (scrolled up).
+        let hasMore = cur.hasMore;
+        let earliestSeq = cur.earliestSeq;
+        const trimmable = k !== activeK || atBottomRef.current;
+        if (trimmable && items.length > MAX_KEEP) {
+          items = items.slice(items.length - MAX_KEEP);
+          hasMore = true;
+          earliestSeq = items[0].seq;
+        }
+        const unread = k === activeK ? 0 : cur.unread + 1;
+        return { ...prev, [k]: { ...cur, items, lastTs: a.ts, unread, hasMore, earliestSeq } };
+      });
+    },
+  });
+
   // ── first load + single task SSE ────────────────────────────────────────────────
   // On task open: load Main's latest page, take the task-level snapshot cursor from
   // it, THEN open ONE task SSE at since=snapshot_cursor. History covers id≤cursor and
@@ -968,70 +1032,13 @@ export function SessionsTab({ taskId }: { taskId: string }) {
             unread: 0,
           };
         });
-        // Open the single task SSE from the snapshot cursor.
-        const es = new EventSource(
-          sseUrl(`/api/exploration/activity/stream?task=${encodeURIComponent(taskId)}&since=${snapshotRef.current}`),
-        );
-        esRef.current = es;
-        es.onopen = () => setSseLive(true);
-        es.onerror = () => setSseLive(false); // EventSource auto-reconnects; DB compensates the gap
-        es.onmessage = (e) => {
-          let a: Activity;
-          try {
-            a = JSON.parse(e.data) as Activity;
-          } catch {
-            return; // ignore malformed frame
-          }
-          if ((a.kind === "llm_switch" || a.kind === "llm_failover") && !llmToastSeqRef.current.has(a.seq)) {
-            llmToastSeqRef.current.add(a.seq);
-            const transition = a.metadata?.llm_transition;
-            if (transition?.mode === "exhausted" || a.is_error) {
-              toast.error(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
-            } else if (transition?.mode === "automatic") {
-              toast.success(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
-            } else {
-              toast.info(a.summary, { id: `task-${taskId}-llm-${a.seq}` });
-            }
-            void api
-              .taskLLMResolution(taskId)
-              .then((value) => {
-                if (alive) setLLMResolutions(value);
-              })
-              .catch(() => {
-                // The periodic resolver poll will retry if this event-triggered refresh fails.
-              });
-          }
-          const k = sessionKeyOf(a);
-          setStore((prev) => {
-            const cur = prev[k] ?? emptyState();
-            const activeK = activeKeyRef.current;
-            // Merge into sessions that are loaded, actively loading, or the current
-            // view (so returning is instant + a frame that lands mid-load isn't lost).
-            // A cold, inactive session also keeps a tiny accounting tail so the
-            // sidebar can add the latest unfinished usage without loading history.
-            if (!cur.loaded && !cur.loading && k !== activeK) {
-              const accountingItems =
-                a.kind === "usage" || a.kind === "result" ? mergeBySeq(cur.items, [a]).slice(-4) : cur.items;
-              return {
-                ...prev,
-                [k]: { ...cur, items: accountingItems, lastTs: a.ts, unread: cur.unread + 1 },
-              };
-            }
-            let items = mergeBySeq(cur.items, [a]);
-            // Memory bound: trim oldest when over cap (older re-fetched on scroll-up),
-            // but never while the user is reading this session's history (scrolled up).
-            let hasMore = cur.hasMore;
-            let earliestSeq = cur.earliestSeq;
-            const trimmable = k !== activeK || atBottomRef.current;
-            if (trimmable && items.length > MAX_KEEP) {
-              items = items.slice(items.length - MAX_KEEP);
-              hasMore = true;
-              earliestSeq = items[0].seq;
-            }
-            const unread = k === activeK ? 0 : cur.unread + 1;
-            return { ...prev, [k]: { ...cur, items, lastTs: a.ts, unread, hasMore, earliestSeq } };
-          });
-        };
+        // Open the single task SSE from the snapshot cursor. The hook refreshes
+        // the token and rebuilds the connection if the stream errors.
+        if (alive && reqTokenRef.current.mainboot === token) {
+          setActivityStream(
+            `/api/exploration/activity/stream?task=${encodeURIComponent(taskId)}&since=${snapshotRef.current}`,
+          );
+        }
       })
       .catch((err) => {
         if (!alive || reqTokenRef.current.mainboot !== token) return;
@@ -1040,10 +1047,11 @@ export function SessionsTab({ taskId }: { taskId: string }) {
       })
       .finally(() => loadingKeysRef.current.delete(bootKey));
 
+    sseAliveRef.current = true;
     return () => {
       alive = false;
-      esRef.current?.close();
-      esRef.current = null;
+      sseAliveRef.current = false;
+      setActivityStream(null);
     };
   }, [taskId, patchStore]);
 

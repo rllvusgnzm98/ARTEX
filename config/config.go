@@ -33,6 +33,11 @@ type Config struct {
 	TunnelPortRange    string   `json:"tunnel_port_range"`
 	TaskProxyPortRange string   `json:"task_proxy_port_range"`
 	OwnInfraHosts      []string `json:"own_infra_hosts"`
+	// JWT 签名寿命与轮换。环境变量优先；见 JWTTTL / JWTRotationPeriod / JWTGrace。
+	// 这些字段不轮换 jwt.key（AES 主密钥）。
+	JWTTTL            string `json:"jwt_ttl"`
+	JWTRotationPeriod string `json:"jwt_rotation_period"`
+	JWTGrace          string `json:"jwt_grace"`
 }
 
 // BaseDir is the directory that anchors all runtime artifacts (config.json and
