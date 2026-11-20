@@ -236,11 +236,13 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
 		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
 		s.seedOrchestrationTools() // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
+		s.seedHackbotsTools()      // Hackbots 脚本工具 seed 进 tools 表(仅首插入,不覆盖用户改动)
 		if err := s.seedFindingRetester(); err != nil {
 			log.Printf("[retester] seed: %v", err)
 		}
 		go s.evidenceStore().RunGC(s.ctx)
 		s.seedPythonInterpreter()     // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
+		s.seedNodeInterpreter()       // Hackbots 的 node 脚本同样只在设置为空时写入
 		s.initSessions()              // 立足点会话：Registry + 启动恢复与陈旧探活
 		s.seedSessionTools()          // register_session / session_recon 默认绑 worker
 		s.initTunnels(dataDir)        // 隧道台账（本刀不拉起外部适配器进程）

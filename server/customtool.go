@@ -14,6 +14,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -183,11 +185,17 @@ func (s *Server) pgTestCustomTool(w http.ResponseWriter, r *http.Request) {
 const settingPythonInterp = "python_interpreter"
 
 // detectPython finds a python interpreter absolute path (python3 preferred).
+// WindowsApps 里的 python3 是商店占位程序，执行会失败，不当成可用解释器。
 func detectPython() string {
 	for _, c := range []string{"python3", "python"} {
-		if p, err := exec.LookPath(c); err == nil {
-			return p
+		p, err := exec.LookPath(c)
+		if err != nil {
+			continue
 		}
+		if runtime.GOOS == "windows" && strings.Contains(strings.ToLower(p), "windowsapps") {
+			continue
+		}
+		return p
 	}
 	return ""
 }
@@ -334,7 +342,25 @@ func (s *Server) runCommandTool(ctx context.Context, execRaw json.RawMessage, pa
 	if strings.TrimSpace(spec.Command) == "" {
 		return actool.Errorf("command 为空"), nil
 	}
-	cmd := renderTemplate(spec.Command, params, shellQuote)
+	var skillDir, dataDir, python, node string
+	if strings.Contains(spec.Command, "{{ARTEX_SKILL_DIR}}") {
+		skillDir = commandDirectory(s.skillDir)
+	}
+	if strings.Contains(spec.Command, "{{ARTEX_DATA_DIR}}") {
+		dataDir = commandDirectory(s.m.dir)
+	}
+	if strings.Contains(spec.Command, "{{ARTEX_PYTHON}}") {
+		python = s.pythonInterpreter()
+	}
+	if strings.Contains(spec.Command, "{{ARTEX_NODE}}") {
+		node = s.nodeInterpreter()
+	}
+	cmd, err := expandCommandPlaceholders(spec.Command, commandPlaceholderValues{
+		SkillDir: skillDir, DataDir: dataDir, Python: python, Node: node,
+	}, params)
+	if err != nil {
+		return actool.Errorf(err.Error()), nil
+	}
 	// 复用 Bash 也在用的底层 run(经 Bash CoreTool.Call):自动继承安全 floor/超时/
 	// 代理 env/输出溢出。工具与 Bash 平级、共用底层,不经过 Bash 这个工具让模型调。
 	bashIn, _ := json.Marshal(map[string]any{"command": cmd})
@@ -492,6 +518,112 @@ func identity(s string) string { return s }
 
 // shellQuote single-quotes a value for safe shell interpolation.
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+
+var (
+	commandPlaceholder = regexp.MustCompile(`\{\{[^{}]*\}\}`)
+	commandConditional = regexp.MustCompile(`\{\{IF ([A-Za-z_][A-Za-z0-9_]*)\}\}((?s:.*?))\{\{END\}\}`)
+	// commandConditionalStart 只匹配条件块的开标记，用于校验模板里的占位符。
+	commandConditionalStart = regexp.MustCompile(`^\{\{IF [A-Za-z_][A-Za-z0-9_]*\}\}$`)
+)
+
+// commandPlaceholderValues 是模板里固名占位符的替换值（都已 shell 转义前）。
+type commandPlaceholderValues struct {
+	SkillDir string
+	DataDir  string
+	Python   string
+	Node     string
+}
+
+// expandCommandPlaceholders 先展开 {{IF <param>}}…{{END}} 条件块，再替换固名占位符，
+// 最后把剩下的段交给 renderTemplate 处理 {param}。未知 {{X}} 原样保留，避免破坏
+// 用户自己写的模板。
+//
+// 条件块只支持一层、不支持嵌套：<param> 存在且不是 false/0/空串时保留块内容，
+// 否则整块删除。用于「可选参数才追加某个 flag」这类常见需要（例如 --seed、
+// --host-mode、--dry-run）。
+func expandCommandPlaceholders(cmd string, v commandPlaceholderValues, params map[string]any) (string, error) {
+	cmd = commandConditional.ReplaceAllStringFunc(cmd, func(block string) string {
+		m := commandConditional.FindStringSubmatch(block)
+		if len(m) != 3 {
+			return block
+		}
+		if truthyParam(params, m[1]) {
+			return m[2]
+		}
+		return ""
+	})
+	var out strings.Builder
+	start := 0
+	for _, loc := range commandPlaceholder.FindAllStringIndex(cmd, -1) {
+		out.WriteString(renderTemplate(cmd[start:loc[0]], params, shellQuote))
+		token := cmd[loc[0]:loc[1]]
+		switch token {
+		case "{{ARTEX_SKILL_DIR}}":
+			if v.SkillDir == "" {
+				return "", fmt.Errorf("技能目录未配置，无法运行脚本工具")
+			}
+			out.WriteString(shellQuote(v.SkillDir))
+		case "{{ARTEX_DATA_DIR}}":
+			if v.DataDir == "" {
+				return "", fmt.Errorf("数据目录未配置，无法运行脚本工具")
+			}
+			out.WriteString(shellQuote(v.DataDir))
+		case "{{ARTEX_PYTHON}}":
+			if v.Python == "" {
+				return "", fmt.Errorf("未检测到 python 解释器（在系统设置里配置 python_interpreter）")
+			}
+			out.WriteString(shellQuote(v.Python))
+		case "{{ARTEX_NODE}}":
+			if v.Node == "" {
+				return "", fmt.Errorf("未检测到 node（在系统设置里配置 node_interpreter）")
+			}
+			out.WriteString(shellQuote(v.Node))
+		default:
+			out.WriteString(token)
+		}
+		start = loc[1]
+	}
+	out.WriteString(renderTemplate(cmd[start:], params, shellQuote))
+	return out.String(), nil
+}
+
+// truthyParam 判断条件块用的参数是否"有值"：缺省、nil、空串、false、0 都算无值。
+func truthyParam(params map[string]any, name string) bool {
+	v, ok := params[name]
+	if !ok || v == nil {
+		return false
+	}
+	switch x := v.(type) {
+	case string:
+		return strings.TrimSpace(x) != ""
+	case bool:
+		return x
+	case float64:
+		return x != 0
+	case int:
+		return x != 0
+	case int64:
+		return x != 0
+	default:
+		return true
+	}
+}
+
+// commandDirectory resolves a configured directory for shell interpolation.
+// Empty, inaccessible and non-directory paths all map to an unset directory.
+func commandDirectory(dir string) string {
+	if strings.TrimSpace(dir) == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return ""
+	}
+	if info, err := os.Stat(abs); err != nil || !info.IsDir() {
+		return ""
+	}
+	return abs
+}
 
 // renderTemplate replaces {name} placeholders with each param's rendered value.
 func renderTemplate(tmpl string, params map[string]any, quote func(string) string) string {

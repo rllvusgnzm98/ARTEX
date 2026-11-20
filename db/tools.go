@@ -215,6 +215,17 @@ func (d *DB) GetTool(key string) (*Tool, error) {
 // CreateCustomTool inserts a user-defined tool (system=false) with an execution
 // spec. Fails if the key already exists.
 func (d *DB) CreateCustomTool(t *Tool) error {
+	return d.insertCustomTool(t, false)
+}
+
+// SeedCustomTool first-inserts a code-shipped custom tool (system=false).
+// ON CONFLICT (key) DO NOTHING preserves existing rows of every kind, including
+// user edits. Disable a seeded tool instead of deleting it to keep it off on restart.
+func (d *DB) SeedCustomTool(t *Tool) error {
+	return d.insertCustomTool(t, true)
+}
+
+func (d *DB) insertCustomTool(t *Tool, seed bool) error {
 	schema := t.Schema
 	if len(schema) == 0 {
 		schema = json.RawMessage("{}")
@@ -223,13 +234,17 @@ func (d *DB) CreateCustomTool(t *Tool) error {
 	if len(exec) == 0 {
 		exec = json.RawMessage("{}")
 	}
-	agents, _ := json.Marshal(t.Agents)
-	if len(agents) == 0 {
-		agents = json.RawMessage("[]")
+	agents := json.RawMessage("[]")
+	if len(t.Agents) > 0 {
+		agents, _ = json.Marshal(t.Agents)
 	}
-	_, err := d.Exec(`
+	query := `
 INSERT INTO tools(key, system, description, schema, agents, enabled, kind, exec, deferred)
-VALUES ($1, false, $2, $3, $4, $5, $6, $7, $8)`,
+VALUES ($1, false, $2, $3, $4, $5, $6, $7, $8)`
+	if seed {
+		query += " ON CONFLICT (key) DO NOTHING"
+	}
+	_, err := d.Exec(query,
 		t.Key, t.Description, schema, agents, t.Enabled, t.Kind, exec, t.Deferred)
 	return err
 }
