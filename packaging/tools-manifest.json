@@ -1,5 +1,5 @@
 {
-  "_comment": "ARTEX 外部工具钉版清单。path 相对 data 目录；env 为可选路径覆盖（运行时 env 优先）。sha256 空串 = 未钉（宁可留空也不抄现场哈希），doctor 只校验非空值；哈希不匹配只警告。默认清单不含凭据收割/提权工具，也不含 suo5-payloads / penelope。chisel / suo5 / ligolo-* 仅为可选隧道检查，缺失只警告，不是必装。",
+  "_comment": "ARTEX 外部工具钉版清单。path 相对 data 目录；env 为可选路径覆盖（运行时 env 优先）。sha256 是 data/tools/<name> 落地二进制的哈希，不是压缩包；空串表示未钉，绝不编造。optional=true 允许空哈希（隧道类，或官方资产取不到的侦察类）。doctor 默认只警告；-strict-tools 时非 optional 的缺失或不匹配为 FAIL。platform 与当前系统不符则跳过，避免 arm64 对照 linux/amd64 钉版假报 mismatch。默认清单不含凭据收割/提权工具，也不含 suo5-payloads / penelope，那些只在 tools-manifest.optional.json 登记元数据，默认不下载、不参与校验。",
   "tools": [
     {
       "name": "suo5",
@@ -7,9 +7,11 @@
       "version": "",
       "platform": "linux/amd64",
       "sha256": "",
+      "url": "",
       "path": "tools/suo5",
       "env": "ARTEX_SUO5_PATH",
-      "category": "tunnel"
+      "category": "tunnel",
+      "optional": true
     },
     {
       "name": "chisel",
@@ -17,9 +19,11 @@
       "version": "",
       "platform": "linux/amd64",
       "sha256": "",
+      "url": "",
       "path": "tools/chisel",
       "env": "ARTEX_CHISEL_PATH",
-      "category": "tunnel"
+      "category": "tunnel",
+      "optional": true
     },
     {
       "name": "ligolo-agent",
@@ -27,9 +31,11 @@
       "version": "",
       "platform": "linux/amd64",
       "sha256": "",
+      "url": "",
       "path": "tools/ligolo-agent",
       "env": "",
-      "category": "tunnel"
+      "category": "tunnel",
+      "optional": true
     },
     {
       "name": "ligolo-proxy",
@@ -37,59 +43,71 @@
       "version": "",
       "platform": "linux/amd64",
       "sha256": "",
+      "url": "",
       "path": "tools/ligolo-proxy",
       "env": "",
-      "category": "tunnel"
+      "category": "tunnel",
+      "optional": true
     },
     {
       "name": "gogo",
       "purpose": "内网端口扫描与服务识别",
-      "version": "",
+      "version": "v2.15.0",
       "platform": "linux/amd64",
-      "sha256": "",
+      "sha256": "3b51080a909023f7d484e2443740b572307ce0054eb9e32d98f0a06bfcd2db90",
+      "url": "https://github.com/chainreactors/gogo/releases/download/v2.15.0/gogo_linux_amd64",
       "path": "tools/gogo",
       "env": "",
-      "category": "arsenal"
+      "category": "arsenal",
+      "optional": false
     },
     {
       "name": "naabu",
       "purpose": "快速端口扫描",
-      "version": "",
+      "version": "v2.7.0",
       "platform": "linux/amd64",
-      "sha256": "",
+      "sha256": "34b22eb195238380947792e9c83f4276d2182871df1842d2eb927db0659e6276",
+      "url": "https://github.com/projectdiscovery/naabu/releases/download/v2.7.0/naabu_2.7.0_linux_amd64.zip",
       "path": "tools/naabu",
       "env": "",
-      "category": "arsenal"
+      "category": "arsenal",
+      "optional": false
     },
     {
       "name": "httpx",
       "purpose": "HTTP 服务探活与指纹/标题识别",
-      "version": "",
+      "version": "v1.12.0",
       "platform": "linux/amd64",
-      "sha256": "",
+      "sha256": "6d78b83b4da452a7e0bd3613c4fae04cbf523209f083904b563f4d4406a680b0",
+      "url": "https://github.com/projectdiscovery/httpx/releases/download/v1.12.0/httpx_1.12.0_linux_amd64.zip",
       "path": "tools/httpx",
       "env": "",
-      "category": "arsenal"
+      "category": "arsenal",
+      "optional": false
     },
     {
       "name": "katana",
       "purpose": "Web 爬虫与端点发现",
-      "version": "",
+      "version": "v1.8.0",
       "platform": "linux/amd64",
-      "sha256": "",
+      "sha256": "3214c11a0548667b37ec17bbb691706b7e0de1f0f24b3ead2ee12c301ebc1bbc",
+      "url": "https://github.com/projectdiscovery/katana/releases/download/v1.8.0/katana_1.8.0_linux_amd64.zip",
       "path": "tools/katana",
       "env": "",
-      "category": "arsenal"
+      "category": "arsenal",
+      "optional": false
     },
     {
       "name": "fscan",
       "purpose": "内网综合扫描：端口与服务识别",
-      "version": "",
+      "version": "v2.2.2",
       "platform": "linux/amd64",
-      "sha256": "",
+      "sha256": "e5c645434b4fb3b9bfa8d7402e2e6e80189c9ec9533ebdc8620aaace686cd84c",
+      "url": "https://github.com/shadow1ng/fscan/releases/download/v2.2.2/fscan_2.2.2_linux_x64",
       "path": "tools/fscan",
       "env": "",
-      "category": "arsenal"
+      "category": "arsenal",
+      "optional": false
     }
   ]
 }

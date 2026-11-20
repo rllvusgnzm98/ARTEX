@@ -1,10 +1,11 @@
 ---
 name: playwright-cli
 description: Automate browser interactions, test web pages and work with Playwright tests.
-allowed-tools: Bash(playwright-cli:*) Bash(npx:*) Bash(npm:*)
 ---
 
 # Browser Automation with playwright-cli
+
+本仓库技能 frontmatter 只记录 name、description、license、compatibility、mcps（兼容 whenToUse、mcp）。上游 `allowed-tools` 不是已文档化字段，原值保留如下：`Bash(playwright-cli:*) Bash(npx:*) Bash(npm:*)`。
 
 ## Quick start
 

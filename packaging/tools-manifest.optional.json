@@ -1,0 +1,57 @@
+{
+  "_comment": "可选档元数据。默认不下载、不参与 doctor 或 tools-manifest.sh verify 的必装校验。sha256 必须留空，不编造哈希。许可备注只说明本仓库不分发二进制，不构成使用授权。",
+  "tools": [
+    {
+      "name": "mimikatz",
+      "purpose": "Windows 凭据提取。",
+      "version": "",
+      "platform": "windows/amd64",
+      "sha256": "",
+      "url": "https://github.com/gentilkiwi/mimikatz",
+      "path": "tools/mimikatz",
+      "env": "",
+      "category": "optional",
+      "optional": true,
+      "license_note": "见上游许可。本仓库只登记元数据，默认不下载、不校验、不随发行物分发。"
+    },
+    {
+      "name": "laZagne",
+      "purpose": "本地已保存口令恢复。",
+      "version": "",
+      "platform": "any",
+      "sha256": "",
+      "url": "https://github.com/AlessandroZ/LaZagne",
+      "path": "tools/laZagne",
+      "env": "",
+      "category": "optional",
+      "optional": true,
+      "license_note": "见上游许可。本仓库只登记元数据，默认不下载、不校验、不随发行物分发。"
+    },
+    {
+      "name": "peass",
+      "purpose": "提权路径枚举（PEASS-ng）。",
+      "version": "",
+      "platform": "any",
+      "sha256": "",
+      "url": "https://github.com/peass-ng/PEASS-ng",
+      "path": "tools/peass",
+      "env": "",
+      "category": "optional",
+      "optional": true,
+      "license_note": "见上游许可。本仓库只登记元数据，默认不下载、不校验、不随发行物分发。"
+    },
+    {
+      "name": "suo5-payloads",
+      "purpose": "suo5 隧道载荷。",
+      "version": "",
+      "platform": "any",
+      "sha256": "",
+      "url": "https://github.com/zema1/suo5",
+      "path": "tools/suo5-payloads",
+      "env": "",
+      "category": "optional",
+      "optional": true,
+      "license_note": "见上游许可。载荷不随发行物分发，默认不下载、不校验。"
+    }
+  ]
+}

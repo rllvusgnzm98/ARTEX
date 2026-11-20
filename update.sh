@@ -12,6 +12,20 @@ warn(){ printf '\033[33m[!]\033[0m %s\n' "$*"; }
 die(){  printf '\033[31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 ask(){  local p="$1" d="${2:-}" a; read -rp "$p${d:+ [$d]}: " a; echo "${a:-$d}"; }
 
+# 构建源留空 = 官方。ARTEX_GOPROXY / ARTEX_NPM_REGISTRY 不可达时回退官方源。
+run_go_build() {
+  local proxy="${ARTEX_GOPROXY:-https://proxy.golang.org,direct}"
+  if GOPROXY="$proxy" GOSUMDB="${ARTEX_GOSUMDB:-sum.golang.org}" CGO_ENABLED=0 "$@"; then
+    return 0
+  fi
+  if [ -n "${ARTEX_GOPROXY:-}" ] && [ "$proxy" != "https://proxy.golang.org,direct" ]; then
+    warn "GOPROXY 不可达，回退官方源"
+    GOPROXY="https://proxy.golang.org,direct" GOSUMDB="${ARTEX_GOSUMDB:-sum.golang.org}" CGO_ENABLED=0 "$@"
+    return
+  fi
+  return 1
+}
+
 # ── 可选：同步仓库到最新代码（compose/脚本/本地编译源码都靠它更新）───────
 sync_repo(){
   [ -d .git ] && command -v git >/dev/null 2>&1 || { warn "非 git 工作副本，跳过 git pull"; return; }
@@ -58,13 +72,21 @@ update_local(){
 
   if command -v npm >/dev/null 2>&1; then
     info "重建前端静态产物…"
-    ( cd web && npm ci && npm run build:static )
+    if [ -n "${ARTEX_NPM_REGISTRY:-}" ]; then
+      if ! ( cd web && npm ci --registry "$ARTEX_NPM_REGISTRY" ); then
+        warn "NPM 镜像不可达，回退官方源"
+        ( cd web && npm ci )
+      fi
+    else
+      ( cd web && npm ci )
+    fi
+    ( cd web && npm run build:static )
     rm -rf server/webui/dist && cp -r web/out server/webui/dist
     info "重新编译内嵌单二进制…"
-    CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
+    run_go_build go build -tags embedui -trimpath -o artex ./cmd/artex
   else
     warn "未检测到 npm：编译**不内嵌前端**的后端（前端需另跑 npm run dev）"
-    CGO_ENABLED=0 go build -o artex ./cmd/artex
+    run_go_build go build -o artex ./cmd/artex
   fi
   ok "编译完成 → ./artex"
   warn "请重启正在运行的 artex 进程以生效（重启时会自动迁移 schema）"

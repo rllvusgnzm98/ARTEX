@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -176,6 +177,31 @@ func TestDockerfileAPTMirrorDefaultEmpty(t *testing.T) {
 	if !strings.Contains(s, `if [ -n "$APT_MIRROR" ]`) {
 		t.Fatal("只有非空时才应换源")
 	}
+	for _, arg := range []string{
+		"ARG NODE_MAJOR=",
+		"ARG NODESOURCE_URL=",
+		"ARG NPM_REGISTRY=",
+		"ARG PLAYWRIGHT_DOWNLOAD_HOST=",
+	} {
+		if !strings.Contains(s, arg) {
+			t.Fatalf("缺少 %s", arg)
+		}
+		if strings.Contains(s, arg+"http") || strings.Contains(s, arg+"20") || strings.Contains(s, arg+"mirrors") {
+			t.Fatalf("%s 默认必须为空", arg)
+		}
+	}
+	if !strings.Contains(s, "sources.list.bak") || !strings.Contains(s, "Acquire::Retries=3") {
+		t.Fatal("apt 改源失败应备份 sources.list 并带 Acquire::Retries=3 回退")
+	}
+	if !strings.Contains(s, `if ! npm install -g --registry="$NPM_REGISTRY"`) {
+		t.Fatal("npm 镜像安装失败应回退官方安装")
+	}
+	if !strings.Contains(s, "playwright install --with-deps chromium") {
+		t.Fatal("应保留 Playwright 浏览器安装，并在镜像失败时回退")
+	}
+	if !strings.Contains(s, "COPY packaging/tools-manifest.json /app/packaging/tools-manifest.json") {
+		t.Fatal("镜像应打包 packaging/tools-manifest.json")
+	}
 }
 
 func TestSystemdUnitListensOnAllInterfaces(t *testing.T) {
@@ -270,10 +296,123 @@ func TestRunDoctorArsenalHashMismatchIsWarn(t *testing.T) {
 	}
 }
 
+func TestRunDoctorStrictToolsMissingNonOptionalFails(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("ARTEX_PG_DSN"))
+	if dsn == "" {
+		t.Skip("no ARTEX_PG_DSN — skipping doctor integration")
+	}
+	isolateConfig(t)
+	t.Setenv("ARTEX_PG_DSN", dsn)
+	man := filepath.Join(t.TempDir(), "tools-manifest.json")
+	body := `{"tools":[{"name":"naabu","path":"tools/naabu","category":"arsenal","optional":false,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}`
+	if err := os.WriteFile(man, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARTEX_TOOLS_MANIFEST", man)
+	out, code := captureDoctor(t, "-data", t.TempDir(), "-strict-tools")
+	if code != 1 {
+		t.Fatalf("-strict-tools 下非 optional 缺失应为 FAIL, exit=%d\n%s", code, out)
+	}
+	if !strings.Contains(out, "[FAIL] 军火库工具") || !strings.Contains(out, "缺失: naabu") {
+		t.Fatalf("应 FAIL 并点名缺失工具:\n%s", out)
+	}
+}
+
+func TestRunDoctorStrictToolsHashMismatchFails(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("ARTEX_PG_DSN"))
+	if dsn == "" {
+		t.Skip("no ARTEX_PG_DSN — skipping doctor integration")
+	}
+	isolateConfig(t)
+	t.Setenv("ARTEX_PG_DSN", dsn)
+	data := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(data, "tools"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "tools", "httpx"), []byte("present-but-wrong"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	man := filepath.Join(t.TempDir(), "tools-manifest.json")
+	body := `{"tools":[{"name":"httpx","path":"tools/httpx","category":"arsenal","optional":false,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}]}`
+	if err := os.WriteFile(man, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARTEX_TOOLS_MANIFEST", man)
+	out, code := captureDoctor(t, "-data", data, "-strict-tools")
+	if code != 1 {
+		t.Fatalf("-strict-tools 下非 optional 哈希不匹配应为 FAIL, exit=%d\n%s", code, out)
+	}
+	if !strings.Contains(out, "[FAIL] 军火库工具") || !strings.Contains(out, "哈希不匹配") {
+		t.Fatalf("应 FAIL 并说明哈希不匹配:\n%s", out)
+	}
+}
+
+func TestRunDoctorStrictToolsOptionalMissingStaysWarn(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("ARTEX_PG_DSN"))
+	if dsn == "" {
+		t.Skip("no ARTEX_PG_DSN — skipping doctor integration")
+	}
+	isolateConfig(t)
+	t.Setenv("ARTEX_PG_DSN", dsn)
+	man := filepath.Join(t.TempDir(), "tools-manifest.json")
+	body := `{"tools":[{"name":"chisel","path":"tools/chisel","category":"tunnel","optional":true,"sha256":""}]}`
+	if err := os.WriteFile(man, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARTEX_TOOLS_MANIFEST", man)
+	out, code := captureDoctor(t, "-data", t.TempDir(), "-strict-tools")
+	if code != 0 {
+		t.Fatalf("optional 缺失在 -strict-tools 下仍应为 WARN, exit=%d\n%s", code, out)
+	}
+	if !strings.Contains(out, "[WARN] 隧道工具") || !strings.Contains(out, "chisel 缺失") {
+		t.Fatalf("optional 缺失应继续 WARN:\n%s", out)
+	}
+	if strings.Contains(out, "[FAIL] 隧道工具") {
+		t.Fatalf("optional 不得 FAIL:\n%s", out)
+	}
+}
+
+func TestRunDoctorOtherPlatformIsSkip(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("ARTEX_PG_DSN"))
+	if dsn == "" {
+		t.Skip("no ARTEX_PG_DSN — skipping doctor integration")
+	}
+	isolateConfig(t)
+	t.Setenv("ARTEX_PG_DSN", dsn)
+	data := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(data, "tools"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "tools", "naabu"), []byte("local-bytes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	man := filepath.Join(t.TempDir(), "tools-manifest.json")
+	// plan9 不是本机平台。文件在、哈希也故意不对，仍必须 SKIP 而不是 mismatch FAIL。
+	body := `{"tools":[{"name":"naabu","path":"tools/naabu","category":"arsenal","platform":"plan9/amd64","optional":false,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}]}`
+	if err := os.WriteFile(man, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARTEX_TOOLS_MANIFEST", man)
+	out, code := captureDoctor(t, "-data", data, "-strict-tools")
+	if code != 0 {
+		t.Fatalf("平台不符不得 FAIL, exit=%d\n%s", code, out)
+	}
+	if !strings.Contains(out, "[SKIP] 军火库工具") || !strings.Contains(out, "不适用") {
+		t.Fatalf("平台不符应 SKIP:\n%s", out)
+	}
+	if strings.Contains(out, "哈希不匹配") {
+		t.Fatalf("平台不符不得报哈希不匹配:\n%s", out)
+	}
+}
+
 func TestDoctorCLIDoesNotStartServer(t *testing.T) {
 	isolateConfig(t)
 	t.Setenv("ARTEX_PG_DSN", "")
 	bin := filepath.Join(t.TempDir(), "artex")
+	// Windows os/exec 只接受 PATHEXT 里的扩展名。不带 .exe 时能编出来，但跑不起来。
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
 	build := exec.Command("go", "build", "-o", bin, "github.com/Autumn-27/artex/cmd/artex")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
