@@ -1545,7 +1545,9 @@ func skillRelPath(file string) (string, string) {
 	if clean == "." || filepath.IsAbs(clean) || strings.HasPrefix(clean, "..") {
 		return "", "invalid path"
 	}
-	return clean, ""
+	// 技能文件路径是 URL 语义（前端按 / 分目录），Windows 上 Clean 会产出 \，
+	// 统一转回 /；白名单已禁止反斜杠，转换不引入新的路径歧义。
+	return filepath.ToSlash(clean), ""
 }
 
 // walkSkillFiles returns all files under root (relative to root), sorted,

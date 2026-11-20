@@ -495,6 +495,11 @@ func TestCredentialRegisterSessionSetsVerified(t *testing.T) {
 	childID := mustTaskID(t, child.ID)
 	otherID := mustTaskID(t, other.ID)
 	t.Cleanup(func() {
+		// register_session 会往 sessions 表写行；测试用自己的主密钥建库，
+		// 残留行会污染后续用别的密钥 List 的用例，必须先清掉。
+		for _, tid := range []int64{childID, parentID, otherID} {
+			_, _ = m.PG().Exec(`DELETE FROM sessions WHERE created_by_task=$1`, tid)
+		}
 		_ = m.PG().DeleteTask(childID)
 		_ = m.PG().DeleteTask(parentID)
 		_ = m.PG().DeleteTask(otherID)

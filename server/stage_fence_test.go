@@ -94,9 +94,10 @@ func TestResolveTaskWorkspaceFileRejectsEscapeAndMissing(t *testing.T) {
 	// 指向工作区外的符号链接
 	link := filepath.Join(ws, "escape")
 	if err := os.Symlink(outside, link); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.resolveTaskWorkspaceFile("42", link); err == nil {
+		// Windows 默认策略下创建符号链接需要额外特权；本用例在无权限环境跳过，
+		// 其余越界断言仍然执行。
+		t.Logf("跳过符号链接越界用例（当前环境无法创建符号链接）: %v", err)
+	} else if _, err := s.resolveTaskWorkspaceFile("42", link); err == nil {
 		t.Fatal("指向工作区外的符号链接应拒绝")
 	}
 	// 无任务上下文 / 非法 task id

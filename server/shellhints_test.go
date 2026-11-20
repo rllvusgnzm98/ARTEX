@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -31,6 +32,14 @@ func openTestPG(t *testing.T) *db.DB {
 
 func writeStubCommand(t *testing.T, dir, name string) {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		// Windows 的 LookPath 只认 PATHEXT 里的扩展名，无后缀脚本永远找不到。
+		path := filepath.Join(dir, name+".cmd")
+		if err := os.WriteFile(path, []byte("@echo off\nexit /b 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
