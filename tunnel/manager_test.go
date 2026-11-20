@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -137,7 +138,12 @@ func freeListenPort(t *testing.T) int {
 
 func buildStub(t *testing.T) string {
 	t.Helper()
-	out := filepath.Join(t.TempDir(), "stublisten")
+	name := "stublisten"
+	if runtime.GOOS == "windows" {
+		// Windows 的 os/exec 只接受 PATHEXT 扩展名，无后缀的 PE 会被当成找不到。
+		name += ".exe"
+	}
+	out := filepath.Join(t.TempDir(), name)
 	cmd := exec.Command("go", "build", "-o", out, "./testdata/stublisten")
 	cmd.Dir = mustThisDir(t)
 	if b, err := cmd.CombinedOutput(); err != nil {
@@ -453,6 +459,9 @@ func TestPublicTunnelRecordOmitsPassword(t *testing.T) {
 }
 
 func TestDeployListenOnlyStaysDeployingUntilEntryReady(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("SIGUSR1 仅 Unix 支持，defer-entry 时序无法在 Windows 模拟")
+	}
 	ctx := context.Background()
 	store := newMemStore()
 	m, err := NewManager(Options{Store: store, DataDir: t.TempDir(), ChiselPath: buildStub(t)})

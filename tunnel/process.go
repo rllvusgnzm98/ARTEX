@@ -16,11 +16,7 @@ func processAlive(pid int) bool {
 		_, err := os.Stat("/proc/" + strconv.Itoa(pid))
 		return err == nil
 	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	return proc.Signal(zeroSignal()) == nil
+	return processAliveFallback(pid)
 }
 
 func readCmdline(pid int) string {

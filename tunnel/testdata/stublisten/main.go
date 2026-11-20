@@ -61,8 +61,10 @@ func main() {
 	}()
 	stop := make(chan os.Signal, 1)
 	usr := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	signal.Notify(usr, syscall.SIGUSR1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	if sig := usr1(); sig != nil {
+		signal.Notify(usr, sig)
+	}
 	for {
 		select {
 		case <-stop:
