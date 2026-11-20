@@ -33,11 +33,13 @@ type ServiceView struct {
 	CertIssuer  string // TLS 证书 issuer
 }
 
-// MatchRule 是一条签名的匹配条件:列出的条件【全部】命中才算命中;
-// 一个条件都没有的签名永不命中(防"无条件签名匹配一切")。
+// MatchRule 是一条签名的匹配条件:列出的正向条件【全部】命中才算命中;
+// 一个正向条件都没有的签名永不命中(防"无条件签名匹配一切")。
+// NotBannerSubstr 是排除项,不算正向条件:banner 含该子串则本条不命中。
 type MatchRule struct {
 	Port              *int   `json:"port,omitempty"`
 	BannerSubstr      string `json:"banner_substr,omitempty"`
+	NotBannerSubstr   string `json:"not_banner_substr,omitempty"`
 	HTTPTitleSubstr   string `json:"http_title_substr,omitempty"`
 	HTTPBodySubstr    string `json:"http_body_substr,omitempty"`
 	CertSubjectSubstr string `json:"cert_subject_substr,omitempty"`
@@ -49,9 +51,24 @@ type Signature struct {
 	Name       string    `json:"name"`       // 签名标识(snake_case)
 	Product    string    `json:"product"`    // 蜜罐产品名(Cowrie/OpenCanary/...)
 	Confidence float64   `json:"confidence"` // 0-1,命中时贡献的评分
-	Source     string    `json:"source"`     // 来源(必填,签名只收录有出处的)
+	Weak       bool      `json:"weak,omitempty"`
+	Severity   string    `json:"severity,omitempty"` // low|medium|high,签名作者标注;评分以 Weak 与条数为准
+	Source     string    `json:"source"`             // 来源(必填,签名只收录有出处的)
 	Match      MatchRule `json:"match"`
 }
+
+// Hit 是一次评估里的一条命中。Confidence 是签名原值,不是折算后的总分。
+type Hit struct {
+	Name       string
+	Product    string
+	Confidence float64
+	Weak       bool
+	Severity   string
+}
+
+// highScore 是 high 档下限,与 agent.honeypotConfidence(>=0.9 为 high)对齐。
+// 单条弱签名的返回分必须低于它;一条强签名沿用其原置信度,两条弱签名才抬到该档。
+const highScore = 0.9
 
 func (m MatchRule) empty() bool {
 	return m.Port == nil && m.BannerSubstr == "" && m.HTTPTitleSubstr == "" &&
@@ -68,6 +85,9 @@ func (m MatchRule) matches(v ServiceView) bool {
 		return false
 	}
 	if m.BannerSubstr != "" && !containsFold(v.Banner, m.BannerSubstr) {
+		return false
+	}
+	if m.NotBannerSubstr != "" && containsFold(v.Banner, m.NotBannerSubstr) {
 		return false
 	}
 	if m.HTTPTitleSubstr != "" && !containsFold(v.Title, m.HTTPTitleSubstr) {
@@ -157,19 +177,84 @@ func parseSignatures(data []byte) []Signature {
 // needsReload 报告缓存的签名是否落后于该 mtime(读锁内快速路径)。
 func (e *Engine) needsReload(mt time.Time) bool { return !mt.Equal(e.modTime) }
 
-// Evaluate 对视图 v 跑全部签名,返回命中签名中的最高置信度与命中证据
-// (每条 "name(product, confidence)");无命中返回 0 分、空证据。
-func (e *Engine) Evaluate(v ServiceView) (score float64, evidence []string) {
+// EvaluateHits 返回视图上的全部命中(签名文件顺序)。v 须是 ServiceView 或其指针,
+// 其他类型返回 nil。无命中返回 nil。
+func (e *Engine) EvaluateHits(v any) []Hit {
+	sv, ok := serviceViewOf(v)
+	if !ok {
+		return nil
+	}
+	var hits []Hit
 	for _, s := range e.signatures() {
-		if s.Confidence <= 0 || !s.Match.matches(v) {
+		if s.Confidence <= 0 || !s.Match.matches(sv) {
 			continue
 		}
-		evidence = append(evidence, fmt.Sprintf("%s(%s, %.2f)", s.Name, s.Product, s.Confidence))
-		if s.Confidence > score {
-			score = s.Confidence
+		hits = append(hits, Hit{
+			Name: s.Name, Product: s.Product, Confidence: s.Confidence,
+			Weak: s.Weak, Severity: s.Severity,
+		})
+	}
+	return hits
+}
+
+func serviceViewOf(v any) (ServiceView, bool) {
+	switch x := v.(type) {
+	case ServiceView:
+		return x, true
+	case *ServiceView:
+		if x == nil {
+			return ServiceView{}, false
+		}
+		return *x, true
+	default:
+		return ServiceView{}, false
+	}
+}
+
+// scoreHits 把命中折成兼容 Evaluate 的分数。
+// 强签名(Weak=false)沿用「最高置信度」:一条强签名即可按其原分写入,原分>=highScore 就是 high。
+// 弱签名单独一条时分数封顶在 highScore 之下,不得单独判 high;
+// 两条及以上弱签名、且没有强签名时,才写 high(至少 highScore)。
+func scoreHits(hits []Hit) (score float64, evidence []string) {
+	if len(hits) == 0 {
+		return 0, nil
+	}
+	var strongMax, weakMax float64
+	var strongN, weakN int
+	for _, h := range hits {
+		evidence = append(evidence, fmt.Sprintf("%s(%s, %.2f)", h.Name, h.Product, h.Confidence))
+		if h.Weak {
+			weakN++
+			if h.Confidence > weakMax {
+				weakMax = h.Confidence
+			}
+			continue
+		}
+		strongN++
+		if h.Confidence > strongMax {
+			strongMax = h.Confidence
 		}
 	}
-	return score, evidence
+	if strongN >= 1 {
+		return strongMax, evidence
+	}
+	if weakN >= 2 {
+		if weakMax < highScore {
+			return highScore, evidence
+		}
+		return weakMax, evidence
+	}
+	if weakMax >= highScore {
+		return highScore - 0.01, evidence
+	}
+	return weakMax, evidence
+}
+
+// Evaluate 对视图 v 跑全部签名,返回折算后的分数与命中证据
+// (每条 "name(product, confidence)");无命中返回 0 分、空证据。
+// 分数规则见 scoreHits。非弱签名的单条命中与旧行为一致(取该签名置信度)。
+func (e *Engine) Evaluate(v ServiceView) (score float64, evidence []string) {
+	return scoreHits(e.EvaluateHits(v))
 }
 
 // defaultSignaturesPath 是默认签名文件相对路径(开发态从仓库根运行即生效);
@@ -190,4 +275,9 @@ func SetSignaturesPath(path string) {
 // Evaluate 用默认引擎评估(见 Engine.Evaluate)。
 func Evaluate(v ServiceView) (score float64, evidence []string) {
 	return defaultEngine.Evaluate(v)
+}
+
+// EvaluateHits 用默认引擎返回全部命中(见 Engine.EvaluateHits)。
+func EvaluateHits(v any) []Hit {
+	return defaultEngine.EvaluateHits(v)
 }

@@ -57,7 +57,7 @@ func TestAPIInsertAssetsRunsHoneypotEvaluation(t *testing.T) {
 		"assets": []any{map[string]any{
 			"type": "service",
 			"url":  httpURL,
-			"body": "fixture login includes x.js",
+			"body": "fixture login includes /x.js",
 		}},
 	})
 	var score float64

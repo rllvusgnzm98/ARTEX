@@ -88,7 +88,7 @@ func TestInsertAssetsHoneypotEvalUsesBodyAndCert(t *testing.T) {
 		"assets": []any{map[string]any{
 			"type": "service",
 			"url":  hfishURL,
-			"body": "login form includes x.js (fixture)",
+			"body": "login form includes /x.js (fixture)",
 		}},
 	})
 	hid := firstResultID(t, hfish)

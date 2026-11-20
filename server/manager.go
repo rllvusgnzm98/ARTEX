@@ -944,6 +944,20 @@ func unixNanoOrZero(t *time.Time) int64 {
 	return t.UnixNano()
 }
 
+// newHoneypotConfig 把本任务资产的蜜罐分类接到 guard。
+// Check 走 agent.HoneypotCheckHost(内部以 HoneypotDispositionFor 决策)。
+// pg 为空时返回零值,Check 为 nil,闸门关闭。
+func newHoneypotConfig(pg *pgdb.DB, store *pgdb.ExplorationStore) guard.HoneypotConfig {
+	if pg == nil {
+		return guard.HoneypotConfig{}
+	}
+	return guard.HoneypotConfig{
+		Check: func(host string) (string, string) {
+			return agent.HoneypotCheckHost(pg.Assets(), store, host)
+		},
+	}
+}
+
 func newTarpitConfig(pg *pgdb.DB, store *pgdb.ExplorationStore) guard.TarpitConfig {
 	return guard.TarpitConfig{
 		Budget: func() int {
@@ -973,6 +987,7 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 	g.SetEgress(eg)
 	g.SetTarpit(newTarpitConfig(pg, store))
 	g.SetRoE(newRoEConfig(pg))
+	g.SetHoneypot(newHoneypotConfig(pg, store))
 	return &Task{
 		ID: strconv.FormatInt(pt.ID, 10), ExpID: pt.ExplorationID,
 		Name:       pt.Name,

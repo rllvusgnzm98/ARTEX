@@ -134,3 +134,48 @@ func TestBundledSignaturesLoad(t *testing.T) {
 		t.Fatalf("内置 Dionaea issuer 签名未命中, score=%v", score)
 	}
 }
+
+func TestWeakScoreAndNotBanner(t *testing.T) {
+	body := `{"signatures":[
+	  {"name":"w1","product":"X","confidence":0.95,"weak":true,"severity":"low","source":"t","match":{"banner_substr":"WEAK-ONE"}},
+	  {"name":"w2","product":"X","confidence":0.85,"weak":true,"severity":"low","source":"t","match":{"banner_substr":"WEAK-TWO"}},
+	  {"name":"strong","product":"X","confidence":0.99,"severity":"high","source":"t","match":{"banner_substr":"STRONG-HIT"}},
+	  {"name":"mid","product":"X","confidence":0.85,"severity":"medium","source":"t","match":{"banner_substr":"MID-HIT"}},
+	  {"name":"excluded","product":"X","confidence":0.99,"source":"t","match":{"banner_substr":"READY","not_banner_substr":"vsftpd"}}
+	]}`
+	e := NewEngine(writeSigs(t, body))
+
+	score, ev := e.Evaluate(ServiceView{Banner: "banner WEAK-ONE"})
+	if score >= highScore || len(ev) != 1 {
+		t.Fatalf("single weak must not score high: score=%v ev=%v", score, ev)
+	}
+	hits := e.EvaluateHits(ServiceView{Banner: "banner WEAK-ONE"})
+	if len(hits) != 1 || !hits[0].Weak || hits[0].Severity != "low" || hits[0].Name != "w1" {
+		t.Fatalf("EvaluateHits single weak: %+v", hits)
+	}
+
+	score, ev = e.Evaluate(ServiceView{Banner: "WEAK-ONE plus WEAK-TWO"})
+	if score < highScore || len(ev) != 2 {
+		t.Fatalf("two weak signatures should score high: score=%v ev=%v", score, ev)
+	}
+
+	if score, _ := e.Evaluate(ServiceView{Banner: "STRONG-HIT"}); score != 0.99 {
+		t.Fatalf("strong signature keeps its confidence, score=%v", score)
+	}
+	if score, _ := e.Evaluate(ServiceView{Banner: "MID-HIT"}); score != 0.85 {
+		t.Fatalf("sub-high strong signature keeps 0.85, score=%v", score)
+	}
+	if score, ev := e.Evaluate(ServiceView{Banner: "STRONG-HIT WEAK-ONE"}); score != 0.99 || len(ev) != 2 {
+		t.Fatalf("strong plus weak uses the strong score: score=%v ev=%v", score, ev)
+	}
+
+	if score, _ := e.Evaluate(ServiceView{Banner: "220 READY vsftpd"}); score != 0 {
+		t.Fatalf("not_banner_substr should exclude, score=%v", score)
+	}
+	if score, _ := e.Evaluate(ServiceView{Banner: "220 READY"}); score != 0.99 {
+		t.Fatalf("banner without the excluded token should hit, score=%v", score)
+	}
+	if hits := e.EvaluateHits("not a view"); hits != nil {
+		t.Fatalf("non-view EvaluateHits = %+v", hits)
+	}
+}

@@ -39,6 +39,7 @@ type Guard struct {
 	egress      *EgressGuard           // optional; 出口敏感指纹拦截,nil 关闭
 	tarpit      *tarpitState           // optional; tarpit 熔断,nil 关闭
 	roe         RoEConfig              // optional; 零值 / Scope=nil 关闭
+	honeypot    HoneypotConfig         // optional; Check==nil 关闭
 }
 
 // New creates a Guard without user-configured intercept rules (used for pentest
@@ -79,13 +80,16 @@ func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
 		_ = json.Unmarshal(ev.Input, &in)
 		cmd = in.Text
 	}
-	// preToolUse 顺序: egress → RoE → tarpit → 现有 intercept。
+	// preToolUse 顺序: egress → RoE → honeypot → tarpit → 现有 intercept。
 	// 空 reason 的 allow 只在全部闸门通过后记录,避免 RoE/intercept 拦下时
 	// 先留下 allow+block 双行。egress 仍先于任何审计,避免命令原文里的秘密落盘。
 	if res, stop := g.checkEgress(ev, cmd); stop {
 		return res
 	}
 	if res, stop := g.checkRoE(ctx, ev, cmd); stop {
+		return res
+	}
+	if res, stop := g.checkHoneypot(ev, cmd); stop {
 		return res
 	}
 	g.checkTarpit(ev)
