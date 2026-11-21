@@ -2,8 +2,11 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/db"
 )
@@ -53,6 +56,23 @@ func TestGraphSnapshotMatchesDirectReads(t *testing.T) {
 	gotEdges, _ := snap.edgeList(5000)
 	if len(wantEdges) == 0 || !sameEdges(gotEdges, wantEdges) {
 		t.Fatalf("edges mismatch: got %v want %v", gotEdges, wantEdges)
+	}
+
+	frWant, _ := es.Frontier(30)
+	frGot, _ := snap.frontier(30)
+	if len(frGot) != len(frWant) || len(frWant) == 0 {
+		t.Fatalf("frontier len %d want %d", len(frGot), len(frWant))
+	}
+	for i := range frWant {
+		if frGot[i].ID != frWant[i].ID {
+			t.Fatalf("frontier order mismatch at %d", i)
+		}
+	}
+	if a, _ := es.CountOpenIntents(); func() int { n, _ := snap.countOpenIntents(); return n }() != a {
+		t.Fatal("open intent count mismatch")
+	}
+	if a, _ := es.CountFinishedIntents(); func() int { n, _ := snap.countFinishedIntents(); return n }() != a {
+		t.Fatal("finished intent count mismatch")
 	}
 
 	ovWant, _ := json.Marshal(tools.graphOverviewData())
@@ -114,5 +134,26 @@ func TestRenderTmplCachesParsedTemplate(t *testing.T) {
 	}
 	if _, err := renderTmpl("{{", nil); err == nil {
 		t.Fatal("parse errors must surface")
+	}
+}
+
+func TestRenderWorkerEntrySeedCapsFactsAndDetail(t *testing.T) {
+	var seed WorkerEntrySeed
+	seed.Prefetched = true
+	for i := 1; i <= entrySeedFactCap+5; i++ {
+		seed.ConfirmedFacts = append(seed.ConfirmedFacts, EntryFact{ID: int64(i), Summary: "s", Detail: strings.Repeat("长", entrySeedDetailCap+50)})
+	}
+	out := RenderWorkerEntrySeed(seed)
+	if strings.Contains(out, "fact #5 ") || !strings.Contains(out, "fact #6 ") || !strings.Contains(out, fmt.Sprintf("fact #%d ", entrySeedFactCap+5)) {
+		t.Fatal("must keep the newest facts and drop the oldest")
+	}
+	if !strings.Contains(out, "另有 5 条") {
+		t.Fatal("must state how many facts were omitted")
+	}
+	if strings.Contains(out, strings.Repeat("长", entrySeedDetailCap+1)) || !strings.Contains(out, "已截断") {
+		t.Fatal("detail must be clipped")
+	}
+	if !utf8.ValidString(out) {
+		t.Fatal("clipping must be UTF-8 safe")
 	}
 }

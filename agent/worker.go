@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
@@ -533,9 +535,12 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	}
 	// 进场预塞：与本意图相关的已确认事实 + 已确认可达但未兑现的下一跳。
 	// 压缩/预取失败只打「图谱不完整」标记，fail-soft，不阻断进场、不写目标失败。
-	sysBody += RenderWorkerEntrySeed(loadWorkerEntrySeedFrom(ts, snap, as, intent))
+	seedBlock := RenderWorkerEntrySeed(loadWorkerEntrySeedFrom(ts, snap, as, intent))
+	sysBody += seedBlock
 	sysBody += w.credentialSeedBlock(ctx, taskID) // 无继承凭据或查询失败时为空串
 	sysBody += "\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。"
+	log.Printf("[worker] intent #%d prompt chars: system=%d overview=%d entry_seed=%d",
+		intent.ID, utf8.RuneCountInString(sysBody), utf8.RuneCountInString(overview), utf8.RuneCountInString(seedBlock))
 	system, boundary := deferredSystem(sysBody, def)
 	// 任务级 deadline(经 ctx 注入)夹逼本 run 的墙钟预算 + 决定收尾词(见 taskclock.go)。
 	tc := taskClockFrom(ctx)

@@ -341,6 +341,21 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 	return seed
 }
 
+// Entry-seed render caps: a long-running task can accumulate many relevant
+// confirmed facts with long details; the rest stay one list_facts call away.
+const (
+	entrySeedFactCap   = 60
+	entrySeedDetailCap = 600
+)
+
+func clipRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…（已截断，完整见 node_detail）"
+}
+
 // RenderWorkerEntrySeed formats the pre-seed, incomplete-graph marker, and
 // entry hard-step for the worker system prompt. Always fail-soft: an incomplete
 // graph still returns a prompt block and never a hard error.
@@ -368,7 +383,12 @@ func RenderWorkerEntrySeed(seed WorkerEntrySeed) string {
 	}
 
 	b.WriteString("\n\n【进场预塞：与本意图相关的已确认事实】\n")
-	for _, f := range seed.ConfirmedFacts {
+	facts := seed.ConfirmedFacts
+	if omitted := len(facts) - entrySeedFactCap; omitted > 0 {
+		facts = facts[omitted:] // sorted by id ASC → keep the newest
+		fmt.Fprintf(&b, "（另有 %d 条更早的相关事实未列出，需要时用 list_facts / node_detail 查）\n", omitted)
+	}
+	for _, f := range facts {
 		conf := f.Confidence
 		if conf == "" {
 			conf = "confirmed"
@@ -382,7 +402,7 @@ func RenderWorkerEntrySeed(seed WorkerEntrySeed) string {
 		}
 		b.WriteByte('\n')
 		if d := strings.TrimSpace(f.Detail); d != "" {
-			fmt.Fprintf(&b, "  细节：%s\n", d)
+			fmt.Fprintf(&b, "  细节：%s\n", clipRunes(d, entrySeedDetailCap))
 		}
 	}
 
