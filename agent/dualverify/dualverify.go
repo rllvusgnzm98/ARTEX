@@ -206,6 +206,10 @@ type Result struct {
 func allowed(o Observation) bool { return o.Status >= 200 && o.Status < 300 }
 func denied(o Observation) bool  { return o.Status == 401 || o.Status == 403 }
 
+func recorded(o Observation) bool {
+	return !o.NotExecuted && !o.OutOfScope && o.Scope == ScopeIn && !o.ProxyBypass
+}
+
 func assess(o Observation, exists bool) (bool, string) {
 	if !exists {
 		return false, "缺少观察，未执行/未验证"
@@ -312,17 +316,18 @@ func Evaluate(p Plan, observations []Observation) (Result, error) {
 		r.Reason = "B 状态与标记矛盾，未验证"
 	}
 	if r.Verdict != FalsePositive {
+		publicPrivate := recorded(pub.Observation) && !pub.Observation.MarkerSeen
 		kept := r.Defects[:0]
 		for _, d := range r.Defects {
 			switch d.Kind {
 			case "cross-tenant":
 				// 跨租户缺陷依赖标记确属 A 的私有数据：需公开排除控制成立且 A 正向控制成立
-				if pub.Pass && a.Pass {
+				if publicPrivate && a.Pass {
 					kept = append(kept, d)
 				}
 			case "token-trust":
-				// 令牌信任缺陷只在资源确实非公开（公开被正确拒绝）时才有意义
-				if pub.Pass {
+				// 令牌信任缺陷需要已记录的公开请求未泄露标记
+				if publicPrivate {
 					kept = append(kept, d)
 				}
 			default:

@@ -398,6 +398,7 @@ func TestDualVerifyDefectControls(t *testing.T) {
 		crossTenant, tokenTrust int
 	}{
 		{"sound controls", func([]Observation) {}, 1, 1},
+		{"public 404", func(o []Observation) { change(o, "public", func(o *Observation) { o.Status = 404 }) }, 1, 1},
 		{"owner denied", func(o []Observation) { change(o, "owner", func(o *Observation) { o.Status = 403 }) }, 0, 1},
 		{"owner marker absent", func(o []Observation) { change(o, "owner", func(o *Observation) { o.MarkerSeen = false }) }, 0, 1},
 		{"public marker", func(o []Observation) {
