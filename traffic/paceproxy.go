@@ -75,7 +75,7 @@ func (pp *PaceProxy) SetUpstreamProxy(raw string) error {
 	}
 	if u.Port() == "" {
 		if dp := defaultProxyPort(u.Scheme); dp != "" {
-			u.Host = net.JoinHostPort(u.Host, dp)
+			u.Host = net.JoinHostPort(u.Hostname(), dp)
 		}
 	}
 	pp.upstream.Store(u)

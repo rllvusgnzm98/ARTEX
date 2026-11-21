@@ -193,6 +193,8 @@ func TestPaceProxyUpstreamDefaultPort(t *testing.T) {
 		"https://proxy":     "proxy:443",
 		"socks5://proxy":    "proxy:1080",
 		"http://proxy:3128": "proxy:3128",
+		"http://[::1]":      "[::1]:80",
+		"http://[::1]:3128": "[::1]:3128",
 	} {
 		if err := pp.SetUpstreamProxy(raw); err != nil {
 			t.Fatalf("%s: %v", raw, err)
