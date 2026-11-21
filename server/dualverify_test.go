@@ -162,7 +162,7 @@ func TestDualVerifyReplay(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if r.Verdict != tc.want || len(r.TokenDefects) != tc.defects {
+			if r.Verdict != tc.want || len(r.Defects) != tc.defects {
 				t.Fatalf("%+v", r)
 			}
 			probe := dualVerifyObservation(t, o, "probe")

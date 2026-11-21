@@ -71,7 +71,7 @@ func (s *Server) dualVerifyTools() []actool.CoreTool {
 	}
 	return []actool.CoreTool{actool.Build(actool.Spec{
 		Name:        "dual_account_verify",
-		Description: "有界双账号访问控制验证：只传凭据 ID，经任务记录代理执行公开/A/B 控制对；缺失令牌、范围或记录时诚实标记未验证。仅 verified 或独立令牌缺陷可用 recommended_findings 调用 report_finding；controls_hold 本身不是漏洞。写入须操作员授权并成对清理。",
+		Description: "有界双账号访问控制验证：只传凭据 ID，经任务记录代理执行公开/A/B 控制对；缺失令牌、范围或记录时诚实标记未验证。仅 verified 或独立令牌/跨租户缺陷可用 recommended_findings 调用 report_finding；controls_hold 本身不是漏洞。写入须操作员授权并成对清理。",
 		Schema:      dualVerifySchema(), ReadOnly: func(json.RawMessage) bool { return false }, Permissions: sessionPerm,
 		Run: func(ctx context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
 			return s.executeDualVerify(ctx, in)
@@ -330,21 +330,25 @@ func (s *Server) executeDualVerify(ctx context.Context, in json.RawMessage) (act
 	if result.Verdict == dualverify.Verified {
 		addFinding("idor", "B 读取到 A 私有资源的唯一标记（双账号对照已验证）")
 	}
-	for _, defect := range result.TokenDefects {
-		addFinding("token-trust", defect.Actor+" 应拒绝令牌被接受（令牌信任缺陷）")
+	for _, defect := range result.Defects {
+		if defect.Kind == "cross-tenant" {
+			addFinding("idor", defect.Actor+" 跨租户读取到 A 的私有标记（跨租户访问控制缺陷）")
+		} else {
+			addFinding("token-trust", defect.Actor+" 应拒绝令牌被接受（令牌信任缺陷）")
+		}
 	}
 	var recommended any
 	if len(recommendations) > 0 {
 		recommended = recommendations[0]
 	}
-	return jsonResult(map[string]any{"verdict": result.Verdict, "reason": result.Reason, "report": report, "token_defects": result.TokenDefects, "steps": summaries, "recommended_finding": recommended, "recommended_findings": recommendations, "finding_id": parseProfileID(a.FindingID), "evidence_binding_notes": bindNotes, "write_not_attempted": plan.WriteNotAttempted, "recording_proxy_configured": addr != ""})
+	return jsonResult(map[string]any{"verdict": result.Verdict, "reason": result.Reason, "report": report, "defects": result.Defects, "steps": summaries, "recommended_finding": recommended, "recommended_findings": recommendations, "finding_id": parseProfileID(a.FindingID), "evidence_binding_notes": bindNotes, "write_not_attempted": plan.WriteNotAttempted, "recording_proxy_configured": addr != ""})
 }
 
 func (s *Server) bindDualVerifyTraffic(ctx context.Context, taskID, findingID int64, p dualverify.Plan, r dualverify.Result, start, end time.Time, proxied bool) []string {
 	if !proxied {
 		return []string{"proxy-bypass：无记录代理，未绑定流量证据"}
 	}
-	if r.Verdict != dualverify.Verified && len(r.TokenDefects) == 0 {
+	if r.Verdict != dualverify.Verified && len(r.Defects) == 0 {
 		return []string{"非已验证漏洞，未绑定流量证据"}
 	}
 	f, err := s.m.pg.GetFinding(findingID)

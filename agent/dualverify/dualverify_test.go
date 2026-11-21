@@ -288,10 +288,10 @@ func TestTokensAndPublicPrecedence(t *testing.T) {
 			if actor == "none" {
 				want = 0
 			}
-			if len(r.TokenDefects) != want {
+			if len(r.Defects) != want {
 				t.Fatal(r)
 			}
-			if want == 1 && (r.TokenDefects[0].Actor != actor || r.TokenDefects[0].Verdict != Verified) {
+			if want == 1 && (r.Defects[0].Actor != actor || r.Defects[0].Kind != "token-trust" || r.Defects[0].Verdict != Verified) {
 				t.Fatal(r)
 			}
 		})
@@ -302,7 +302,7 @@ func TestTokensAndPublicPrecedence(t *testing.T) {
 		o[i].MarkerSeen = true
 	}
 	r, err := Evaluate(p, o)
-	if err != nil || r.Verdict != FalsePositive || len(r.TokenDefects) != 0 {
+	if err != nil || r.Verdict != FalsePositive || len(r.Defects) != 0 {
 		t.Fatalf("%+v %v", r, err)
 	}
 	for _, flag := range []string{"scope", "bypass", "skip", "ambiguous"} {
@@ -322,8 +322,46 @@ func TestTokensAndPublicPrecedence(t *testing.T) {
 				}
 			})
 			r, err := Evaluate(p, o)
-			if err != nil || len(r.TokenDefects) != 0 {
+			if err != nil || len(r.Defects) != 0 {
 				t.Fatalf("%+v %v", r, err)
+			}
+		})
+	}
+}
+
+func TestDualVerifyCrossTenantDefects(t *testing.T) {
+	s := testSpec()
+	s.TenantRole = true
+	s.SessionToken = true
+	p := testPlan(t, s)
+	for _, tc := range []struct {
+		name                      string
+		marker, untrusted, public bool
+		want                      int
+	}{
+		{"private marker leaked", true, false, false, 1},
+		{"empty tenant view", false, false, false, 0},
+		{"unrecorded leak", true, true, false, 0},
+		{"public data", true, false, true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := baseline(p)
+			change(o, "tenant", func(o *Observation) { o.Status = 200; o.MarkerSeen = tc.marker; o.ProxyBypass = tc.untrusted })
+			if tc.public {
+				change(o, "public", func(o *Observation) { o.Status = 200; o.MarkerSeen = true })
+			}
+			r, err := Evaluate(p, o)
+			if err != nil || len(r.Defects) != tc.want {
+				t.Fatalf("%+v %v", r, err)
+			}
+			if tc.want == 1 {
+				d := r.Defects[0]
+				if d.Actor != "B_other_tenant" || d.Kind != "cross-tenant" || d.Verdict != Verified || r.Verdict != ControlsHold {
+					t.Fatal(r)
+				}
+				if !strings.Contains(Report(r, p), "B_other_tenant (cross-tenant)") {
+					t.Fatal("report omitted defect kind")
+				}
 			}
 		})
 	}

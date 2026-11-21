@@ -183,17 +183,18 @@ type StepResult struct {
 	Reason        string
 }
 
-type TokenResult struct {
+type Defect struct {
 	Actor   string
+	Kind    string
 	Verdict Verdict
 	Reason  string
 }
 
 type Result struct {
-	Verdict      Verdict
-	Reason       string
-	Steps        []StepResult
-	TokenDefects []TokenResult
+	Verdict Verdict
+	Reason  string
+	Steps   []StepResult
+	Defects []Defect
 }
 
 func allowed(o Observation) bool { return o.Status >= 200 && o.Status < 300 }
@@ -279,15 +280,18 @@ func Evaluate(p Plan, observations []Observation) (Result, error) {
 		byID[s.ID] = sr
 		if s.Actor == "B_expired" || s.Actor == "B_revoked" || s.Actor == "B_wrong_issuer" {
 			if trusted && s.Expect == Deny && allowed(o) {
-				r.TokenDefects = append(r.TokenDefects, TokenResult{s.Actor, Verified, "应拒绝的令牌被接受"})
+				r.Defects = append(r.Defects, Defect{Actor: s.Actor, Kind: "token-trust", Verdict: Verified, Reason: "应拒绝的令牌被接受"})
 			}
+		}
+		if s.Actor == "B_other_tenant" && trusted && s.Expect == Deny && allowed(o) && o.MarkerSeen {
+			r.Defects = append(r.Defects, Defect{Actor: s.Actor, Kind: "cross-tenant", Verdict: Verified, Reason: "跨租户会话读取到 A 的私有标记"})
 		}
 	}
 	pub, a, b := byID["public"], byID["owner"], byID["probe"]
 	switch {
 	case pub.Trusted && allowed(pub.Observation) && pub.Observation.MarkerSeen:
 		r.Verdict, r.Reason = FalsePositive, "公开请求可读取标记：公开数据，不是访问控制漏洞"
-		r.TokenDefects = nil
+		r.Defects = nil
 	case !pub.Trusted || !pub.Pass:
 		r.Reason = "公开数据排除控制缺失：" + pub.Reason
 	case !a.Trusted || !a.Pass:
@@ -358,8 +362,8 @@ func Report(r Result, p Plan) string {
 			fmt.Fprintf(&b, "  - %s：成功响应=%t；仅响应，持久化/清理结果未独立验证。\n", s.ID, sr.Trusted && sr.Pass)
 		}
 	}
-	for _, t := range r.TokenDefects {
-		fmt.Fprintf(&b, "- 令牌信任缺陷 %s：%s（%s）\n", t.Actor, t.Verdict, t.Reason)
+	for _, t := range r.Defects {
+		fmt.Fprintf(&b, "- 访问控制缺陷 %s (%s)：%s（%s）\n", t.Actor, t.Kind, t.Verdict, t.Reason)
 	}
 	b.WriteString("- 明确未验证：未运行的检查族、读证据之外的写权限、响应以外的副作用。\n")
 	return b.String()
