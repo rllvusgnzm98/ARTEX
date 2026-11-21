@@ -235,3 +235,34 @@ func TestForIntentPrimaryTruncation(t *testing.T) {
 		t.Fatalf("primary skeleton truncation failed: %s", out)
 	}
 }
+
+func TestAmbiguousLatinKeywordBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		summary string
+		want    string
+	}{
+		{"seven-day log retention", ""},
+		{"SQL injection in disaster recovery", "web"},
+		{"n-day patch validation", "patch"},
+		{"Run SAST for SQL injection", "audit"},
+		{"N-day补丁分析", "patch"},
+		{"SAST代码审计", "audit"},
+		{"n-days", ""},
+		{"sast_report", ""},
+		{"seven-day then n-day", "patch"},
+		{"disaster then SAST", "audit"},
+	} {
+		t.Run(tc.summary, func(t *testing.T) {
+			out := ForIntent(payload(t, map[string]any{"summary": tc.summary}))
+			if tc.want == "" {
+				if out != "" {
+					t.Fatalf("unexpected skeleton: %s", out)
+				}
+				return
+			}
+			if !strings.Contains(out, `category="`+tc.want+`"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+				t.Fatalf("want primary %s, got %s", tc.want, out)
+			}
+		})
+	}
+}

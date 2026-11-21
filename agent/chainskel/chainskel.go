@@ -113,6 +113,28 @@ var keywordRules = []struct {
 	{"pivot", []string{"隧道", "代理", "横向", "内网", "穿透", "socks", "chisel", "frp", "端口转发", "跳板", "立足点", "webshell"}},
 }
 
+func matchesKeyword(text, keyword string) bool {
+	if keyword != "n-day" && keyword != "sast" {
+		return strings.Contains(text, keyword)
+	}
+	isTokenByte := func(b byte) bool {
+		return b >= 'a' && b <= 'z' || b >= '0' && b <= '9' || b == '_'
+	}
+	for offset := 0; offset < len(text); {
+		idx := strings.Index(text[offset:], keyword)
+		if idx < 0 {
+			return false
+		}
+		start := offset + idx
+		end := start + len(keyword)
+		if (start == 0 || !isTokenByte(text[start-1])) && (end == len(text) || !isTokenByte(text[end])) {
+			return true
+		}
+		offset = end
+	}
+	return false
+}
+
 // Match 是回退关键词匹配器:从自由文本(意图 summary / vulnclass)推出至多
 // MaxTagsPerIntent 个类别,无任何命中返回 nil(调用方静默不注入)。
 func Match(text string) []string {
@@ -123,7 +145,7 @@ func Match(text string) []string {
 	var out []string
 	for _, r := range keywordRules {
 		for _, kw := range r.keywords {
-			if strings.Contains(text, kw) {
+			if matchesKeyword(text, kw) {
 				out = append(out, r.cat)
 				break
 			}
