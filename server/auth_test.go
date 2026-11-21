@@ -3,6 +3,8 @@ package server
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -80,5 +82,69 @@ func TestValidatePassword(t *testing.T) {
 				t.Fatalf("validatePassword(%q)=%q, wantErr=%v", tc.pw, got, tc.wantErr)
 			}
 		})
+	}
+}
+
+// /api/auth/init 不经 requireAuth，没有初始化令牌时任何能连上端口的人都能抢先
+// 设置管理员密码。这里在真实库上走完整流程：无令牌/错令牌必须 403 且不落库，
+// 正确令牌成功后令牌作废、文件删除。
+func TestAuthInitRequiresSetupToken(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v)", err)
+	}
+	defer m.Close()
+	if hash, _, err := m.pg.GetSetting(authPassKey); err != nil {
+		t.Skipf("postgres unavailable (%v)", err)
+	} else if hash != "" {
+		t.Skip("开发库已设置管理员密码，跳过以免改动它")
+	}
+	defer func() { _, _ = m.pg.Exec(`DELETE FROM settings WHERE key=$1`, authPassKey) }()
+
+	keyDir := t.TempDir()
+	s := &Server{m: m, jwtKey: []byte(strings.Repeat("k", 32))}
+	s.initSetupToken(keyDir)
+	tokPath := filepath.Join(keyDir, setupTokenFilename)
+	raw, err := os.ReadFile(tokPath)
+	if err != nil {
+		t.Fatalf("未设置密码时应生成 %s: %v", setupTokenFilename, err)
+	}
+	setupTok := strings.TrimSpace(string(raw))
+
+	post := func(body string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/api/auth/init", strings.NewReader(body))
+		req.RemoteAddr = "203.0.113.7:4444"
+		s.authInit(w, req)
+		return w
+	}
+	for name, body := range map[string]string{
+		"无令牌": `{"password":"correct horse battery"}`,
+		"错令牌": `{"password":"correct horse battery","setup_token":"deadbeef"}`,
+	} {
+		if w := post(body); w.Code != 403 || strings.Contains(w.Body.String(), `"token"`) {
+			t.Fatalf("%s: status=%d body=%s, want 403 无 token", name, w.Code, w.Body.String())
+		}
+		if hash, _, _ := m.pg.GetSetting(authPassKey); hash != "" {
+			t.Fatalf("%s: 被拒绝的请求不应写入密码", name)
+		}
+	}
+
+	w := post(`{"password":"correct horse battery","setup_token":"` + setupTok + `"}`)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"token"`) {
+		t.Fatalf("正确令牌应成功: status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(tokPath); !os.IsNotExist(err) {
+		t.Fatalf("成功初始化后应删除 %s", setupTokenFilename)
+	}
+	if s.checkSetupToken(setupTok) {
+		t.Fatal("令牌用过后应作废")
+	}
+}
+
+func TestCheckSetupTokenFailsClosedWithoutServerToken(t *testing.T) {
+	s := &Server{}
+	if s.checkSetupToken("") || s.checkSetupToken("anything") {
+		t.Fatal("服务端没有令牌时必须拒绝")
 	}
 }

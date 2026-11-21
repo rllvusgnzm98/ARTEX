@@ -224,7 +224,8 @@ func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"initialized": hash != ""})
 }
 
-// POST /api/auth/init — sets the password for the first time; rejected if already set.
+// POST /api/auth/init — sets the password for the first time; rejected if already set
+// or if the one-time setup token (see setup_token.go) is missing or wrong.
 func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
@@ -240,9 +241,18 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Password string `json:"password"`
+		Password   string `json:"password"`
+		SetupToken string `json:"setup_token"`
 	}
-	if err := decode(r, &req); err != nil || req.Password == "" {
+	if err := decode(r, &req); err != nil {
+		writeErr(w, 400, "请求格式错误")
+		return
+	}
+	if !s.checkSetupToken(req.SetupToken) {
+		writeErr(w, 403, "初始化令牌无效：请查看服务端启动日志或 "+setupTokenFilename+" 文件")
+		return
+	}
+	if req.Password == "" {
 		writeErr(w, 400, "密码不能为空")
 		return
 	}
@@ -267,6 +277,7 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "密码已设置")
 		return
 	}
+	s.consumeSetupToken()
 	tok, _, err := s.issueToken()
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")

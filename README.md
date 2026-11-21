@@ -115,6 +115,8 @@ cd ARTEX
 
 装好后打开 **http://localhost:8787**（首次进入 `/setup` 设置管理员密码）。
 
+> 首次设置密码需要一次性**初始化令牌**：未设置密码时，服务启动会把令牌打印到日志（`docker compose logs artex | grep 初始化令牌`），并写入程序目录下的 `setup.token`；在 `/setup` 页填入即可，设置成功后令牌自动作废。这样即便 8787 暴露在网络上，别人也无法抢先设置管理员密码。
+
 ### 方式二：Docker Compose（手动）
 
 ```bash
