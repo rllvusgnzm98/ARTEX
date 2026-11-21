@@ -489,7 +489,10 @@ func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
 	var caFile string
 	if spec.UseRecordingProxy {
 		if addr := s.m.ProxyAddr(); addr != "" {
-			proxyStr = "http://" + addr
+			proxyStr = addr
+			if !strings.Contains(addr, "://") {
+				proxyStr = "http://" + addr
+			}
 			caFile = s.m.ProxyCACert()
 		}
 	}
