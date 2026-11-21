@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -102,6 +103,8 @@ func validateRequest(r Request, read bool) error {
 	return nil
 }
 
+var markerPattern = regexp.MustCompile(`^[A-Za-z0-9._~-]+$`)
+
 // BuildPlan 始终生成公开、所有者、跨账号三个读对照。Read 为 false 时
 // 这些仍是其他检查族的必要控制；未选择任何检查族则拒绝空计划。
 func BuildPlan(s Spec) (Plan, error) {
@@ -110,6 +113,9 @@ func BuildPlan(s Spec) (Plan, error) {
 	}
 	if strings.TrimSpace(s.Marker) == "" || strings.TrimSpace(s.ResourceID) == "" {
 		return Plan{}, fmt.Errorf("marker/resource ID 不能为空")
+	}
+	if !markerPattern.MatchString(s.Marker) {
+		return Plan{}, fmt.Errorf("marker 含非法字符，只允许字母数字及 ._~-")
 	}
 	if err := validateRequest(s.Target, true); err != nil {
 		return Plan{}, err

@@ -91,12 +91,12 @@ func TestDualVerifyProvidedMarker(t *testing.T) {
 	if !strings.Contains(string(raw), "write + allow_write") {
 		t.Fatalf("missing tool error: %s", raw)
 	}
-	for _, marker := range []string{"short", "marker{{bad}}", "marker\nbad", "marker\rbad", strings.Repeat("x", 257), strings.Repeat("界", 86)} {
+	for _, marker := range []string{"short", "marker{{bad}}", "marker\nbad", "marker\rbad", `marker"bad`, `marker\bad`, "marker:bad", "marker bad", strings.Repeat("x", 257), strings.Repeat("界", 8)} {
 		if _, err := dualVerifyMarker(dualVerifyInput{Marker: marker}); err == nil {
 			t.Errorf("accepted invalid marker %q", marker)
 		}
 	}
-	for _, marker := range []string{strings.Repeat("界", 8), strings.Repeat("x", 256)} {
+	for _, marker := range []string{"artex-mark-0123456789abcdef", "Alphanumeric123", "safe._~-marker", strings.Repeat("x", 256)} {
 		if got, err := dualVerifyMarker(dualVerifyInput{Marker: marker}); err != nil || got != marker {
 			t.Fatalf("valid marker rejected: %v", err)
 		}

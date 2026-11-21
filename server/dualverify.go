@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/Autumn-27/artex/agent"
@@ -179,12 +180,14 @@ func dualVerifyInputHasSecret(in any, secrets map[string]string) bool {
 	return false
 }
 
+var dualVerifyMarkerPattern = regexp.MustCompile(`^[A-Za-z0-9._~-]{8,256}$`)
+
 func dualVerifyMarker(a dualVerifyInput) (string, error) {
 	provided := strings.TrimSpace(a.Marker)
 	willPlant := a.Write && a.AllowWrite
 	if provided != "" {
-		if strings.ContainsAny(provided, "{}\r\n") || len([]rune(provided)) < 8 || len(provided) > 256 {
-			return "", errors.New("marker 必须至少 8 个字符、最多 256 字节，且不能包含花括号或换行")
+		if !dualVerifyMarkerPattern.MatchString(provided) {
+			return "", errors.New("marker 必须为 8..256 个字符，且只能包含字母、数字、._~-（不得含引号、反斜杠、花括号、冒号或空白）")
 		}
 		return provided, nil
 	}

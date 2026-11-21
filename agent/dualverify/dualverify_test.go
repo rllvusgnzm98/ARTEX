@@ -61,6 +61,27 @@ func TestNewMarker(t *testing.T) {
 	}
 }
 
+func TestDualVerifyMarkerCharset(t *testing.T) {
+	for _, marker := range []string{`marker"bad`, `marker\bad`, "marker:bad", "marker bad", "marker{bad}", "marker\nbad"} {
+		s := testSpec()
+		s.Marker = marker
+		if _, err := BuildPlan(s); err == nil {
+			t.Fatalf("accepted unsafe marker %q", marker)
+		}
+	}
+	generated, err := NewMarker()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{generated, "Alphanumeric123", "safe._~-marker"} {
+		s := testSpec()
+		s.Marker = marker
+		if _, err := BuildPlan(s); err != nil {
+			t.Fatalf("rejected safe marker %q: %v", marker, err)
+		}
+	}
+}
+
 func TestPlanMatrix(t *testing.T) {
 	s := testSpec()
 	s.Write = true
