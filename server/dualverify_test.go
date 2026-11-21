@@ -431,10 +431,13 @@ func TestDualVerifyClientAndSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"target", "plant", "cleanup", "a_credential_id", "b_credential_id", "b_expired_credential_id", "b_revoked_credential_id", "b_wrong_issuer_credential_id", "b_other_tenant_credential_id", "resource_id", "read", "write", "session_token", "tenant_role", "allow_write", "asset_ids", "finding_id"} {
+	for _, key := range []string{"target", "plant", "cleanup", "a_credential_id", "b_credential_id", "b_expired_credential_id", "b_revoked_credential_id", "b_wrong_issuer_credential_id", "b_other_tenant_credential_id", "resource_id", "marker", "read", "write", "session_token", "tenant_role", "allow_write", "asset_ids"} {
 		if !strings.Contains(string(raw), `"`+key+`"`) {
 			t.Fatal("schema missing", key)
 		}
+	}
+	if strings.Contains(string(raw), `"finding_id"`) {
+		t.Fatal("obsolete finding_id input remains")
 	}
 }
 
@@ -476,22 +479,5 @@ func TestDualVerifyTemplateValidation(t *testing.T) {
 	}
 	if dualVerifyInputHasSecret(map[string]any{"headers": map[string]any{"Authorization": "{{AUTH}}"}}, secrets) {
 		t.Fatal("safe template rejected")
-	}
-}
-
-func TestDualVerifyTraceMatching(t *testing.T) {
-	for _, tc := range []struct {
-		raw  string
-		want bool
-	}{
-		{"GET / HTTP/1.1\r\nX-Artex-Dualverify: marker:probe\r\n\r\n", true},
-		{"GET / HTTP/1.1\nx-artex-dualverify: marker:probe\n\n", true},
-		{"GET / HTTP/1.1\nX-Artex-Dualverify: marker:owner\n\n", false},
-		{"GET / HTTP/1.1\n\nX-Artex-Dualverify: marker:probe", false},
-		{"GET / HTTP/1.1\nX-Artex-Dualverify: marker:probe\nX-Artex-Dualverify: marker:probe\n\n", false},
-	} {
-		if got := dualVerifyTraceMatches(tc.raw, "marker:probe"); got != tc.want {
-			t.Errorf("match=%t want=%t", got, tc.want)
-		}
 	}
 }

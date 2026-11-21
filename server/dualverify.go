@@ -4,15 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/agent/dualverify"
-	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/guard"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -36,7 +33,6 @@ type dualVerifyInput struct {
 	AllowWrite   bool               `json:"allow_write"`
 	AssetIDs     []int64            `json:"asset_ids"`
 	VulnClass    string             `json:"vulnclass"`
-	FindingID    json.RawMessage    `json:"finding_id"`
 }
 
 func dualVerifySchema() map[string]any {
@@ -55,8 +51,8 @@ func dualVerifySchema() map[string]any {
 		"asset_ids":   map[string]any{"type": "array", "items": map[string]any{"type": "integer"}},
 		"vulnclass":   strParam("可选漏洞分类；默认 idor 或 token-trust"),
 	}
-	for _, key := range []string{"a_credential_id", "b_credential_id", "b_expired_credential_id", "b_revoked_credential_id", "b_wrong_issuer_credential_id", "b_other_tenant_credential_id", "finding_id"} {
-		props[key] = map[string]any{"anyOf": []any{map[string]any{"type": "integer", "minimum": 1}, map[string]any{"type": "string", "pattern": "^[1-9][0-9]*$"}}, "description": "本任务或有效继承的凭据 ID（finding_id 为本任务漏洞 ID）；不接受秘密"}
+	for _, key := range []string{"a_credential_id", "b_credential_id", "b_expired_credential_id", "b_revoked_credential_id", "b_wrong_issuer_credential_id", "b_other_tenant_credential_id"} {
+		props[key] = map[string]any{"anyOf": []any{map[string]any{"type": "integer", "minimum": 1}, map[string]any{"type": "string", "pattern": "^[1-9][0-9]*$"}}, "description": "本任务或有效继承的凭据 ID；不接受秘密"}
 	}
 	for _, key := range []string{"read", "write", "session_token", "tenant_role", "allow_write"} {
 		props[key] = map[string]any{"type": "boolean", "default": key == "read"}
@@ -295,9 +291,7 @@ func (s *Server) executeDualVerify(ctx context.Context, in json.RawMessage) (act
 			return dualverify.ScopeEmpty, false
 		}
 	}
-	start := time.Now()
 	observations, runErr := runDualVerify(ctx, client, plan, secrets, scopeOf, addr != "")
-	end := time.Now()
 	if runErr != nil {
 		plan.Notes = append(plan.Notes, runErr.Error())
 	}
@@ -305,20 +299,13 @@ func (s *Server) executeDualVerify(ctx context.Context, in json.RawMessage) (act
 	if err != nil {
 		return actool.Errorf("验证结果计算失败"), nil
 	}
-	bindNotes := []string{"未提供 finding_id；使用 recommended_finding 调用 report_finding，非漏洞结论不得提交。"}
-	if len(a.FindingID) > 0 && string(a.FindingID) != "null" {
-		if fid := parseProfileID(a.FindingID); fid > 0 {
-			bindNotes = s.bindDualVerifyTraffic(ctx, taskID, fid, plan, result, start, end, addr != "")
-		} else {
-			bindNotes = []string{"finding_id 无效，未绑定证据"}
-		}
-	}
-	plan.Notes = append(plan.Notes, bindNotes...)
+	evidenceHint := "未自动绑定证据。请求携带 X-Artex-Dualverify: " + marker + ":<step_id>；从 recommended_findings 提交 report_finding 后，通过 traffic_search → traffic_get → bind_finding_traffic 定位并绑定完全匹配的已记录交换；未记录或无法确认的流量不得绑定。"
+	plan.Notes = append(plan.Notes, evidenceHint)
 	report := dualverify.Report(result, plan)
 	summaries := []map[string]any{}
 	for i, sr := range result.Steps {
 		step := plan.Steps[i]
-		summaries = append(summaries, map[string]any{"step_id": step.ID, "actor": step.Actor, "action": step.Action, "expect": step.Expect, "require_marker": step.RequireMarker, "status": sr.Observation.Status, "marker": sr.Observation.MarkerSeen, "pass": sr.Pass, "trusted": sr.Trusted, "scope": sr.Observation.Scope, "out_of_scope": sr.Observation.OutOfScope, "proxy_bypass": sr.Observation.ProxyBypass, "not_executed": sr.Observation.NotExecuted, "reason": sr.Reason})
+		summaries = append(summaries, map[string]any{"step_id": step.ID, "actor": step.Actor, "action": step.Action, "expect": step.Expect, "require_marker": step.RequireMarker, "status": sr.Observation.Status, "marker": sr.Observation.MarkerSeen, "pass": sr.Pass, "trusted": sr.Trusted, "scope": sr.Observation.Scope, "out_of_scope": sr.Observation.OutOfScope, "proxy_bypass": sr.Observation.ProxyBypass, "not_executed": sr.Observation.NotExecuted, "reason": sr.Reason, "trace": step.Request.Headers[dualVerifyTraceHeader]})
 	}
 	recommendations := []map[string]any{}
 	addFinding := func(class, summary string) {
@@ -341,100 +328,5 @@ func (s *Server) executeDualVerify(ctx context.Context, in json.RawMessage) (act
 	if len(recommendations) > 0 {
 		recommended = recommendations[0]
 	}
-	return jsonResult(map[string]any{"verdict": result.Verdict, "reason": result.Reason, "report": report, "defects": result.Defects, "steps": summaries, "recommended_finding": recommended, "recommended_findings": recommendations, "finding_id": parseProfileID(a.FindingID), "evidence_binding_notes": bindNotes, "write_not_attempted": plan.WriteNotAttempted, "recording_proxy_configured": addr != ""})
-}
-
-func (s *Server) bindDualVerifyTraffic(ctx context.Context, taskID, findingID int64, p dualverify.Plan, r dualverify.Result, start, end time.Time, proxied bool) []string {
-	if !proxied {
-		return []string{"proxy-bypass：无记录代理，未绑定流量证据"}
-	}
-	if r.Verdict != dualverify.Verified && len(r.Defects) == 0 {
-		return []string{"非已验证漏洞，未绑定流量证据"}
-	}
-	f, err := s.m.pg.GetFinding(findingID)
-	if err != nil || f == nil || f.TaskID == nil || *f.TaskID != taskID {
-		return []string{"finding_id 不属于本任务或无法读取，未绑定证据"}
-	}
-	if s.m.traffic == nil {
-		return []string{"流量存储不可用，未绑定证据"}
-	}
-	notes := []string{}
-	refs := []db.TrafficRef{}
-	used := map[string]bool{}
-	for i, step := range p.Steps {
-		sr := r.Steps[i]
-		if !sr.Trusted || sr.Observation.Status == 0 {
-			continue
-		}
-		u, err := url.Parse(step.Request.URL)
-		if err != nil {
-			continue
-		}
-		matches := []string{}
-		searchOK := true
-		for page := 0; page < 4; page++ {
-			rows, err := s.m.traffic.Search(u.Hostname(), page, 500)
-			if err != nil {
-				searchOK = false
-				break
-			}
-			for _, row := range rows {
-				if row.TS < start.Unix() || row.TS > end.Unix() || row.Method != step.Request.Method || row.URL != step.Request.URL || row.Status != sr.Observation.Status {
-					continue
-				}
-				req, _, err := s.m.traffic.Get(row.ID)
-				if err == nil && dualVerifyTraceMatches(req, p.Marker+":"+step.ID) {
-					matches = append(matches, row.ID)
-				}
-			}
-			if len(rows) < 500 {
-				break
-			}
-			if page == 3 {
-				searchOK = false
-			}
-		}
-		if !searchOK || len(matches) != 1 || used[matches[0]] {
-			notes = append(notes, fmt.Sprintf("%s：无法唯一关联记录流量，已跳过绑定", step.ID))
-			continue
-		}
-		role := "supporting"
-		switch step.ID {
-		case "public":
-			role = "baseline"
-		case "owner":
-			role = "verification"
-		case "probe":
-			role = "proof"
-		case "B_expired", "B_revoked", "B_wrong_issuer":
-			role = "verification"
-			if sr.Observation.Status >= 200 && sr.Observation.Status < 300 {
-				role = "proof"
-			}
-		}
-		used[matches[0]] = true
-		refs = append(refs, db.TrafficRef{TrafficID: matches[0], Role: role, Note: "dual_account_verify " + step.ID})
-	}
-	if len(refs) == 0 {
-		return append(notes, "未找到可确信关联的流量；未绑定证据")
-	}
-	if _, err := s.evidenceStore().Bind(ctx, findingID, refs); err != nil {
-		return append(notes, "证据绑定失败；验证结论保留，未声称绑定成功")
-	}
-	return append(notes, fmt.Sprintf("已向 finding_id=%d 绑定 %d 条唯一关联的流量证据", findingID, len(refs)))
-}
-
-func dualVerifyTraceMatches(raw, want string) bool {
-	header, _, _ := strings.Cut(strings.ReplaceAll(raw, "\r\n", "\n"), "\n\n")
-	count := 0
-	for _, line := range strings.Split(header, "\n") {
-		key, value, ok := strings.Cut(line, ":")
-		if ok && strings.EqualFold(strings.TrimSpace(key), dualVerifyTraceHeader) {
-			if strings.TrimSpace(value) != want {
-				return false
-			}
-			count++
-		}
-	}
-	return count == 1
+	return jsonResult(map[string]any{"verdict": result.Verdict, "reason": result.Reason, "report": report, "defects": result.Defects, "steps": summaries, "recommended_finding": recommended, "recommended_findings": recommendations, "evidence_hint": evidenceHint, "write_not_attempted": plan.WriteNotAttempted, "recording_proxy_configured": addr != ""})
 }
