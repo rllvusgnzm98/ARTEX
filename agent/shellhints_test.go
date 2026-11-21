@@ -70,7 +70,7 @@ func TestWorkerSystemShellCLIRulesAreCodeTail(t *testing.T) {
 	t.Cleanup(func() { PromptOverride = nil })
 	PromptOverride = nil
 
-	off := workerSystem("", "", "/data", "/data", false)
+	off := workerSystem("", "", "/data", "/data", false, DefaultFootprint())
 	if !strings.Contains(off, "CLI 优先") {
 		t.Fatalf("always-on CLI discipline missing:\n%s", off)
 	}
@@ -89,7 +89,7 @@ func TestWorkerSystemShellCLIRulesAreCodeTail(t *testing.T) {
 		}
 	}
 
-	on := workerSystem("", "", "/data", "/data", true)
+	on := workerSystem("", "", "/data", "/data", true, DefaultFootprint())
 	if !strings.Contains(on, "CLI 优先") || !strings.Contains(on, "Bash 说明里已列出") {
 		t.Fatalf("CLI discipline must remain during intranet phase:\n%s", on)
 	}
@@ -107,7 +107,7 @@ func TestWorkerSystemShellCLIRulesAreCodeTail(t *testing.T) {
 		}
 		return "", false
 	}
-	overridden := workerSystem("", "", "/data", "/data", false)
+	overridden := workerSystem("", "", "/data", "/data", false, DefaultFootprint())
 	if !strings.HasPrefix(overridden, "仅正文") {
 		t.Fatalf("worker body should honor override: %q", overridden)
 	}

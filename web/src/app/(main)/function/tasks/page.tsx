@@ -3087,6 +3087,11 @@ function CreateTaskSheet({
   const [heartbeatMin, setHeartbeatMin] = React.useState("10"); // planner 心跳(分钟);默认10,下限10(与后端一致)
   const [seedFirstIntent, setSeedFirstIntent] = React.useState(false); // 创建时下发种子意图,worker 免等首轮 planner 直接开跑;默认关闭,走标准先规划再执行
   const [coverageEnabled, setCoverageEnabled] = React.useState(true); // 资产覆盖度功能;默认开。关闭=不计算/展示覆盖度、不累积范围、隐藏范围类工具(company 关联不受影响)
+  const [footprintPace, setFootprintPace] = React.useState(true);
+  const [footprintMinTouch, setFootprintMinTouch] = React.useState(true);
+  const [footprintNoDirtyData, setFootprintNoDirtyData] = React.useState(true);
+  const [footprintNoDestructive, setFootprintNoDestructive] = React.useState(true);
+  const [footprintNoHarmOthers, setFootprintNoHarmOthers] = React.useState(true);
   const [interceptRules, setInterceptRules] = React.useState<AssetInterceptRuleInput[]>([]); // 任务级资产拦截规则(仅本任务生效,不进全局表)
   // 方式1 文件上传:建任务前把文件暂存到 drafts/<draftId>/uploads/,拿回绝对路径追加进描述。
   const [uploading, setUploading] = React.useState(false);
@@ -3154,6 +3159,11 @@ function CreateTaskSheet({
         seedFirstIntent,
         planHeartbeatSeconds: heartbeatSec,
         coverageEnabled,
+        footprintPace,
+        footprintMinTouch,
+        footprintNoDirtyData,
+        footprintNoDestructive,
+        footprintNoHarmOthers,
         interceptRules: interceptRules
           .map((r) => ({ ...r, pattern: r.pattern.trim() }))
           .filter((r) => r.pattern !== ""),
@@ -3171,6 +3181,11 @@ function CreateTaskSheet({
       setHeartbeatMin("10");
       setSeedFirstIntent(false);
       setCoverageEnabled(true);
+      setFootprintPace(true);
+      setFootprintMinTouch(true);
+      setFootprintNoDirtyData(true);
+      setFootprintNoDestructive(true);
+      setFootprintNoHarmOthers(true);
       setInterceptRules([]);
       setUploadCount(0);
       draftIdRef.current = "";
@@ -3396,6 +3411,30 @@ function CreateTaskSheet({
                     默认开启：计算并展示测试覆盖度、态势图显示测试进度、自动累积测试范围。关闭后不再计算/展示覆盖度，
                     态势图仅展示资产不显示进度，agent 也不再获得范围类工具。关闭不影响「关联企业资产范围」。
                   </p>
+                </div>
+                <div className="grid gap-2">
+                  <p className="text-sm">作业脚印限制</p>
+                  <p className="text-muted-foreground text-xs">默认全部开启；关闭某项即为本任务放宽对应脚印限制。</p>
+                  <label htmlFor="footprint-pace" className="flex items-center gap-2 text-sm">
+                    <Switch id="footprint-pace" checked={footprintPace} onCheckedChange={setFootprintPace} />
+                    礼貌优先
+                  </label>
+                  <label htmlFor="footprint-min_touch" className="flex items-center gap-2 text-sm">
+                    <Switch id="footprint-min_touch" checked={footprintMinTouch} onCheckedChange={setFootprintMinTouch} />
+                    最小触达
+                  </label>
+                  <label htmlFor="footprint-no_dirty_data" className="flex items-center gap-2 text-sm">
+                    <Switch id="footprint-no_dirty_data" checked={footprintNoDirtyData} onCheckedChange={setFootprintNoDirtyData} />
+                    不留脏数据
+                  </label>
+                  <label htmlFor="footprint-no_destructive" className="flex items-center gap-2 text-sm">
+                    <Switch id="footprint-no_destructive" checked={footprintNoDestructive} onCheckedChange={setFootprintNoDestructive} />
+                    不做破坏性或不可逆动作
+                  </label>
+                  <label htmlFor="footprint-no_harm_others" className="flex items-center gap-2 text-sm">
+                    <Switch id="footprint-no_harm_others" checked={footprintNoHarmOthers} onCheckedChange={setFootprintNoHarmOthers} />
+                    不伤他人
+                  </label>
                 </div>
               </CollapsibleContent>
             </Collapsible>

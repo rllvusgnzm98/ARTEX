@@ -155,8 +155,19 @@ type TaskCreateOptions struct {
 	// CoverageEnabled 是「资产覆盖度功能」开关;nil=默认开(true)，让不关心该开关的创建
 	// 路径(编排 spawn、老 API)沿用原行为。仅 web 创建任务时可显式传 false 关闭。
 	CoverageEnabled *bool
+	// Footprint 开关仅创建时设置;nil=默认开(true)。
+	FootprintPace          *bool
+	FootprintMinTouch      *bool
+	FootprintNoDirtyData   *bool
+	FootprintNoDestructive *bool
+	FootprintNoHarmOthers  *bool
 	// InterceptRules 是任务级资产拦截规则,创建时随任务在同一事务内写入 task_intercept_rules。
 	InterceptRules []TaskInterceptRuleInput
+}
+
+func (d *DB) TaskFootprint(taskID int64) (pace, minTouch, noDirtyData, noDestructive, noHarmOthers bool, err error) {
+	err = d.QueryRow(`SELECT footprint_pace, footprint_min_touch, footprint_no_dirty_data, footprint_no_destructive, footprint_no_harm_others FROM tasks WHERE id=$1`, taskID).Scan(&pace, &minTouch, &noDirtyData, &noDestructive, &noHarmOthers)
+	return
 }
 
 // CreateTaskWithOptions creates an exploration, task, direct source relations,
@@ -199,6 +210,11 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 	}
 	opts.PlanHeartbeatSeconds = normalizeHeartbeat(opts.PlanHeartbeatSeconds)
 	coverageEnabled := opts.CoverageEnabled == nil || *opts.CoverageEnabled
+	footprintPace := opts.FootprintPace == nil || *opts.FootprintPace
+	footprintMinTouch := opts.FootprintMinTouch == nil || *opts.FootprintMinTouch
+	footprintNoDirtyData := opts.FootprintNoDirtyData == nil || *opts.FootprintNoDirtyData
+	footprintNoDestructive := opts.FootprintNoDestructive == nil || *opts.FootprintNoDestructive
+	footprintNoHarmOthers := opts.FootprintNoHarmOthers == nil || *opts.FootprintNoHarmOthers
 	var categoryName string
 	if opts.CategoryID != nil {
 		if *opts.CategoryID <= 0 {
@@ -227,9 +243,9 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		CoverageEnabled: coverageEnabled,
 	}
 	if err := tx.QueryRow(`
-INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled)
-VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9)
-RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
+INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, footprint_pace, footprint_min_touch, footprint_no_dirty_data, footprint_no_destructive, footprint_no_harm_others)
+VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, footprintPace, footprintMinTouch, footprintNoDirtyData, footprintNoDestructive, footprintNoHarmOthers).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
 		return nil, err
 	}
 	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
