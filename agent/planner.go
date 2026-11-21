@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/Autumn-27/artex/agent/chainskel"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
@@ -353,7 +354,7 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 
 func plannerSystem(goal, dataDir, workDir string) string {
 	body := renderSystem("planner", plannerDefaultTmpl, PlannerVars{Goal: goal, DataDir: dataDir, Now: nowStr()})
-	return body + artifactSpec(workDir) + untrustedDataRule + plannerHoneypotRules
+	return body + artifactSpec(workDir) + untrustedDataRule + plannerHoneypotRules + chainskel.PlannerMetaRules
 }
 
 // Plan runs one planning round. emit, if non-nil, receives the planner's execution
