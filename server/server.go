@@ -251,6 +251,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		s.seedTunnelTools()           // tunnel_list/probe/deploy/teardown 默认绑 worker
 		s.initCredentials()           // 凭据库（secret AES-GCM，jwt.key 域分离）
 		s.seedCredentialTools()       // add_credential / list_credentials / credential_reuse_plan
+		s.seedDualVerifyTool()        // dual_account_verify 默认绑 worker
 		s.seedStageShareTool()        // stage_share 默认绑 worker
 		go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
