@@ -207,6 +207,14 @@ func (s *Server) executeDualVerify(ctx context.Context, in json.RawMessage) (act
 	if err != nil {
 		return actool.Errorf(err.Error()), nil
 	}
+	if ot := parseProfileID(a.OtherTenant); ot > 0 {
+		if ot == parseProfileID(a.A) {
+			return actool.Errorf("B_other_tenant 不能与 A 使用相同凭据：所有者自读不是跨租户访问"), nil
+		}
+		if ot == parseProfileID(a.B) {
+			return actool.Errorf("B_other_tenant 不能与 B 使用相同凭据：同一次读取会被重复判定为两个漏洞"), nil
+		}
+	}
 	taskID := agent.RunInfoFrom(ctx).TaskID
 	if taskID <= 0 || s.m == nil || s.m.pg == nil || s.credStore == nil {
 		return actool.Errorf("dual_account_verify 需要任务上下文与凭据库"), nil
@@ -230,6 +238,14 @@ func (s *Server) executeDualVerify(ctx context.Context, in json.RawMessage) (act
 	}
 	if secrets["A"] == secrets["B"] {
 		return actool.Errorf("A/B 必须为不同账号凭据，不能使用相同秘密"), nil
+	}
+	if ot, ok := secrets["B_other_tenant"]; ok {
+		if ot == secrets["A"] {
+			return actool.Errorf("B_other_tenant 不能与 A 使用相同凭据：所有者自读不是跨租户访问"), nil
+		}
+		if ot == secrets["B"] {
+			return actool.Errorf("B_other_tenant 不能与 B 使用相同凭据：同一次读取会被重复判定为两个漏洞"), nil
+		}
 	}
 	var decoded any
 	_ = json.Unmarshal(in, &decoded)

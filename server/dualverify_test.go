@@ -106,6 +106,31 @@ func TestDualVerifyProvidedMarker(t *testing.T) {
 	}
 }
 
+func TestDualVerifyDuplicateTenantCredentialIDs(t *testing.T) {
+	for _, tc := range []struct{ name, other, want string }{
+		{"owner ID", `11`, "B_other_tenant 不能与 A 使用相同凭据：所有者自读不是跨租户访问"},
+		{"B ID", `22`, "B_other_tenant 不能与 B 使用相同凭据：同一次读取会被重复判定为两个漏洞"},
+		{"owner string ID", `"11"`, "B_other_tenant 不能与 A 使用相同凭据：所有者自读不是跨租户访问"},
+		{"B string ID", `"22"`, "B_other_tenant 不能与 B 使用相同凭据：同一次读取会被重复判定为两个漏洞"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var s Server
+			in := json.RawMessage(`{"marker":"preplanted-marker","a_credential_id":11,"b_credential_id":22,"b_other_tenant_credential_id":` + tc.other + `}`)
+			res, err := s.executeDualVerify(context.Background(), in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := json.Marshal(res)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(raw), tc.want) {
+				t.Fatalf("missing duplicate credential error: %s", raw)
+			}
+		})
+	}
+}
+
 func TestDualVerifyReplay(t *testing.T) {
 	for _, tc := range []struct {
 		name                                  string
