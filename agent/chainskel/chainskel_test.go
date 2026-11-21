@@ -71,6 +71,64 @@ func TestMatch(t *testing.T) {
 	}
 }
 
+func TestP1RoutingMismatches(t *testing.T) {
+	for _, tc := range []struct {
+		summary  string
+		tags     []string
+		category string
+	}{
+		{"JWT OAuth 令牌信任评估", nil, "identity"},
+		{"JWT 令牌伪造", nil, "identity"},
+		{"jwt", nil, "identity"},
+		{"OIDC SSO 单点登录绕过", nil, "identity"},
+		{"SAML 断言签名绕过", nil, "identity"},
+		{"SSRF 打云元数据 IMDS 临时凭据", nil, "cloud"},
+		{"SSRF 读取 IMDS", nil, "cloud"},
+		{"REST API RBAC 评估", nil, "web"},
+		{"k8s 集群 rbac 审查", nil, "cloud"},
+		{"SSRF 文件读取", nil, "web"},
+		{"SQL 数据库配置审计", nil, "database"},
+		{"数据库未授权与危险配置审计", nil, "database"},
+		{"对 /api 做 sql 注入测试", nil, "web"},
+		{"域内横向移动摸底", nil, "ad"},
+		{"域渗透 kerberos 委派滥用", nil, "ad"},
+		{"web app 渗透测试", nil, "web"},
+		{"webapp 逻辑漏洞挖掘", nil, "web"},
+		{"web application 渗透测试", nil, "web"},
+		{"web应用 渗透测试", nil, "web"},
+		{"web 应用 渗透测试", nil, "web"},
+		{"SQLi", nil, ""},
+		{"OAuth2", nil, ""},
+		{"常规巡检,无明确攻击面", nil, ""},
+		{"单写 CVE bounty 信息", nil, ""},
+		{"task planned for three weeks", nil, ""},
+		{"grep the sourcecode", nil, ""},
+		{"反编译 MessageProcessor", nil, "rev"},
+		{"invalid tag", []string{"bogus"}, ""},
+		{"做 sql 注入测试", []string{"identity", "web"}, "identity"},
+		{"x", []string{"web", "cloud"}, "web"},
+		{"explicit meta", []string{"meta"}, "meta"},
+	} {
+		t.Run(tc.summary, func(t *testing.T) {
+			out := ForIntent(payload(t, map[string]any{"summary": tc.summary, "chain_tags": tc.tags}))
+			if tc.category == "" {
+				if out != "" {
+					t.Fatalf("irrelevant intent routed: %s", out)
+				}
+				return
+			}
+			if !strings.Contains(out, `category="`+tc.category+`"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+				t.Fatalf("wrong primary skeleton, want %s: %s", tc.category, out)
+			}
+		})
+	}
+	for _, category := range []string{"identity", "cloud", "database"} {
+		if err := ValidateChainTags([]string{category, "web"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestSkeletonEmbedded(t *testing.T) {
 	for _, c := range Categories {
 		sk, ok := Skeleton(c)
