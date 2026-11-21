@@ -416,7 +416,7 @@ func (t *ToolSet) graphOverviewDataFrom(g *graphSnapshot) map[string]any {
 	}
 	hidden := func(id int64) bool { _, c := covered[id]; return c && !hotAtRender[id] }
 	const openIntentsCap = 30
-	fr, _ := t.ts.Frontier(openIntentsCap) // priority DESC, id ASC —— 优先级最高的前 N 条；真实总数见 frontier_open
+	fr, _ := g.frontier(openIntentsCap) // priority DESC, id ASC —— 优先级最高的前 N 条；真实总数见 frontier_open
 	out["open_intents"] = compactIntents(fr, parentsOf, yieldsOf)
 	all, _ := g.listByKind(db.KindIntent, 300)
 	var running, recentDone []*db.Node
@@ -435,11 +435,11 @@ func (t *ToolSet) graphOverviewDataFrom(g *graphSnapshot) map[string]any {
 	// done_intents_total：已结束意图（done/blocked/exhausted）总数，与 recent_done_intents
 	// 平行命名——后者只是它的最新窗口截断视图。两键并排即自描述："看到的是 N/总数"，
 	// 让 planner 去重时别把"没显示"当成"没派过"，无需在提示词里另行解释。
-	if dt, err := t.ts.CountFinishedIntents(); err == nil {
+	if dt, err := g.countFinishedIntents(); err == nil {
 		out["done_intents_total"] = dt
 	}
 	// frontier_open：开放意图真实总数（open_intents 只是其中优先级最高的前 N 条截断视图）。
-	if fo, err := t.ts.CountOpenIntents(); err == nil {
+	if fo, err := g.countOpenIntents(); err == nil {
 		out["frontier_open"] = fo
 	} else {
 		out["frontier_open"] = len(fr)

@@ -1,6 +1,10 @@
 package agent
 
-import "github.com/Autumn-27/artex/db"
+import (
+	"sort"
+
+	"github.com/Autumn-27/artex/db"
+)
 
 // graphSnapshot memoizes exploration-graph reads for one prompt build. The full
 // graph (nodes + edges) is loaded once and per-kind lists, capped edge lists and
@@ -66,4 +70,57 @@ func (s *graphSnapshot) edgeList(limit int) ([]db.Edge, error) {
 		return s.edges, nil
 	}
 	return s.edges[:limit], nil
+}
+
+// frontier matches ExplorationStore.Frontier: open intents, priority DESC, id ASC.
+func (s *graphSnapshot) frontier(limit int) ([]*db.Node, error) {
+	if s.load() != nil {
+		return s.ts.Frontier(limit)
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	var open []*db.Node
+	for _, n := range s.nodes {
+		if n.Kind == db.KindIntent && n.State == "open" {
+			open = append(open, n)
+		}
+	}
+	sort.SliceStable(open, func(i, j int) bool { return open[i].Priority > open[j].Priority })
+	if len(open) > limit {
+		open = open[:limit]
+	}
+	return open, nil
+}
+
+// countFinishedIntents matches ExplorationStore.CountFinishedIntents.
+func (s *graphSnapshot) countFinishedIntents() (int, error) {
+	if s.load() != nil {
+		return s.ts.CountFinishedIntents()
+	}
+	return s.countIntents("done", "blocked", "exhausted"), nil
+}
+
+// countOpenIntents matches ExplorationStore.CountOpenIntents.
+func (s *graphSnapshot) countOpenIntents() (int, error) {
+	if s.load() != nil {
+		return s.ts.CountOpenIntents()
+	}
+	return s.countIntents("open"), nil
+}
+
+func (s *graphSnapshot) countIntents(states ...string) int {
+	n := 0
+	for _, node := range s.nodes {
+		if node.Kind != db.KindIntent {
+			continue
+		}
+		for _, st := range states {
+			if node.State == st {
+				n++
+				break
+			}
+		}
+	}
+	return n
 }
