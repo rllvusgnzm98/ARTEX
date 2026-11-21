@@ -274,6 +274,11 @@ export const api = {
     seedFirstIntent?: boolean;
     planHeartbeatSeconds?: number;
     coverageEnabled?: boolean;
+    footprintPace?: boolean;
+    footprintMinTouch?: boolean;
+    footprintNoDirtyData?: boolean;
+    footprintNoDestructive?: boolean;
+    footprintNoHarmOthers?: boolean;
     interceptRules?: AssetInterceptRuleInput[];
   }) =>
     post<Task>("/tasks", {
@@ -288,6 +293,11 @@ export const api = {
       seed_first_intent: input.seedFirstIntent ?? false,
       plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = 后端归一到默认 600(10min)
       coverage_enabled: input.coverageEnabled ?? true, // 默认开;false=关闭资产覆盖度功能
+      footprint_pace: input.footprintPace ?? true,
+      footprint_min_touch: input.footprintMinTouch ?? true,
+      footprint_no_dirty_data: input.footprintNoDirtyData ?? true,
+      footprint_no_destructive: input.footprintNoDestructive ?? true,
+      footprint_no_harm_others: input.footprintNoHarmOthers ?? true,
       intercept_rules: input.interceptRules ?? [], // 任务级资产拦截规则
     }),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),

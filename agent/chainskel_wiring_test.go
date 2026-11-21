@@ -146,7 +146,7 @@ func TestSystemPromptsCarryMetaRules(t *testing.T) {
 	if !strings.Contains(plan, "meta 铁律") || !strings.Contains(plan, "梯度为零") {
 		t.Fatal("planner system 固定尾应带 L2 meta 铁律")
 	}
-	work := workerSystem("", "", t.TempDir(), t.TempDir(), false)
+	work := workerSystem("", "", t.TempDir(), t.TempDir(), false, DefaultFootprint())
 	if !strings.Contains(work, "meta 铁律") || !strings.Contains(work, "回显阴性从不等于漏洞阴性") {
 		t.Fatal("worker system 固定尾应带 L2 meta 铁律")
 	}

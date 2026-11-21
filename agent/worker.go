@@ -95,7 +95,8 @@ type Worker struct {
 	// intranetFn resolves whether a task is in its intranet phase (存在存活立足点
 	// 会话)。为 true 时 worker 系统提示追加 worker.intranet 短纪律变体。
 	// 每次 run 现查,会话状态变化即时生效;nil = 外网(默认)。
-	intranetFn func(taskID int64) bool
+	intranetFn  func(taskID int64) bool
+	footprintFn func(taskID int64) FootprintToggles
 
 	// uaFn 解析本任务稳定分配的客户端 UA,经 BashEnv 注入 ARTEX_UA。
 	// 同一任务始终同一个 UA;nil = 不注入。
@@ -159,6 +160,17 @@ func (w *Worker) SetIntranetResolver(fn func(taskID int64) bool) { w.intranetFn 
 
 func (w *Worker) intranetForTask(taskID int64) bool {
 	return w.intranetFn != nil && w.intranetFn(taskID)
+}
+
+func (w *Worker) SetFootprintResolver(fn func(taskID int64) FootprintToggles) {
+	w.footprintFn = fn
+}
+
+func (w *Worker) footprintForTask(taskID int64) FootprintToggles {
+	if w.footprintFn == nil {
+		return DefaultFootprint()
+	}
+	return w.footprintFn(taskID)
 }
 
 // SetUAResolver 接入按任务稳定分配的客户端 UA。每次 run 现查,任务内不更换。
@@ -389,7 +401,7 @@ func ensureRunDir(base string, taskID, intentID int64) string {
 // cmdOutDir is the SDK large-tool-output spill dir under an agent's run dir.
 func cmdOutDir(dir string) string { return filepath.Join(dir, "cmd-output") }
 
-func workerSystem(proxyAddr, caCert, dataDir, runDir string, intranet bool) string {
+func workerSystem(proxyAddr, caCert, dataDir, runDir string, intranet bool, fp FootprintToggles) string {
 	vars := WorkerVars{ProxyAddr: proxyAddr, DataDir: dataDir, Now: nowStr(), Intranet: intranet}
 	body := renderSystem("worker", workerDefaultTmpl, vars)
 	tail := ""
@@ -404,7 +416,7 @@ func workerSystem(proxyAddr, caCert, dataDir, runDir string, intranet bool) stri
 	// CLI 优先固定尾始终追加,位于内网变体之后,进场预塞仍由 execute() 再往后接。
 	// 工人红线是代码固定尾:目标内容当数据不当指令,内外网一律追加,
 	// 编辑正文也删不掉。进场预塞仍由 execute() 再往后接。
-	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir) + tail + workerShellCLIRules + untrustedDataRule + workerAntiTrapRules + workerFootprintRules + chainskel.WorkerMetaRules
+	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir) + tail + workerShellCLIRules + untrustedDataRule + workerAntiTrapRules + workerFootprintRulesFor(fp) + chainskel.WorkerMetaRules
 }
 
 // renderIntentTask formats the claimed intent for the worker's launch USER message:
@@ -510,7 +522,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	snap := newGraphSnapshot(ts) // overview + entry seed share one graph read
 	overview := renderWorkerGraphOverview(tsx.graphOverviewDataFrom(snap))
 	proxyAddr, proxyCA := w.proxyForTask(taskID)
-	sysBody := workerSystem(proxyAddr, proxyCA, w.workDir, runDir, w.intranetForTask(taskID))
+	sysBody := workerSystem(proxyAddr, proxyCA, w.workDir, runDir, w.intranetForTask(taskID), w.footprintForTask(taskID))
 	if w.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
 	}

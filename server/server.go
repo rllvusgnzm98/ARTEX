@@ -1510,18 +1510,23 @@ func truncateReply(s string) string {
 }
 
 type createTaskReq struct {
-	Name                 string   `json:"name,omitempty"` // 可选任务名称;省略/空=未命名
-	CategoryID           *int64   `json:"category_id,omitempty"`
-	Description          string   `json:"description"`
-	Goal                 string   `json:"goal"`
-	LLMProfileID         *int64   `json:"llm_profile_id,omitempty"`    // 指定运行本任务的 LLM 配置;省略/null=用激活配置
-	LLMProfileIDs        []int64  `json:"llm_profile_ids,omitempty"`   // 有序任务级配置链;第一项初始生效
-	SourceTaskIDs        []string `json:"source_task_ids,omitempty"`   // 仅直接、只读继承的来源任务
-	CompanyIDs           []int64  `json:"company_ids,omitempty"`       // 关联企业范围并快照关联当前企业资产;不复制资产或强制生成意图
-	TimeoutSeconds       int      `json:"timeout_seconds"`             // 任务级超时(秒);0/省略=不限时
-	PlanHeartbeatSeconds int      `json:"plan_heartbeat_seconds"`      // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
-	SeedFirstIntent      *bool    `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
-	CoverageEnabled      *bool    `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
+	Name                   string   `json:"name,omitempty"` // 可选任务名称;省略/空=未命名
+	CategoryID             *int64   `json:"category_id,omitempty"`
+	Description            string   `json:"description"`
+	Goal                   string   `json:"goal"`
+	LLMProfileID           *int64   `json:"llm_profile_id,omitempty"`    // 指定运行本任务的 LLM 配置;省略/null=用激活配置
+	LLMProfileIDs          []int64  `json:"llm_profile_ids,omitempty"`   // 有序任务级配置链;第一项初始生效
+	SourceTaskIDs          []string `json:"source_task_ids,omitempty"`   // 仅直接、只读继承的来源任务
+	CompanyIDs             []int64  `json:"company_ids,omitempty"`       // 关联企业范围并快照关联当前企业资产;不复制资产或强制生成意图
+	TimeoutSeconds         int      `json:"timeout_seconds"`             // 任务级超时(秒);0/省略=不限时
+	PlanHeartbeatSeconds   int      `json:"plan_heartbeat_seconds"`      // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
+	SeedFirstIntent        *bool    `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
+	CoverageEnabled        *bool    `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
+	FootprintPace          *bool    `json:"footprint_pace,omitempty"`
+	FootprintMinTouch      *bool    `json:"footprint_min_touch,omitempty"`
+	FootprintNoDirtyData   *bool    `json:"footprint_no_dirty_data,omitempty"`
+	FootprintNoDestructive *bool    `json:"footprint_no_destructive,omitempty"`
+	FootprintNoHarmOthers  *bool    `json:"footprint_no_harm_others,omitempty"`
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
 }
@@ -1579,8 +1584,13 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		Name: strings.TrimSpace(req.Name), CategoryID: req.CategoryID,
 		SourceTaskIDs: sourceIDs, CompanyIDs: req.CompanyIDs, LLMProfileIDs: req.LLMProfileIDs,
 		TimeoutSeconds: req.TimeoutSeconds, PlanHeartbeatSeconds: req.PlanHeartbeatSeconds,
-		CoverageEnabled: req.CoverageEnabled,
-		InterceptRules:  interceptRules,
+		CoverageEnabled:        req.CoverageEnabled,
+		FootprintPace:          req.FootprintPace,
+		FootprintMinTouch:      req.FootprintMinTouch,
+		FootprintNoDirtyData:   req.FootprintNoDirtyData,
+		FootprintNoDestructive: req.FootprintNoDestructive,
+		FootprintNoHarmOthers:  req.FootprintNoHarmOthers,
+		InterceptRules:         interceptRules,
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrTaskCategoryInvalid) || errors.Is(err, db.ErrTaskCategoryNotFound) {
