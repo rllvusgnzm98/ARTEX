@@ -48,8 +48,8 @@ func TestHandleAskAndLogRedactCredentialInput(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	var emitted db.Activity
-	ctx = WithTaskContext(ctx, "cred-redact-ask", "worker", func(a db.Activity) { emitted = a })
+	activities := make(chan db.Activity, 1)
+	ctx = WithTaskContext(ctx, "cred-redact-ask", "worker", func(a db.Activity) { activities <- a })
 
 	done := make(chan bool, 1)
 	go func() {
@@ -82,6 +82,12 @@ func TestHandleAskAndLogRedactCredentialInput(t *testing.T) {
 
 	if strings.Contains(string(pending.ToolInput), credInterceptFixturePass) {
 		t.Fatalf("pending.tool_input 不得含明文 secret: %s", pending.ToolInput)
+	}
+	var emitted db.Activity
+	select {
+	case emitted = <-activities:
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandleAsk 未写出活动")
 	}
 	if emitted.Kind != "intercept_request" {
 		t.Fatalf("应写出 intercept_request 活动, got %+v", emitted)

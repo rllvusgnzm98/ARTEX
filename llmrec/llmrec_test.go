@@ -91,9 +91,13 @@ func TestSideUsageRecordedOnceOnConsumerCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pg.Close()
+	t.Cleanup(func() { pg.Close() })
+	if err := pg.EnsureLLMUsageTable(); err != nil {
+		t.Fatal(err)
+	}
 	for _, early := range []bool{false, true} {
 		profile := "btw-metering-" + uuid.NewString()
+		t.Cleanup(func() { _, _ = pg.Exec(`DELETE FROM llm_usage WHERE profile_name=$1`, profile) })
 		ctx, cancel := context.WithCancel(transcript.WithSessionID(t.Context(), "exp0-btw-test"))
 		recorder := Wrap(meteredStreamProvider{}, pg, "fixture", profile, "", "", func() bool { return false })
 		for event, err := range recorder.Stream(ctx, llm.CompletionRequest{}) {
@@ -110,7 +114,6 @@ func TestSideUsageRecordedOnceOnConsumerCancellation(t *testing.T) {
 		var worker, status string
 		err = pg.QueryRow(`SELECT count(*),max(input_tokens),max(output_tokens),max(worker),max(status)
 FROM llm_usage WHERE profile_name=$1`, profile).Scan(&count, &input, &output, &worker, &status)
-		_, _ = pg.Exec(`DELETE FROM llm_usage WHERE profile_name=$1`, profile)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -41,8 +41,6 @@ func trafficEvidenceServer(t *testing.T) (*Server, *db.RecordedFinding, func(str
 	cancel()
 	s := New(ctx, m, t.TempDir(), t.TempDir(), t.TempDir())
 	s.archiveWG.Wait()
-	// The archive test below replaces the cancelled service context. Wait for
-	// the side-question snapshot writer too before reusing this fixture.
 	<-s.side.done
 	token, err := signJWT(s.jwtKey)
 	if err != nil {
@@ -62,6 +60,7 @@ func trafficEvidenceServer(t *testing.T) (*Server, *db.RecordedFinding, func(str
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _, _ = m.pg.Exec(`DELETE FROM notification_events WHERE finding_id=$1`, f.FindingID) })
 	return s, f, request
 }
 
@@ -247,9 +246,9 @@ func TestFindingTrafficAPIAndExport(t *testing.T) {
 }
 
 func TestFindingTrafficArchiveV3RoundTripAndRetry(t *testing.T) {
-	s, f, _ := trafficEvidenceServer(t)
-	ctx := context.Background()
-	s.ctx = ctx
+	fixture, f, _ := trafficEvidenceServer(t)
+	ctx := t.Context()
+	s := &Server{m: fixture.m, engine: fixture.engine, ctx: ctx, side: fixture.side}
 	body := []byte("evidence without original traffic\x00\xff")
 	seedServerEvidenceFlow(t, s, "original", body)
 	list, err := s.evidenceStore().Bind(ctx, f.FindingID, []db.TrafficRef{{TrafficID: "original", Role: "proof", Note: "keep note"}})
@@ -271,6 +270,7 @@ func TestFindingTrafficArchiveV3RoundTripAndRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _, _ = s.m.pg.Exec(`DELETE FROM notification_events WHERE finding_id=$1`, shared.FindingID) })
 	if _, err = s.m.traffic.DeleteHost("evidence.local"); err != nil {
 		t.Fatal(err)
 	}

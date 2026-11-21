@@ -34,6 +34,9 @@ func evidenceFixture(t *testing.T) (*Store, db.RecordFindingInput, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { pg.DeleteFindingsByTask(task.ID); pg.DeleteTask(task.ID) })
+	t.Cleanup(func() {
+		_, _ = pg.Exec(`DELETE FROM notification_events WHERE snapshot->>'task_id'=$1`, fmt.Sprint(task.ID))
+	})
 	dir := t.TempDir()
 	tr, err := traffic.Open(filepath.Join(dir, "traffic"), ":0")
 	if err != nil {

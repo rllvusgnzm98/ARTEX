@@ -416,13 +416,16 @@ func TestDeliveryStateTransitions(t *testing.T) {
 	d := notifyTestDB(t)
 	ctx := context.Background()
 	ch := newTestChannel(t, d, notify.KindDingTalk, NotifyModeRealtime, `{}`)
-	addTestEvent(t, d, notify.EventFindingCreated, 7001, notify.Snapshot{Severity: "high"})
-	if _, _, err := d.FanOutPendingEvents(ctx, 100); err != nil {
+	eventID := addTestEvent(t, d, notify.EventFindingCreated, 7001, notify.Snapshot{Severity: "high"})
+	if _, err := d.Exec(`INSERT INTO notification_deliveries(event_id,channel_id) VALUES($1,$2)`, eventID, ch.ID); err != nil {
 		t.Fatal(err)
 	}
 	got, err := d.ClaimRealtimeDeliveries(ctx, ch.ID, 10, time.Minute)
 	if err != nil || len(got) != 1 {
 		t.Fatalf("领取失败: %v (%d)", err, len(got))
+	}
+	if got[0].EventID != eventID || got[0].ChannelID != ch.ID {
+		t.Fatalf("领取了其他事件或渠道: %+v", got[0])
 	}
 	id := got[0].ID
 
