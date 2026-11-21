@@ -1352,12 +1352,14 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 // must NOT be stuffed into the asset graph via upsert_asset.
 // factItem 是 record_fact 批量/单条的一条事实。
 type factItem struct {
-	Summary    string            `json:"summary"`
-	Detail     string            `json:"detail"`
-	Evidence   string            `json:"evidence"`   // 一行关键证据（命令+关键输出行），支撑结论、便于事后核对
-	Confidence string            `json:"confidence"` // observed（直接看到）| inferred（据现象推断）
-	IntentID   json.RawMessage   `json:"intent_id"`
-	AssetIDs   []json.RawMessage `json:"asset_ids"`
+	Summary     string            `json:"summary"`
+	Detail      string            `json:"detail"`
+	Evidence    string            `json:"evidence"`   // 一行关键证据（命令+关键输出行），支撑结论、便于事后核对
+	Confidence  string            `json:"confidence"` // observed（直接看到）| inferred（据现象推断）
+	Category    string            `json:"category"`
+	EvidenceIDs []string          `json:"evidence_ids"`
+	IntentID    json.RawMessage   `json:"intent_id"`
+	AssetIDs    []json.RawMessage `json:"asset_ids"`
 }
 
 // recordOneFact 写一条 fact 节点并连到意图（intent→yields→fact）。defaultIntent 为
@@ -1366,7 +1368,18 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 	if strings.TrimSpace(it.Summary) == "" {
 		return 0, fmt.Errorf("summary 不能为空")
 	}
+	switch it.Category {
+	case "", "negative_result", "scope_limit", "cleanup_status", "evidence":
+	default:
+		return 0, fmt.Errorf("category 必须为 negative_result / scope_limit / cleanup_status / evidence，普通事实请省略")
+	}
 	payload := map[string]any{"summary": it.Summary}
+	if it.Category != "" {
+		payload["category"] = it.Category
+	}
+	if len(it.EvidenceIDs) > 0 {
+		payload["evidence_ids"] = it.EvidenceIDs
+	}
 	if it.Detail != "" {
 		payload["detail"] = it.Detail
 	}
@@ -1399,28 +1412,38 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 }
 
 func (t *ToolSet) recordFact() actool.CoreTool {
+	itemProps := map[string]any{
+		"summary":      str("对本次探索结论的【总结性一句话】（是对 detail 的概括）"),
+		"intent_id":    idp("产生本事实的意图 id（你领到的意图；批量时作为各条默认）"),
+		"detail":       str("本事实的相关细节：把这次探索的多个观察事实都写进这里"),
+		"evidence":     str("【一行】关键证据：命令 + 最能证明结论的那一两行输出。务必简洁，不要粘大段输出（细节放 detail）。"),
+		"confidence":   str("observed（输出里直接看到）| inferred（据现象推断）。否定结论务必如实标注。"),
+		"asset_ids":    map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "相关资产 id（可选，0/1/多个）：该事实涉及哪些资产"},
+		"category":     map[string]any{"type": "string", "enum": []string{"negative_result", "scope_limit", "cleanup_status", "evidence"}, "description": "可选关键事实类别：否定结果 / 授权范围限制 / 清理状态 / 关键证据。省略表示 general 普通事实；漏洞 finding 仍用 report_finding 单独记录。"},
+		"evidence_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选：支撑结论的已有证据记录 ID 或工件引用，保留可恢复的准确标识；不要编造。"},
+	}
+	props := make(map[string]any, len(itemProps)+1)
+	for key, value := range itemProps {
+		props[key] = value
+	}
+	props["facts"] = map[string]any{"type": "array", "description": "【有多条不同结论时用】事实数组，元素字段同顶层（含 category/evidence_ids）；省略 intent_id 则用顶层 intent_id。返回 ids 与本数组等长、同序。", "items": obj(itemProps, "summary")}
 	return t.writeExpTool("record_fact", "把探索【事实/结论】写入探索图，连到产生它的意图（intent_id）。用于记录探索结果——包括指纹/枚举等【正向结论】，和'端口关闭'/'参数不可注入'/'未发现登录入口'等【否定结论】。\n"+
 		"⚠️一次探索的多个观察要【汇总成一条事实】，不要拆成多条，可以合并成一条事实的就尽量用一条事实表示：summary=对本次结论的总结性一句话，detail=相关细节（可含多个具体项）。例：指纹意图→一条事实 {summary:'识别了 X 站点的技术栈与响应特征', detail:'nginx 1.25 / Vue3 / 200 / title=.. / body_len=..'}，而不是状态码、指纹、标题各记一条。一条意图通常只产出一条事实，拆太碎会让图谱无限膨胀。\n"+
 		"★facts 数组用于一次写多条【彼此不同】的结论（每条可省略 intent_id，默认用顶层 intent_id）。返回 ids 数组，与 facts 等长同序。\n"+
+		"★关键事实用 category 标记：negative_result=否定结果，scope_limit=授权/范围限制，cleanup_status=清理完成或遗留状态，evidence=关键证据；省略为 general。evidence_ids 填已有证据 ID/工件引用，便于恢复原文。这些事实优先进入 worker 进场上下文；漏洞发现始终是独立 finding 节点，请用 report_finding，不要用 category 替代。\n"+
 		"⚠️只写你在工具输出里【真实看到】的结论，不要脑补。evidence 与 confidence 用来防止不准确的结论污染图谱：\n"+
 		"  · evidence=支撑本结论的【一行】关键证据（命令+最能证明的那一两行输出），**务必简洁**——细节已在 detail，这里不要再粘大段输出。\n"+
 		"  · confidence=observed（输出里直接看到）| inferred（据现象推断）。\n"+
 		"  · **否定类结论**（不可注入/端口关闭/未发现入口等）只写\"观察 + 试探性读法\"——陈述你实际看到什么，方向是否放弃由规划者综合全局定；务必给 evidence，手段没穷尽或证据弱（含只探一次、看起来像）标 inferred，确已穷尽且直接看到才标 observed。",
-		obj(map[string]any{
-			"facts":      map[string]any{"type": "array", "description": "【有多条不同结论时用】事实数组，元素字段同下方顶层字段（summary/detail/evidence/confidence/intent_id/asset_ids）；省略 intent_id 则用顶层 intent_id。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
-			"summary":    str("对本次探索结论的【总结性一句话】（是对 detail 的概括）"),
-			"intent_id":  idp("产生本事实的意图 id（你领到的意图；批量时作为各条默认）"),
-			"detail":     str("本事实的相关细节：把这次探索的多个观察事实都写进这里"),
-			"evidence":   str("【一行】关键证据：命令 + 最能证明结论的那一两行输出。务必简洁，不要粘大段输出（细节放 detail）。"),
-			"confidence": str("observed（输出里直接看到）| inferred（据现象推断）。否定结论务必如实标注。"),
-			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "相关资产 id（可选，0/1/多个）：该事实涉及哪些资产"},
-		}),
+		obj(props),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				Facts    []factItem `json:"facts"`
 				factItem            // 单条模式 + 批量默认 intent_id
 			}
-			_ = json.Unmarshal(in, &a)
+			if err := json.Unmarshal(in, &a); err != nil {
+				return actool.Errorf("invalid record_fact input: " + err.Error()), nil
+			}
 			batch := len(a.Facts) > 0
 			items := a.Facts
 			if !batch {

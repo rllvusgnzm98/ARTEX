@@ -29,15 +29,17 @@ type WorkerEntrySeed struct {
 	Writes []string
 }
 
-// EntryFact is one confirmed fact relevant to the claimed intent.
+// EntryFact is a relevant confirmed fact or a task-wide key observation.
 type EntryFact struct {
-	ID         int64
-	Summary    string
-	Detail     string
-	Confidence string
-	AssetIDs   []int64
-	Assets     []string
-	FromIntent int64
+	ID          int64
+	Summary     string
+	Detail      string
+	Confidence  string
+	Category    string
+	EvidenceIDs []string
+	AssetIDs    []int64
+	Assets      []string
+	FromIntent  int64
 }
 
 // EntryTarget is a target confirmed reachable by a prior fact but not yet
@@ -123,6 +125,9 @@ func GraphReadBeforeSideEffect(seed WorkerEntrySeed, toolCalls []string) bool {
 func RepeatScanRisk(seed WorkerEntrySeed, confirmedAssetIDs []int64) int {
 	known := map[int64]bool{}
 	for _, f := range seed.ConfirmedFacts {
+		if isKeyFact(f.Category, f.EvidenceIDs) {
+			continue
+		}
 		for _, id := range f.AssetIDs {
 			known[id] = true
 		}
@@ -226,12 +231,14 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 	}
 
 	type factView struct {
-		node       *db.Node
-		summary    string
-		detail     string
-		confidence string
-		assets     []int64
-		from       int64
+		node        *db.Node
+		summary     string
+		detail      string
+		confidence  string
+		category    string
+		evidenceIDs []string
+		assets      []int64
+		from        int64
 	}
 	var confirmed []factView
 	byID := map[int64]factView{}
@@ -240,16 +247,20 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 			continue
 		}
 		summary, detail, conf := factFields(n)
-		if !isConfirmedFact(n.State, conf) {
+		category, evidenceIDs := factPriorityFields(n)
+		key := isKeyFact(category, evidenceIDs)
+		if key && n.State != "confirmed" || !key && !isConfirmedFact(n.State, conf) {
 			continue
 		}
 		fv := factView{
-			node:       n,
-			summary:    summary,
-			detail:     detail,
-			confidence: conf,
-			assets:     uniqueIDs(anchorOf(n.ID)),
-			from:       producedBy[n.ID],
+			node:        n,
+			summary:     summary,
+			detail:      detail,
+			confidence:  conf,
+			category:    category,
+			evidenceIDs: evidenceIDs,
+			assets:      uniqueIDs(anchorOf(n.ID)),
+			from:        producedBy[n.ID],
 		}
 		confirmed = append(confirmed, fv)
 		byID[n.ID] = fv
@@ -263,6 +274,9 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 			return
 		}
 		relevant[id] = true
+		if isKeyFact(fv.category, fv.evidenceIDs) {
+			return
+		}
 		for _, a := range fv.assets {
 			seedAnchors[a] = true
 		}
@@ -274,7 +288,7 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 		mark(id)
 	}
 	for _, fv := range confirmed {
-		if overlapsID(fv.assets, intentAssets) {
+		if isKeyFact(fv.category, fv.evidenceIDs) || overlapsID(fv.assets, intentAssets) {
 			mark(fv.node.ID)
 		}
 	}
@@ -296,13 +310,15 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 			labels = append(labels, assetLabelOf(g.Assets, a))
 		}
 		facts = append(facts, EntryFact{
-			ID:         fv.node.ID,
-			Summary:    fv.summary,
-			Detail:     fv.detail,
-			Confidence: fv.confidence,
-			AssetIDs:   fv.assets,
-			Assets:     labels,
-			FromIntent: fv.from,
+			ID:          fv.node.ID,
+			Summary:     fv.summary,
+			Detail:      fv.detail,
+			Confidence:  fv.confidence,
+			Category:    fv.category,
+			EvidenceIDs: fv.evidenceIDs,
+			AssetIDs:    fv.assets,
+			Assets:      labels,
+			FromIntent:  fv.from,
 		})
 	}
 	sort.Slice(facts, func(i, j int) bool { return facts[i].ID < facts[j].ID })
@@ -311,6 +327,9 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 	// Neighborhood of confirmed-reachable assets, minus those already delivered.
 	factIDsFor := map[int64][]int64{}
 	for _, f := range facts {
+		if isKeyFact(f.Category, f.EvidenceIDs) {
+			continue
+		}
 		for _, a := range f.AssetIDs {
 			factIDsFor[a] = append(factIDsFor[a], f.ID)
 		}
@@ -344,8 +363,9 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 // Entry-seed render caps: a long-running task can accumulate many relevant
 // confirmed facts with long details; the rest stay one list_facts call away.
 const (
-	entrySeedFactCap   = 60
-	entrySeedDetailCap = 600
+	entrySeedFactCap    = 60
+	entrySeedKeyFactCap = 40
+	entrySeedDetailCap  = 600
 )
 
 func clipRunes(s string, n int) string {
@@ -373,27 +393,55 @@ func RenderWorkerEntrySeed(seed WorkerEntrySeed) string {
 	b.WriteString("\n\n【进场硬步骤】领取意图后，第一次工具调用必须是读图（list_facts，或 list_companies / node_detail 等只读查图工具）。")
 	b.WriteString("下面若已预塞相关已确认事实，视为读图已发生，不要对已确认可达的目标再开一轮扫描。")
 	b.WriteString("禁止把已确认可达但未兑现的目标当成新目标重开，应作为下一跳接着做。")
+	b.WriteString("关键事实中的否定结果、范围限制、清理状态及 inferred 推断不代表目标已确认可达，也不构成扩大授权范围的许可。")
 	if seed.GraphIncomplete {
 		b.WriteString("若出现「" + GraphIncompleteMarker + "」，先用只读工具把能读到的补上，再行动。")
 	}
 
 	if len(seed.ConfirmedFacts) == 0 {
-		b.WriteString("\n\n【进场预塞】没有与本意图相关的已确认事实。第一次工具仍须先读图（list_facts）。")
+		b.WriteString("\n\n【进场预塞】没有相关事实或关键限制/证据。第一次工具仍须先读图（list_facts）。")
 		return b.String()
 	}
 
-	b.WriteString("\n\n【进场预塞：与本意图相关的已确认事实】\n")
-	facts := seed.ConfirmedFacts
-	if omitted := len(facts) - entrySeedFactCap; omitted > 0 {
-		facts = facts[omitted:] // sorted by id ASC → keep the newest
-		fmt.Fprintf(&b, "（另有 %d 条更早的相关事实未列出，需要时用 list_facts / node_detail 查）\n", omitted)
+	b.WriteString("\n\n【进场预塞：相关事实与任务关键限制/证据】\n")
+	fmt.Fprintf(&b, "关键事实优先（最多 %d 条，保留最早记录）；其余位置补最新相关普通事实，总计最多 %d 条。\n", entrySeedKeyFactCap, entrySeedFactCap)
+	var keys, general []EntryFact
+	for _, fact := range seed.ConfirmedFacts {
+		if isKeyFact(fact.Category, fact.EvidenceIDs) {
+			keys = append(keys, fact)
+		} else {
+			general = append(general, fact)
+		}
 	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i].ID < keys[j].ID })
+	sort.Slice(general, func(i, j int) bool { return general[i].ID < general[j].ID })
+	keyCount, generalCount := len(keys), len(general)
+	if len(keys) > entrySeedKeyFactCap {
+		keys = keys[:entrySeedKeyFactCap]
+	}
+	generalSlots := entrySeedFactCap - len(keys)
+	if len(general) > generalSlots {
+		general = general[len(general)-generalSlots:]
+	}
+	if omittedKeys, omittedGeneral := keyCount-len(keys), generalCount-len(general); omittedKeys+omittedGeneral > 0 {
+		fmt.Fprintf(&b, "（另有 %d 条事实未列出：关键事实 %d 条，相关普通事实 %d 条；需要时用 list_facts / node_detail 查）\n", omittedKeys+omittedGeneral, omittedKeys, omittedGeneral)
+	}
+	facts := append(keys, general...)
 	for _, f := range facts {
 		conf := f.Confidence
 		if conf == "" {
 			conf = "confirmed"
 		}
 		fmt.Fprintf(&b, "- fact #%d (%s)：%s", f.ID, conf, strings.TrimSpace(f.Summary))
+		category := f.Category
+		if category == "" {
+			category = "general"
+		}
+		fmt.Fprintf(&b, " [category=%s]", category)
+		if len(f.EvidenceIDs) > 0 {
+			refs, _ := json.Marshal(f.EvidenceIDs)
+			fmt.Fprintf(&b, " [evidence_ids=%s]", refs)
+		}
 		if len(f.Assets) > 0 {
 			fmt.Fprintf(&b, "（资产：%s）", strings.Join(f.Assets, "、"))
 		}
@@ -480,8 +528,11 @@ func loadWorkerEntrySeedFrom(ts *db.ExplorationStore, snap *graphSnapshot, as *d
 		}
 	}
 
-	facts, err := snap.listByKind(db.KindFact, 1000)
+	keys, err := ts.EntrySeedFacts(true)
 	collect(err)
+	general, err := ts.EntrySeedFacts(false)
+	collect(err)
+	facts := append(keys, general...)
 	g.Facts = facts
 	findings, err := snap.listByKind(db.KindFinding, 1000)
 	collect(err)
@@ -555,6 +606,19 @@ func factFields(n *db.Node) (summary, detail, confidence string) {
 	detail, _ = p["detail"].(string)
 	confidence, _ = p["confidence"].(string)
 	return
+}
+
+func factPriorityFields(n *db.Node) (category string, evidenceIDs []string) {
+	var p struct {
+		Category    string   `json:"category"`
+		EvidenceIDs []string `json:"evidence_ids"`
+	}
+	_ = json.Unmarshal(n.Payload, &p)
+	return p.Category, p.EvidenceIDs
+}
+
+func isKeyFact(category string, evidenceIDs []string) bool {
+	return category != "" && category != "general" || len(evidenceIDs) > 0
 }
 
 func assetLabelOf(labels map[int64]string, id int64) string {
