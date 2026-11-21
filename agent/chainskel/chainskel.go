@@ -118,7 +118,7 @@ var keywordRules = []struct {
 	// identity/cloud/database 置于 web 之前:身份、云、数据库专属信号优先于 web 泛词。
 	// 仅保留各自专词,不含裸 sql/ssrf 等泛词,无专属信号的 sql/注入/ssrf 仍回退 web。
 	{"identity", []string{"saml", "oidc", "openid", "oauth", "sso", "单点登录", "身份联邦", "联邦登录", "账号接管", "account takeover", "redirect_uri", "assertion 篡改", "idp 元数据", "jwt"}},
-	{"cloud", []string{"k8s", "kubernetes", "云原生", "imds", "元数据凭据", "公开桶", "存储桶", "iam 角色", "iam 权限", "过度授权", "rbac", "eks", "gke", "serviceaccount", "云控制面"}},
+	{"cloud", []string{"k8s", "kubernetes", "云原生", "imds", "元数据凭据", "公开桶", "存储桶", "iam 角色", "iam 权限", "过度授权", "集群 rbac", "eks", "gke", "serviceaccount", "云控制面"}},
 	{"database", []string{"数据库安全", "数据库未授权", "数据库弱口令", "redis 未授权", "mongodb 未授权", "memcached 未授权", "xp_cmdshell", "load_file", "file_priv", "copy program", "udf 提权", "数据库提权", "数据库配置审计", "rds 配置审计"}},
 	{"web", []string{"sql", "注入", "xss", "ssrf", "ssti", "xxe", "反序列化", "文件上传", "上传点", "命令注入", "命令执行", "代码执行", "rce", "waf", "逻辑漏洞", "越权", "文件包含", "目录遍历", "cms", "graphql", "bola", "bfla", "idor", "接口鉴权", "接口测试", "批量赋值", "mass assignment", "限速绕过", "rest api", "websocket", "前端加密", "前端签名", "js 加密", "sourcemap", "webpack 还原", "请求签名", "web app", "web application", "webapp", "web应用", "web 应用"}},
 	// web3 置于 web 之后保留 web 优先级,但先于 pivot,避免"可升级代理/代理合约"被泛词"代理"吞掉。

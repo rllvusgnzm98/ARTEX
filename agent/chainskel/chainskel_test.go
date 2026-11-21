@@ -84,6 +84,8 @@ func TestP1RoutingMismatches(t *testing.T) {
 		{"SAML 断言签名绕过", nil, "identity"},
 		{"SSRF 打云元数据 IMDS 临时凭据", nil, "cloud"},
 		{"SSRF 读取 IMDS", nil, "cloud"},
+		{"REST API RBAC 评估", nil, "web"},
+		{"k8s 集群 rbac 审查", nil, "cloud"},
 		{"SSRF 文件读取", nil, "web"},
 		{"SQL 数据库配置审计", nil, "database"},
 		{"数据库未授权与危险配置审计", nil, "database"},
