@@ -49,6 +49,7 @@ type Server struct {
 	jwtKey   []byte      // jwt.key 原文：AES 主密钥、无 kid 令牌验签、出口指纹。轮换签名密钥时不动它
 	jwtRing  *jwtKeyRing // HS256 签名钥匙环；nil 时签发/验签退回 jwtKey
 	gate     *Gate       // 伪装门控；nil 表示未初始化，Handler 不改写 UI 行为
+	setup    setupGate   // 首次设置密码的一次性令牌
 
 	sessReg   *session.Registry   // 立足点会话注册表；nil = DB 未就绪
 	sessStore *db.SessionStore    // 会话落库访问层（secret AES-GCM，密钥由 jwtKey 派生）
@@ -163,6 +164,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
+	s.initSetupToken(keyDir)
 	s.initSideQuestions()
 	s.initStage(dataDir) // 受管文件投递暂存；失败降级为关闭，不影响启动
 	s.initGate(dataDir)  // 伪装门控；解析失败保持 detect，不阻断启动
