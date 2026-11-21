@@ -7,6 +7,28 @@ import (
 	"testing"
 )
 
+func TestHostPaceRPS(t *testing.T) {
+	for _, tt := range []struct {
+		value string
+		want  float64
+	}{
+		{"", HostPaceDefaultRPS},
+		{"  ", HostPaceDefaultRPS},
+		{" 2.5 ", 2.5},
+		{"0", 0},
+		{"-1", HostPaceDefaultRPS},
+		{"invalid", HostPaceDefaultRPS},
+		{"NaN", HostPaceDefaultRPS},
+	} {
+		t.Run(tt.value, func(t *testing.T) {
+			t.Setenv("ARTEX_HOST_PACE_RPS", tt.value)
+			if got := HostPaceRPS(); got != tt.want {
+				t.Fatalf("HostPaceRPS() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestPostgresDSNPrecedence(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.json")

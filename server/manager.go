@@ -251,6 +251,7 @@ type Manager struct {
 	// capture is on it becomes the MITM's upstream; when capture is off it is
 	// injected into agent bash env / WebFetch directly. See ProxyAddr.
 	globalProxy string
+	hostPace    float64 // 每主机礼貌限速 req/s;0=关闭
 
 	// taskProxy 按任务 MITM 实例管理器（见 taskproxy.go）；nil = 关闭。
 	// 不得用进程级 SetUpstream 让任务互相踩踏上游。
@@ -270,6 +271,7 @@ const (
 	// (http/https/socks5). Empty = direct. Distinct from web_search_proxy (which
 	// only routes the search backend) and the per-profile LLM proxy.
 	settingGlobalProxy = "global_proxy"
+	settingHostPace    = "host_pace_rps"
 	settingWorkers     = "workers"
 	settingLLMRecord   = "llm_record"
 	// LLM 轮询(故障转移)。默认关闭——开启后走「全局激活配置」的 agent 在当前配置
@@ -453,13 +455,25 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 			log.Printf("[proxy] 全局代理 %q 无效，已忽略: %v", m.globalProxy, err)
 		}
 	}
+	// Polite per-host pacing: the persisted setting wins once chosen; otherwise the
+	// config default (env ARTEX_HOST_PACE_RPS or built-in). Applied to the global
+	// proxy here and to each per-task proxy as it is built (see taskproxy.go).
+	m.hostPace = config.HostPaceRPS()
+	if v, ok, _ := pg.GetSetting(settingHostPace); ok && strings.TrimSpace(v) != "" {
+		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil && f >= 0 {
+			m.hostPace = f
+		}
+	}
+	if m.traffic != nil {
+		m.traffic.SetHostPace(m.hostPace, 0)
+	}
 	m.enrich = enrich.New(m.assets, m.ProxyAddr, 4)
 	// 按任务懒建 MITM。ARTEX_TASK_PROXY=off 关闭；端口池 ARTEX_TASK_PROXY_PORT_RANGE。
 	if config.TaskProxyEnabled() {
 		if pmin, pmax, err := tunnel.ParsePortRange(config.TaskProxyPortRange()); err != nil {
 			log.Printf("[taskproxy] 端口池非法,按任务 MITM 关闭: %v", err)
 		} else {
-			m.taskProxy = newTaskProxyManager(dir, pgdb.NewTunnelStore(pg), m.GlobalProxy, pmin, pmax)
+			m.taskProxy = newTaskProxyManager(dir, pgdb.NewTunnelStore(pg), m.GlobalProxy, m.HostPace, pmin, pmax)
 			m.taskProxy.useRoE(m.proxyRoEDeps())
 			agent.TaskScopeChanged = m.InvalidateProxyRoE
 		}
@@ -795,6 +809,33 @@ func (m *Manager) GlobalProxy() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.globalProxy
+}
+
+// HostPace 返回当前每主机礼貌限速(req/s;0=关闭)。
+func (m *Manager) HostPace() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.hostPace
+}
+
+// SetHostPace 持久化并即时应用每主机礼貌限速(req/s;<=0=关闭),覆盖全局出口与所有在用任务代理。
+func (m *Manager) SetHostPace(rps float64) error {
+	if rps < 0 {
+		rps = 0
+	}
+	if err := m.pg.SetSetting(settingHostPace, strconv.FormatFloat(rps, 'f', -1, 64)); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.hostPace = rps
+	m.mu.Unlock()
+	if m.traffic != nil {
+		m.traffic.SetHostPace(rps, 0)
+	}
+	if m.taskProxy != nil {
+		m.taskProxy.ApplyHostPace()
+	}
+	return nil
 }
 
 // SetGlobalProxy validates, persists and applies the global egress proxy

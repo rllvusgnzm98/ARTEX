@@ -16,6 +16,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -173,6 +174,9 @@ type Traffic struct {
 	// hostGate, when non-nil, rejects a target host before any upstream dial.
 	// nil means the gate is off and forwarding is unchanged. Hot-swappable.
 	hostGate atomic.Pointer[hostGateFn]
+	// pace, when non-nil, delays requests per target host for politeness.
+	// Hot-swappable; nil means no pacing. Loopback is never paced.
+	pace atomic.Pointer[pacer]
 }
 
 // hostGateFn is the RoE host check installed by SetHostGate.
@@ -343,6 +347,35 @@ func (t *Traffic) SetHostGate(fn func(host string) error) {
 	t.hostGate.Store(&f)
 }
 
+// SetHostPace installs a polite per-host request pacer on the egress path:
+// sustained traffic to any one target host is held to rps requests/second, with
+// short bursts up to `burst` let through immediately. rps<=0 removes pacing.
+// burst<1 defaults to ceil(rps). Hot-swappable; takes effect on the next request.
+func (t *Traffic) SetHostPace(rps float64, burst int) {
+	if rps <= 0 {
+		t.pace.Store(nil)
+		return
+	}
+	interval := time.Duration(float64(time.Second) / rps)
+	if burst < 1 {
+		burst = int(math.Ceil(rps))
+		if burst < 1 {
+			burst = 1
+		}
+	}
+	t.pace.Store(newPacer(interval, burst))
+}
+
+// paceHost blocks for as long as the pacer requires before a request to host may
+// proceed. No-op when pacing is off or host is loopback.
+func (t *Traffic) paceHost(ctx context.Context, host string) {
+	p := t.pace.Load()
+	if p == nil || host == "" || isLoopback(host) {
+		return
+	}
+	p.wait(ctx, host, t.closed)
+}
+
 // gateHost reports a gate rejection. A nil gate returns nil and does no work.
 func (t *Traffic) gateHost(host string) error {
 	p := t.hostGate.Load()
@@ -461,13 +494,21 @@ type sink struct {
 
 // Requestheaders rejects an out-of-scope host before the proxy dials upstream.
 // Assigning f.Response makes go-mitmproxy return that response and skip the
-// upstream request. A nil gate returns immediately.
+// upstream request. Allowed non-CONNECT requests are paced before forwarding.
 func (s *sink) Requestheaders(f *mproxy.Flow) {
 	if f == nil || f.Request == nil || f.Request.URL == nil {
 		return
 	}
-	err := s.t.gateHost(f.Request.URL.Hostname())
+	host := f.Request.URL.Hostname()
+	err := s.t.gateHost(host)
 	if err == nil {
+		if f.Request.Method != http.MethodConnect {
+			ctx := context.Background()
+			if raw := f.Request.Raw(); raw != nil {
+				ctx = raw.Context()
+			}
+			s.t.paceHost(ctx, host)
+		}
 		return
 	}
 	// Default MITM looks up the upstream certificate before answering CONNECT.
