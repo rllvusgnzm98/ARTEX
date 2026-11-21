@@ -15,7 +15,7 @@ func TestValidateChainTags(t *testing.T) {
 		{"nil 合法", nil, false},
 		{"单个合法", []string{"web"}, false},
 		{"两个合法", []string{"web", "pivot"}, false},
-		{"非法取值", []string{"web", "cloud"}, true},
+		{"非法取值", []string{"web", "bogus"}, true},
 		{"超过两个", []string{"web", "ad", "priv"}, true},
 	}
 	for _, c := range cases {
@@ -192,7 +192,7 @@ func TestOnDemandCategories(t *testing.T) {
 			t.Fatalf("irrelevant intent %q routed: %s", summary, out)
 		}
 	}
-	for _, category := range []string{"patch", "firmware", "audit"} {
+	for _, category := range []string{"patch", "firmware", "audit", "identity", "cloud", "protocol"} {
 		if err := ValidateChainTags([]string{category, "web"}); err != nil {
 			t.Fatal(err)
 		}
@@ -224,6 +224,39 @@ func TestOnDemandCategories(t *testing.T) {
 				t.Fatalf("%s missing %s", category, term)
 			}
 		}
+	}
+}
+
+func TestBatch2Categories(t *testing.T) {
+	for _, tc := range []struct{ summary, category string }{
+		{"OAuth redirect_uri 账号接管", "identity"},
+		{"SAML 断言签名绕过", "identity"},
+		{"k8s 集群 RBAC 审查", "cloud"},
+		{"云元数据 IMDS 临时凭据", "cloud"},
+		{"protobuf 报文解析字段还原", "protocol"},
+		{"grpc 帧布局分析", "protocol"},
+	} {
+		t.Run(tc.summary, func(t *testing.T) {
+			out := ForIntent(payload(t, map[string]any{"summary": tc.summary}))
+			if !strings.Contains(out, `category="`+tc.category+`"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+				t.Fatalf("summary %q want primary %s, got: %s", tc.summary, tc.category, out)
+			}
+		})
+	}
+	// explicit chain_tags take priority over summary keywords, first valid tag only, one block
+	out := ForIntent(payload(t, map[string]any{"summary": "做 sql 注入测试", "chain_tags": []string{"cloud", "web"}}))
+	if !strings.Contains(out, `category="cloud"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+		t.Fatalf("explicit tag priority failed: %s", out)
+	}
+	// api-security folds into the existing web tag (BOLA/GraphQL keywords route to web)
+	for _, s := range []string{"GraphQL 内省与批查询 DoS", "REST API BOLA 越权"} {
+		if o := ForIntent(payload(t, map[string]any{"summary": s})); !strings.Contains(o, `category="web"`) {
+			t.Fatalf("api-security summary %q should route to web: %s", s, o)
+		}
+	}
+	// missing-file / invalid behavior stays fail-closed for the new tags too
+	if o := ForIntent(payload(t, map[string]any{"chain_tags": []string{"bogus"}})); o != "" {
+		t.Fatal("all-invalid tags must stay silent")
 	}
 }
 

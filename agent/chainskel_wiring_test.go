@@ -53,7 +53,7 @@ func TestAddIntentRejectsInvalidChainTags(t *testing.T) {
 
 	if _, err := tools.addOneIntent(intentItem{
 		Summary:   "云上横向",
-		ChainTags: []string{"cloud"},
+		ChainTags: []string{"bogus"},
 	}); err == nil || !strings.Contains(err.Error(), "chain_tags 含非法取值") {
 		t.Fatalf("非法取值应在写库前被拒, got %v", err)
 	}

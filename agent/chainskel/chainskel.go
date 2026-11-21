@@ -22,7 +22,7 @@ import (
 var skeletonFS embed.FS
 
 // Categories 是合法的 chain_tags 取值。
-var Categories = []string{"web", "ad", "app", "priv", "pwn", "recon", "rev", "pivot", "meta", "patch", "firmware", "audit"}
+var Categories = []string{"web", "ad", "app", "priv", "pwn", "recon", "rev", "pivot", "meta", "patch", "firmware", "audit", "identity", "cloud", "protocol"}
 
 // MaxTagsPerIntent 是公开标签校验上限;ForIntent 只注入首个主类别。
 const MaxTagsPerIntent = 2
@@ -103,7 +103,10 @@ var keywordRules = []struct {
 	{"patch", []string{"patch diff", "补丁差分", "补丁分析", "补丁对比", "n-day", "ghidriff", "diaphora"}},
 	{"firmware", []string{"firmware", "固件", "binwalk", "squashfs", "ubifs", "嵌入式安全", "iot security", "iot pentest"}},
 	{"audit", []string{"code audit", "code-audit", "source code security", "security code review", "源码审计", "代码审计", "白盒审计", "semgrep", "codeql", "gosec", "sast"}},
-	{"web", []string{"sql", "注入", "xss", "ssrf", "ssti", "xxe", "反序列化", "文件上传", "上传点", "命令注入", "命令执行", "代码执行", "rce", "waf", "逻辑漏洞", "越权", "jwt", "文件包含", "目录遍历", "cms"}},
+	{"web", []string{"sql", "注入", "xss", "ssrf", "ssti", "xxe", "反序列化", "文件上传", "上传点", "命令注入", "命令执行", "代码执行", "rce", "waf", "逻辑漏洞", "越权", "jwt", "文件包含", "目录遍历", "cms", "graphql", "bola", "bfla", "idor", "接口鉴权", "接口测试", "批量赋值", "mass assignment", "限速绕过", "rest api", "websocket"}},
+	{"identity", []string{"saml", "oidc", "openid", "oauth", "sso", "单点登录", "身份联邦", "联邦登录", "账号接管", "account takeover", "redirect_uri", "assertion 篡改", "idp 元数据"}},
+	{"cloud", []string{"k8s", "kubernetes", "云原生", "imds", "元数据凭据", "公开桶", "存储桶", "iam 角色", "iam 权限", "过度授权", "rbac", "eks", "gke", "serviceaccount", "云控制面"}},
+	{"protocol", []string{"protobuf", "grpc", "协议逆向", "私有协议", "二进制协议", "pcap", "流量还原", "帧布局", "帧结构", "tlv", "mqtt", "kaitai", "dissector", "报文解析", "decode_raw"}},
 	{"ad", []string{"kerberos", "域控", "ad域", "活动目录", "ntlm", "dcsync", "kerberoast", "委派", "adcs", "黄金票据", "白银票据", "as-rep", "域渗透", "域内", "密码喷洒"}},
 	{"app", []string{"apk", "frida", "小程序", "安卓", "android", "ios", "抓包", "app"}},
 	{"priv", []string{"提权", "权限提升", "privesc", "suid", "内核漏洞", "disable_functions", "容器逃逸", "逃逸"}},

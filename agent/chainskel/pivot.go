@@ -84,7 +84,7 @@ func RefsGuideForIntent(payload json.RawMessage) string {
 	if len(cats) == 0 {
 		return ""
 	}
-	if cats[0] == "patch" || cats[0] == "firmware" || cats[0] == "audit" {
+	if cats[0] == "patch" || cats[0] == "firmware" || cats[0] == "audit" || cats[0] == "identity" || cats[0] == "cloud" || cats[0] == "protocol" {
 		return ""
 	}
 	paths := make([]string, len(cats))
