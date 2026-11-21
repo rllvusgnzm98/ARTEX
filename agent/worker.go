@@ -563,6 +563,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if tc.DeadlineUnix > 0 {
 		settle = wrapupSettlementForTask("worker", []string{"Bash"}, clamped)
 	}
+	window := w.compactionWindow()
 	opts := agentcore.Options{
 		Provider:        w.prov,
 		SystemPrompt:    system,
@@ -597,13 +598,12 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		// clamped(被任务 deadline 夹逼)时用 PromptByReason:因超时=任务到点→任务超时词,
 		// 因步数=夹逼窗口内步数先耗尽→回落 per-run 词。非 clamped 维持纯 per-run。
 		Settlement: settle,
-		// large tool output spills to cmd-output/ with a head + pointer (SDK tool.Capture);
-		// full output preserved on disk. 截断上限用 SDK 默认(30000 字符)。
+		// ARTEX spills large output to cmd-output/ with bounded head+tail previews.
 		ToolOutputDir: cmdOutDir(runDir),
-		Compaction:    compactionConfig(w.compactionWindow()), // long tool-heavy runs stay within the window
-		Todos:         actool.NewTodoStore(),                  // 会话级临时待办（TodoWrite），纯规划用，退出即丢
-		NonStreaming:  w.nonStreaming(),                       // 该 profile 选非流式时走 Provider.Complete
-		MaxTokens:     w.maxTokens(),                          // 0 = 不发上限,由服务端默认值决定
+		Compaction:    compactionConfig(window), // long tool-heavy runs stay within the window
+		Todos:         actool.NewTodoStore(),    // 会话级临时待办（TodoWrite），纯规划用，退出即丢
+		NonStreaming:  w.nonStreaming(),         // 该 profile 选非流式时走 Provider.Complete
+		MaxTokens:     w.maxTokens(),            // 0 = 不发上限,由服务端默认值决定
 	}
 	AttachStableWebFetch(&opts, w.uaForTask(taskID)) // 官方 WebFetch 请求头用本任务稳定 UA，回包走 untrusted-data
 	if hooks != nil {                                // typed-nil guard: only set when concrete (avoids harness panic)
@@ -631,7 +631,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 
 	// 实验功能:开启后由 noa 接管上下文压缩(归档集中在 <workDir>/noa/<SessionID> 下,持久)。
 	noaSession := WorkerSessionID(ts.ID(), intent.ID)
-	enableNoa(&opts, w.noaEnabledFn, w.workDir, noaSession, opts.Compaction.ContextWindow, noaWarn(noaSession))
+	enableNoa(&opts, w.noaEnabledFn, w.workDir, noaSession, window, noaWarn(noaSession))
+	attachToolOutputSpilling(&opts)
 	ctx = attachSideCapture(ctx, &opts)
 	s := agentcore.NewSession(opts)
 	defer s.Close() // release the session's background-task manager (temp dir + processes)
