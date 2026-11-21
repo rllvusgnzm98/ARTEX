@@ -870,6 +870,9 @@ func (m *Manager) SetHostPace(rps float64) error {
 	if m.paceProxy != nil {
 		m.paceProxy.SetHostPacer(p)
 	}
+	// Capture off: toggling pacing on/off changes ProxyAddr (pace proxy vs direct),
+	// so the seeded browser MCP must re-route too — mirror SetGlobalProxy.
+	m.syncBrowserMCPProxy()
 	return nil
 }
 
