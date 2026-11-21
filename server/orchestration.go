@@ -45,6 +45,7 @@ func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	tools = append(tools, s.tunnelTools()...)     // 隧道：list/probe/deploy/teardown
 	tools = append(tools, s.credentialTools()...) // 凭据：add/list/reuse_plan
 	tools = append(tools, s.dualVerifyTools()...)
+	tools = append(tools, s.patchVerifyTools()...)
 	if t := s.stageShareTool(); t != nil {
 		tools = append(tools, t)
 	}
