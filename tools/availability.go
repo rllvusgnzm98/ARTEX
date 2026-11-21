@@ -74,14 +74,20 @@ func CheckCommand(ctx context.Context, spec CommandSpec, dataDir string) Availab
 		return r
 	}
 	if spec.Name == "httpx" {
+		home, err := os.MkdirTemp("", "artex-httpx-probe-")
+		if err != nil {
+			r.Error = "httpx identity probe: create temporary home: " + err.Error()
+			return r
+		}
+		defer os.RemoveAll(home)
 		ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
 		out := &probeOutput{}
-		cmd := exec.CommandContext(ctx, r.Path, "-version")
-		cmd.Env = append(os.Environ(), "PATH="+CommandPath(dataDir))
+		cmd := exec.CommandContext(ctx, r.Path, "-version", "-duc")
+		cmd.Env = append(os.Environ(), "PATH="+CommandPath(dataDir), "HOME="+home, "XDG_CONFIG_HOME="+home, "XDG_CACHE_HOME="+home)
 		cmd.Stdout, cmd.Stderr = out, out
 		cmd.WaitDelay = 100 * time.Millisecond
-		err := cmd.Run()
+		err = cmd.Run()
 		version := strings.ToLower(string(out.data))
 		if err != nil || !strings.Contains(version, "projectdiscovery") {
 			r.Error = "identity mismatch: httpx must be ProjectDiscovery's CLI (-version)"

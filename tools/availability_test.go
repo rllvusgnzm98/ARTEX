@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -85,5 +86,59 @@ func TestAvailabilitySummary(t *testing.T) {
 		if summary == "" || warn != (len(results) > 0 && !results[0].Available) {
 			t.Fatalf("summary=%s warning=%v", summary, warn)
 		}
+	}
+}
+
+func TestHTTPXProbeIsolatesHome(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprint("failure=", fail), func(t *testing.T) {
+			data, home, config, cache, scratch := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", config)
+			t.Setenv("XDG_CACHE_HOME", cache)
+			t.Setenv("TMPDIR", scratch)
+			receipt := filepath.Join(data, "probe-home")
+			t.Setenv("ARTEX_PROBE_RECEIPT", receipt)
+			body := `[ "$1" = "-version" ] && [ "$2" = "-duc" ] || exit 2
+printf '%s' "$HOME" > "$ARTEX_PROBE_RECEIPT"
+printf config > "$HOME/httpx-config"
+printf config > "$XDG_CONFIG_HOME/xdg-config"
+printf cache > "$XDG_CACHE_HOME/xdg-cache"
+echo projectdiscovery.io`
+			if fail {
+				body += "\nexit 1"
+			}
+			commandFixture(t, data, "httpx", body)
+			r := CheckCommand(t.Context(), CommandSpec{Name: "httpx"}, data)
+			if r.Available == fail {
+				t.Fatalf("unexpected identity result: %+v", r)
+			}
+			probeHome, err := os.ReadFile(receipt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if filepath.Dir(string(probeHome)) != scratch {
+				t.Fatalf("probe not isolated: %q", probeHome)
+			}
+			if _, err := os.Stat(string(probeHome)); !os.IsNotExist(err) {
+				t.Fatalf("probe HOME not cleaned: %v", err)
+			}
+			for _, dir := range []string{home, config, cache, scratch} {
+				entries, err := os.ReadDir(dir)
+				if err != nil || len(entries) != 0 {
+					t.Fatalf("diagnostic left files in %s: %v %v", dir, entries, err)
+				}
+			}
+		})
+	}
+}
+
+func TestHTTPXProbeTemporaryHomeFailure(t *testing.T) {
+	data := t.TempDir()
+	commandFixture(t, data, "httpx", "echo projectdiscovery.io")
+	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "missing"))
+	r := CheckCommand(t.Context(), CommandSpec{Name: "httpx"}, data)
+	if r.Available || !strings.Contains(r.Error, "create temporary home") {
+		t.Fatalf("unexpected result: %+v", r)
 	}
 }
