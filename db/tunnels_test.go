@@ -12,7 +12,11 @@ func TestTunnelStoreCRUD(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 	ctx := context.Background()
 	s := NewTunnelStore(d)
 
@@ -28,7 +32,11 @@ func TestTunnelStoreCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	t.Cleanup(func() { _ = s.Delete(context.Background(), id) })
+	t.Cleanup(func() {
+		if err := s.Delete(context.Background(), id); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 
 	rec, err := s.Get(ctx, id)
 	if err != nil || rec == nil {

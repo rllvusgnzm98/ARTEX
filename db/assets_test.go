@@ -1008,7 +1008,11 @@ func TestAssetIPRejectsHostname(t *testing.T) {
 // are excluded. Direct source tasks' scope is included.
 func TestQueryDSLInScopeMembership(t *testing.T) {
 	d, assets, _ := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	task, err := d.CreateTask("scope membership", "goal", nil, 0, 0)
 	if err != nil {
@@ -1018,18 +1022,25 @@ func TestQueryDSLInScopeMembership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(task.ID); _ = d.DeleteTask(src.ID) })
+	t.Cleanup(func() {
+		if err := d.DeleteTask(task.ID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+		if err := d.DeleteTask(src.ID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 	// task ← src is a direct source relation.
 	if _, err := d.Exec(`INSERT INTO task_relations(task_id, source_task_id) VALUES ($1,$2)`, task.ID, src.ID); err != nil {
 		t.Fatal(err)
 	}
 
 	stamp := time.Now().UnixNano()
-	root := fmt.Sprintf("sc%d.invalid", stamp)           // in-scope root domain (task)
-	srcRoot := fmt.Sprintf("src%d.invalid", stamp)       // in-scope via source task
-	out := fmt.Sprintf("out%d.invalid", stamp)           // out of every scope
-	marker := fmt.Sprintf("mk%d", stamp)                 // bare-text token present in all rows
-	foreignTask := stamp + 777                           // asset produced by an unrelated task
+	root := fmt.Sprintf("sc%d.invalid", stamp)     // in-scope root domain (task)
+	srcRoot := fmt.Sprintf("src%d.invalid", stamp) // in-scope via source task
+	out := fmt.Sprintf("out%d.invalid", stamp)     // out of every scope
+	marker := fmt.Sprintf("mk%d", stamp)           // bare-text token present in all rows
+	foreignTask := stamp + 777                     // asset produced by an unrelated task
 
 	// Scope: task owns root; source task owns srcRoot; task owns an IP /24.
 	for _, sc := range []struct {
@@ -1057,7 +1068,7 @@ func TestQueryDSLInScopeMembership(t *testing.T) {
 		{"subdomain", "api." + root, root, "", "", "", marker},                        // under task root
 		{"service", "www." + root, root, "https://www." + root + "/", "", "", marker}, // service under task root
 		{"endpoint", "www." + root, root, "https://www." + root + "/a?" + marker + "=1", "GET", "", ""},
-		{"subdomain", "dev." + srcRoot, srcRoot, "", "", "", marker}, // under source-task root
+		{"subdomain", "dev." + srcRoot, srcRoot, "", "", "", marker},                                      // under source-task root
 		{"endpoint", "198.51.100.9", "198.51.100.9", "http://198.51.100.9:8080/" + marker, "GET", "", ""}, // IP-literal host, ip col empty
 		{"subdomain", "x." + out, out, "", "", "", marker},                                                // out of scope
 	}
@@ -1077,7 +1088,9 @@ func TestQueryDSLInScopeMembership(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() {
-		_, _ = d.Exec(`DELETE FROM assets WHERE id=ANY($1::bigint[]) OR id=ANY($2::bigint[])`, inScopeIDs, outIDs)
+		if _, err := d.Exec(`DELETE FROM assets WHERE id=ANY($1::bigint[]) OR id=ANY($2::bigint[])`, inScopeIDs, outIDs); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
 	})
 
 	got, err := assets.QueryDSLInScope(marker, "", task.ID, 50, 0)

@@ -14,7 +14,11 @@ func TestTaskTemplateCRUDAndNormalizedUniqueness(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	suffix := time.Now().UnixNano()
 	name := fmt.Sprintf("Template %d", suffix)
@@ -26,7 +30,11 @@ func TestTaskTemplateCRUDAndNormalizedUniqueness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = d.DeleteTaskTemplate(created.ID) })
+	t.Cleanup(func() {
+		if _, err := d.DeleteTaskTemplate(created.ID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 	if created.Name != name || created.Description != "initial description" || created.Goal != "initial goal" {
 		t.Fatalf("template was not normalized: %+v", created)
 	}
@@ -85,7 +93,11 @@ func TestTaskTemplateDisjointPatchesCompose(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	created, err := d.CreateTaskTemplate(TaskTemplateInput{
 		Name:        fmt.Sprintf("Concurrent template %d", time.Now().UnixNano()),
@@ -95,7 +107,11 @@ func TestTaskTemplateDisjointPatchesCompose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = d.DeleteTaskTemplate(created.ID) })
+	t.Cleanup(func() {
+		if _, err := d.DeleteTaskTemplate(created.ID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 
 	description := "description from concurrent patch"
 	goal := "goal from concurrent patch"

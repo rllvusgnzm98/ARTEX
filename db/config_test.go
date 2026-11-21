@@ -17,7 +17,11 @@ func TestPoolProfilesOrder(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	mk := func(name string, priority int, exclude bool, key string) int64 {
 		id, err := d.SaveProfile(&LLMProfile{
@@ -27,7 +31,11 @@ func TestPoolProfilesOrder(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { d.Exec(`DELETE FROM llm_profiles WHERE id=$1`, id) })
+		t.Cleanup(func() {
+			if _, err := d.Exec(`DELETE FROM llm_profiles WHERE id=$1`, id); err != nil {
+				t.Errorf("cleanup: %v", err)
+			}
+		})
 		return id
 	}
 	lo := mk("t-pool-lo", 1, false, "k1")

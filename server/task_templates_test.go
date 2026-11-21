@@ -19,7 +19,11 @@ func TestTaskTemplateHTTPCRUD(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer m.Close()
+	t.Cleanup(func() {
+		if err := m.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
 	h := s.Handler()
 	token, err := signJWT(s.jwtKey)
@@ -49,7 +53,11 @@ func TestTaskTemplateHTTPCRUD(t *testing.T) {
 		t.Fatalf("create status=%d body=%v", code, created)
 	}
 	id := int64(created["id"].(float64))
-	t.Cleanup(func() { _, _ = m.pg.DeleteTaskTemplate(id) })
+	t.Cleanup(func() {
+		if _, err := m.pg.DeleteTaskTemplate(id); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 
 	code, duplicate := do(http.MethodPost, "/api/task-templates", map[string]any{
 		"name": "  " + name + "  ", "description": "other", "goal": "other",
@@ -89,13 +97,21 @@ func TestConversationPatchReturnsPinState(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer m.Close()
+	t.Cleanup(func() {
+		if err := m.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
 	conversation, err := m.pg.CreateConversation("mainagent", "pin through http", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = m.pg.DeleteConversation(conversation.ID) })
+	t.Cleanup(func() {
+		if err := m.pg.DeleteConversation(conversation.ID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 	token, err := signJWT(s.jwtKey)
 	if err != nil {
 		t.Fatal(err)

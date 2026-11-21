@@ -31,7 +31,11 @@ func TestProbeDoesNotCreateSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer admin.Close()
+	t.Cleanup(func() {
+		if err := admin.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := admin.PingContext(ctx); err != nil {
@@ -42,7 +46,9 @@ func TestProbeDoesNotCreateSchema(t *testing.T) {
 		t.Fatalf("无法创建一次性探测库: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = admin.Exec(`DROP DATABASE IF EXISTS ` + pqIdent(name))
+		if _, err := admin.Exec(`DROP DATABASE IF EXISTS ` + pqIdent(name)); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
 	})
 
 	empty := *u
@@ -91,7 +97,11 @@ func TestProbeOtherQueryErrorIsNotUninitialized(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer admin.Close()
+	t.Cleanup(func() {
+		if err := admin.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := admin.PingContext(ctx); err != nil {
@@ -111,8 +121,12 @@ func TestProbeOtherQueryErrorIsNotUninitialized(t *testing.T) {
 		t.Fatalf("无法创建只读角色: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = admin.Exec(`DROP DATABASE IF EXISTS ` + pqIdent(dbName))
-		_, _ = admin.Exec(`DROP ROLE IF EXISTS ` + pqIdent(role))
+		if _, err := admin.Exec(`DROP DATABASE IF EXISTS ` + pqIdent(dbName)); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+		if _, err := admin.Exec(`DROP ROLE IF EXISTS ` + pqIdent(role)); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
 	})
 
 	ownerURL := *u

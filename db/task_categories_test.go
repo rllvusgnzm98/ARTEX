@@ -13,7 +13,11 @@ func TestTaskCategoryCRUDAndTaskAssignment(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	name := fmt.Sprintf("Category %d", time.Now().UnixNano())
 	category, err := d.CreateTaskCategory("  " + strings.ReplaceAll(name, " ", "   ") + "  ")
@@ -31,7 +35,11 @@ func TestTaskCategoryCRUDAndTaskAssignment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+	t.Cleanup(func() {
+		if err := d.DeleteTask(task.ID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 	loaded, err := d.GetTask(task.ID)
 	if err != nil || loaded == nil || loaded.CategoryID == nil || *loaded.CategoryID != category.ID || loaded.CategoryName != name {
 		t.Fatalf("categorized task=%+v err=%v", loaded, err)
@@ -95,14 +103,22 @@ func TestSetTasksCategoryBatch(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	stamp := time.Now().UnixNano()
 	category, err := d.CreateTaskCategory(fmt.Sprintf("Batch %d", stamp))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = d.DeleteTaskCategory(category.ID) })
+	t.Cleanup(func() {
+		if _, err := d.DeleteTaskCategory(category.ID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 
 	ids := make([]int64, 0, 3)
 	for i := range 3 {
@@ -110,7 +126,11 @@ func TestSetTasksCategoryBatch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+		t.Cleanup(func() {
+			if err := d.DeleteTask(task.ID); err != nil {
+				t.Errorf("cleanup: %v", err)
+			}
+		})
 		ids = append(ids, task.ID)
 	}
 
@@ -152,14 +172,22 @@ func TestSetTasksCategoryRejectsBadInputAtomically(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	stamp := time.Now().UnixNano()
 	task, err := d.CreateTaskWithOptions(fmt.Sprintf("batch-reject-%d", stamp), "goal", TaskCreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+	t.Cleanup(func() {
+		if err := d.DeleteTask(task.ID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 
 	missingCategory := int64(1 << 62)
 	if _, _, err := d.SetTasksCategory([]int64{task.ID}, &missingCategory); !errors.Is(err, ErrTaskCategoryNotFound) {

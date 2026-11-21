@@ -49,7 +49,11 @@ func firstResultID(t *testing.T, out map[string]any) int64 {
 
 func TestInsertAssetsHoneypotEvalUsesBodyAndCert(t *testing.T) {
 	d := testDB(t)
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 	task, err := d.CreateTask("honeypot eval fields fixture", "fixture", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -68,7 +72,9 @@ func TestInsertAssetsHoneypotEvalUsesBodyAndCert(t *testing.T) {
 	const bannerOnlyIP = "203.0.113.83"
 	const titleOnlyURL = "http://203.0.113.84/"
 	t.Cleanup(func() {
-		_, _ = d.Exec(`DELETE FROM assets WHERE url IN ($1,$2,$3) OR ip IN ($4,$5)`, glastopfURL, hfishURL, titleOnlyURL, dionaeaIP, bannerOnlyIP)
+		if _, err := d.Exec(`DELETE FROM assets WHERE url IN ($1,$2,$3) OR ip IN ($4,$5)`, glastopfURL, hfishURL, titleOnlyURL, dionaeaIP, bannerOnlyIP); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
 	})
 
 	glastopf := callInsertAssets(t, ts, map[string]any{
