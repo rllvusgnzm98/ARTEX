@@ -92,7 +92,7 @@ func managedPortRegistered(port int) bool {
 func TestTaskProxyLifecycle(t *testing.T) {
 	port := freePort(t)
 	lister := &fakeTunnelLister{}
-	m := newTaskProxyManager(t.TempDir(), lister, func() string { return "http://127.0.0.1:9000" }, port, port)
+	m := newTaskProxyManager(t.TempDir(), lister, func() string { return "http://127.0.0.1:9000" }, nil, port, port)
 	ctx := context.Background()
 
 	addr, ca := m.ForTask(ctx, 42)
@@ -175,7 +175,7 @@ func TestTwoTasksDoNotStompUpstream(t *testing.T) {
 		11: {socksRec(1, db.TunnelAlive, 20811)},
 		22: {socksRec(2, db.TunnelAlive, 20822)},
 	}}
-	m := newTaskProxyManager(t.TempDir(), lister, func() string { return "http://127.0.0.1:9000" }, min, max)
+	m := newTaskProxyManager(t.TempDir(), lister, func() string { return "http://127.0.0.1:9000" }, nil, min, max)
 	ctx := context.Background()
 	defer m.Close()
 

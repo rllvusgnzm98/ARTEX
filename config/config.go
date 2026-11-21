@@ -240,6 +240,22 @@ func TunnelPortRange() string {
 	return "20000-21000"
 }
 
+// HostPaceDefaultRPS is the built-in polite per-host request rate used on first
+// run when no host_pace_rps setting has been chosen yet. 0 would disable pacing.
+const HostPaceDefaultRPS = 10.0
+
+// HostPaceRPS resolves the startup default for per-host pacing: ARTEX_HOST_PACE_RPS
+// if set (>=0; 0 disables), else HostPaceDefaultRPS. A persisted host_pace_rps
+// setting, once chosen, overrides this.
+func HostPaceRPS() float64 {
+	if v := strings.TrimSpace(os.Getenv("ARTEX_HOST_PACE_RPS")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			return f
+		}
+	}
+	return HostPaceDefaultRPS
+}
+
 // TaskProxyEnabled reports whether per-task MITM instances are on.
 // Default on; env ARTEX_TASK_PROXY=off/0/false disables (worker then keeps
 // using the single global recording proxy).

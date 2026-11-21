@@ -3368,6 +3368,7 @@ func (s *Server) settingsPayload() map[string]any {
 		"tavily_key_set":           strings.TrimSpace(tavilyKey) != "",
 		"web_search_proxy":         proxy,                       // 独立出口代理(http/https/socks5)，空=直连
 		"global_proxy":             s.m.GlobalProxy(),           // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
+		"host_pace_rps":            s.m.HostPace(),              // 每主机礼貌限速(req/s);0=关闭,所有目标主机共享
 		"python_interpreter":       strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
 		"workers":                  s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
 		"task_concurrency_enabled": concOn,                      // 任务并发上限开关(默认关)
@@ -3434,14 +3435,15 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		LLMRecord           *bool `json:"llm_record"` // LLM 录制开关（默认关）；即时生效，无需重建 agent
 		// Web search. WebSearchEnabled/Backend toggle the tool + backend; BraveKey/TavilyKey
 		// are optional — omit (null) to leave a stored key untouched, send "" to clear.
-		WebSearchEnabled *bool   `json:"web_search_enabled"`
-		WebSearchBackend *string `json:"web_search_backend"`
-		BraveKey         *string `json:"brave_search_api_key"`
-		TavilyKey        *string `json:"tavily_search_api_key"`
-		WebSearchProxy   *string `json:"web_search_proxy"`   // 独立出口代理(http/https/socks5)；null=不改，""=清空
-		GlobalProxy      *string `json:"global_proxy"`       // 全局出口代理(http/https/socks5)；null=不改，""=清空(直连)
-		PythonInterp     *string `json:"python_interpreter"` // 自定义脚本工具的 python 解释器路径
-		Workers          *int    `json:"workers"`            // 并发工作 agent 数(>0)；对之后启动的任务生效
+		WebSearchEnabled *bool    `json:"web_search_enabled"`
+		WebSearchBackend *string  `json:"web_search_backend"`
+		BraveKey         *string  `json:"brave_search_api_key"`
+		TavilyKey        *string  `json:"tavily_search_api_key"`
+		WebSearchProxy   *string  `json:"web_search_proxy"`   // 独立出口代理(http/https/socks5)；null=不改，""=清空
+		GlobalProxy      *string  `json:"global_proxy"`       // 全局出口代理(http/https/socks5)；null=不改，""=清空(直连)
+		HostPaceRPS      *float64 `json:"host_pace_rps"`      // 每主机礼貌限速(req/s);null=不改,0=关闭
+		PythonInterp     *string  `json:"python_interpreter"` // 自定义脚本工具的 python 解释器路径
+		Workers          *int     `json:"workers"`            // 并发工作 agent 数(>0)；对之后启动的任务生效
 		// 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
 		ConcurrencyEnabled *bool `json:"task_concurrency_enabled"`
 		ConcurrencyLimit   *int  `json:"task_concurrency_limit"`
@@ -3593,6 +3595,16 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		changed = true // capture-off egress is baked into agents at build time → rebuild
+	}
+	if req.HostPaceRPS != nil {
+		if *req.HostPaceRPS < 0 {
+			writeErr(w, 400, "每主机限速需为 >=0 的数值(0=关闭)")
+			return
+		}
+		if err := s.m.SetHostPace(*req.HostPaceRPS); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
 	}
 	if req.WebSearchEnabled != nil || req.WebSearchBackend != nil || req.BraveKey != nil || req.TavilyKey != nil || req.WebSearchProxy != nil {
 		// Fill unspecified fields from current state so a partial PUT doesn't reset them.

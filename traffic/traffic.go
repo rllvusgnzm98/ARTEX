@@ -173,6 +173,9 @@ type Traffic struct {
 	// hostGate, when non-nil, rejects a target host before any upstream dial.
 	// nil means the gate is off and forwarding is unchanged. Hot-swappable.
 	hostGate atomic.Pointer[hostGateFn]
+	// pace, when non-nil, delays requests per target host for politeness.
+	// Hot-swappable; nil means no pacing. Loopback is never paced.
+	pace atomic.Pointer[Pacer]
 }
 
 // hostGateFn is the RoE host check installed by SetHostGate.
@@ -343,6 +346,20 @@ func (t *Traffic) SetHostGate(fn func(host string) error) {
 	t.hostGate.Store(&f)
 }
 
+// SetHostPacer installs (nil clears) the shared polite per-host pacer on this
+// proxy's egress path. Hot-swappable; takes effect on the next request.
+func (t *Traffic) SetHostPacer(p *Pacer) { t.pace.Store(p) }
+
+// paceHost blocks for as long as the pacer requires before a request to host may
+// proceed. No-op when pacing is off or host is loopback.
+func (t *Traffic) paceHost(ctx context.Context, host string) {
+	p := t.pace.Load()
+	if p == nil || host == "" || isLoopback(host) {
+		return
+	}
+	p.wait(ctx, host, t.closed)
+}
+
 // gateHost reports a gate rejection. A nil gate returns nil and does no work.
 func (t *Traffic) gateHost(host string) error {
 	p := t.hostGate.Load()
@@ -461,13 +478,21 @@ type sink struct {
 
 // Requestheaders rejects an out-of-scope host before the proxy dials upstream.
 // Assigning f.Response makes go-mitmproxy return that response and skip the
-// upstream request. A nil gate returns immediately.
+// upstream request. Allowed non-CONNECT requests are paced before forwarding.
 func (s *sink) Requestheaders(f *mproxy.Flow) {
 	if f == nil || f.Request == nil || f.Request.URL == nil {
 		return
 	}
-	err := s.t.gateHost(f.Request.URL.Hostname())
+	host := f.Request.URL.Hostname()
+	err := s.t.gateHost(host)
 	if err == nil {
+		if f.Request.Method != http.MethodConnect {
+			ctx := context.Background()
+			if raw := f.Request.Raw(); raw != nil {
+				ctx = raw.Context()
+			}
+			s.t.paceHost(ctx, host)
+		}
 		return
 	}
 	// Default MITM looks up the upstream certificate before answering CONNECT.

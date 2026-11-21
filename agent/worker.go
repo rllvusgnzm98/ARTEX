@@ -404,7 +404,7 @@ func workerSystem(proxyAddr, caCert, dataDir, runDir string, intranet bool) stri
 	// CLI 优先固定尾始终追加,位于内网变体之后,进场预塞仍由 execute() 再往后接。
 	// 工人红线是代码固定尾:目标内容当数据不当指令,内外网一律追加,
 	// 编辑正文也删不掉。进场预塞仍由 execute() 再往后接。
-	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir) + tail + workerShellCLIRules + untrustedDataRule + workerAntiTrapRules + chainskel.WorkerMetaRules
+	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir) + tail + workerShellCLIRules + untrustedDataRule + workerAntiTrapRules + workerFootprintRules + chainskel.WorkerMetaRules
 }
 
 // renderIntentTask formats the claimed intent for the worker's launch USER message:

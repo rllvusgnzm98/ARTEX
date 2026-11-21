@@ -31,6 +31,8 @@ export default function SystemSettingsPage() {
   const [savingProxy, setSavingProxy] = React.useState(false);
   const [globalProxyInput, setGlobalProxyInput] = React.useState("");
   const [savingGlobalProxy, setSavingGlobalProxy] = React.useState(false);
+  const [hostPaceInput, setHostPaceInput] = React.useState("10");
+  const [savingHostPace, setSavingHostPace] = React.useState(false);
   const [testing, setTesting] = React.useState(false);
   const [loaded, setLoaded] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
@@ -55,6 +57,7 @@ export default function SystemSettingsPage() {
     setTavilyKeySet(!!s.tavily_key_set);
     setProxyInput(s.web_search_proxy ?? "");
     setGlobalProxyInput(s.global_proxy ?? "");
+    setHostPaceInput(String(s.host_pace_rps ?? 10));
     setPyInterp(s.python_interpreter ?? "");
     setWorkers(String(s.workers ?? 3));
     setInjectPlanner(s.constraints_inject_planner !== false);
@@ -232,6 +235,23 @@ export default function SystemSettingsPage() {
       .finally(() => setSavingGlobalProxy(false));
   };
 
+  const saveHostPace = () => {
+    const n = Number(hostPaceInput);
+    if (!Number.isFinite(n) || n < 0) {
+      toast.error("每主机限速需为 >= 0 的数值（0 = 关闭）");
+      return;
+    }
+    setSavingHostPace(true);
+    api
+      .setSettings({ host_pace_rps: n })
+      .then((s) => {
+        apply(s);
+        toast.success(n > 0 ? `已保存每主机限速 ${n} req/s` : "已关闭每主机限速");
+      })
+      .catch((e) => toast.error("保存失败：" + (e as Error).message))
+      .finally(() => setSavingHostPace(false));
+  };
+
   // Run a real "test" search ("test") against the CURRENT form values (backend +
   // proxy + entered key), falling back to saved values server-side. Toasts result.
   const runTest = () => {
@@ -360,6 +380,24 @@ export default function SystemSettingsPage() {
             </div>
             <p className="text-muted-foreground text-xs">
               {globalProxyInput.trim() ? "已配置 · 所有目标流量经此代理出网" : "未配置 · 目标流量直连出网"}
+            </p>
+            <Label htmlFor="host-pace" className="text-sm font-normal text-muted-foreground">
+              每主机礼貌限速 (req/s，0=关闭)
+            </Label>
+            <div className="flex items-center gap-2">
+              <Input
+                id="host-pace"
+                inputMode="numeric"
+                value={hostPaceInput}
+                disabled={!loaded || savingHostPace}
+                onChange={(e) => setHostPaceInput(e.target.value)}
+              />
+              <Button type="button" onClick={saveHostPace} disabled={!loaded || savingHostPace}>
+                保存
+              </Button>
+            </div>
+            <p className="text-muted-foreground text-xs">
+              对每个目标主机主动限速，避免高频请求压垮厂商站点（0 关闭）。
             </p>
           </CardContent>
         </Card>
