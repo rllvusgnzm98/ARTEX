@@ -151,8 +151,7 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		MaxDuration:           maxDuration,
 		Compaction:            compactionConfig(c.window),
 		Todos:                 actool.NewTodoStore(),
-		// large tool output spills to cmd-output/ under the session dir.
-		// 截断上限用 SDK 默认(tool.Capture 的 30000 字符)。
+		// ARTEX spills large output to cmd-output/ under the session dir.
 		ToolOutputDir: filepath.Join(sessionWorkDir, "cmd-output"),
 		// 命中预算(步数)→ SDK 跑收尾:输出一句总结。Prompt 与收尾轮数按本 agent key 后台可编辑
 		// (自定义 agent 各自一份;留空/0 用通用默认:10 轮)。
@@ -169,14 +168,16 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		opts.SessionID = sessionID
 	}
 	// 实验功能:开启后由 noa 接管上下文压缩(归档集中在 <workDir>/noa/<SessionID> 下,持久)。
-	enableNoa(&opts, c.noaEnabledFn, c.workDir, "chat-"+sessionID, noaWarn("chat-"+sessionID))
+	installRuntimeCompactor(&opts, nil)
+	enableNoa(&opts, c.noaEnabledFn, c.workDir, "chat-"+sessionID, c.window, noaWarn("chat-"+sessionID))
+	attachToolOutputSpilling(&opts)
 	ctx = attachSideCapture(ctx, &opts)
 	s := agentcore.NewSession(opts)
 	defer s.Close()
 	// reload prior conversation so the agent has context across turns (each Chat is
 	// a fresh session). First turn: no file yet → Resume loads nothing and proceeds.
 	if c.tx != nil {
-		_ = s.Resume(sessionID)
+		message = resumeHistory(s, sessionID, agentKey, emit) + message
 	}
 	// re-unlock skill-gated MCPs from prior Skill() calls in the reloaded history so
 	// revealed tools stay callable across the fresh session.

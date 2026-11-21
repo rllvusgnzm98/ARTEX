@@ -736,6 +736,22 @@ WHERE exploration_id=$1 AND kind=$2 ORDER BY id DESC LIMIT $3`, s.expID, kind, l
 	return scanNodes(rows)
 }
 
+// EntrySeedFacts reads one fact class without a recency cap. Key facts are read
+// independently so old restrictions and evidence cannot fall out of the seed.
+func (s *ExplorationStore) EntrySeedFacts(key bool) ([]*Node, error) {
+	rows, err := s.db.Query(`SELECT `+nodeCols+` FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='fact' AND (
+  COALESCE(payload->>'category','') NOT IN ('','general')
+  OR CASE WHEN jsonb_typeof(payload->'evidence_ids')='array'
+     THEN jsonb_array_length(payload->'evidence_ids')>0 ELSE false END
+)=$2 ORDER BY id ASC`, s.expID, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanNodes(rows)
+}
+
 // ListByKindPage returns one newest-first page of nodes of a kind for reverse
 // pagination: up to `limit` nodes with id < `before` (before<=0 = the newest page).
 // hasMore reports whether still-older nodes exist, so a client (e.g. the worker

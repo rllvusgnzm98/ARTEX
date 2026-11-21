@@ -179,21 +179,21 @@ func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
 	if len(blocks) == 0 {
 		return // this batch has no ≥2 connected/shared-parent block — nothing to fold (§7)
 	}
-	var emptyExhausted, compressedOK bool
+	var compressionFailed, compressedOK bool
 	for _, b := range blocks {
 		switch c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, nil)) {
-		case foldEmptyExhausted:
-			emptyExhausted = true
+		case foldEmptyExhausted, foldProviderFailed:
+			compressionFailed = true
 		case foldOK:
 			compressedOK = true
 		}
 	}
-	if err := syncGraphIncompleteSignal(ts, emptyExhausted, compressedOK); err != nil {
+	if err := syncGraphIncompleteSignal(ts, compressionFailed, compressedOK); err != nil {
 		log.Printf("[compaction] graph incomplete signal exp=%d: %v", ts.ID(), err)
 	}
 	// A minor may have pushed the segment count over M → merge in the same run.
 	if ad, e := ts.ActiveDigests(); e == nil && len(ad) >= c.m {
-		c.major(ctx, ts)
+		c.majorWithFailure(ctx, ts, compressionFailed)
 	}
 }
 
@@ -203,6 +203,10 @@ func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
 // new/changed blocks are compressed afresh. This is where tiered fragments of one
 // direction merge and where "later became connected" blocks unify (§5.2).
 func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
+	c.majorWithFailure(ctx, ts, false)
+}
+
+func (c *Compactor) majorWithFailure(ctx context.Context, ts *db.ExplorationStore, compressionFailed bool) {
 	round, err := ts.RoundNo()
 	if err != nil {
 		return
@@ -254,29 +258,29 @@ func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
 	if err := ts.SupersedeDigests(stale); err != nil {
 		log.Printf("[compaction] supersede exp=%d: %v", ts.ID(), err)
 	}
-	var emptyExhausted, compressedOK bool
+	var compressedOK bool
 	for _, b := range toCreate {
 		switch c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, active)) {
-		case foldEmptyExhausted:
-			emptyExhausted = true
+		case foldEmptyExhausted, foldProviderFailed:
+			compressionFailed = true
 		case foldOK:
 			compressedOK = true
 		}
 	}
-	if err := syncGraphIncompleteSignal(ts, emptyExhausted, compressedOK); err != nil {
+	if err := syncGraphIncompleteSignal(ts, compressionFailed, compressedOK); err != nil {
 		log.Printf("[compaction] graph incomplete signal exp=%d: %v", ts.ID(), err)
 	}
 }
 
-// foldResult is the outcome of one foldBlock attempt. Only foldEmptyExhausted
-// writes the fail-soft 图谱不完整 signal; only foldOK may clear it. Neither
-// path writes node or goal state on a failed compression.
+// foldResult is the outcome of one foldBlock attempt. Compression errors set
+// the fail-soft signal; cancellation and storage failures do not.
 type foldResult int
 
 const (
 	foldSkipped foldResult = iota
 	foldOK
 	foldEmptyExhausted
+	foldProviderFailed
 	foldFailed
 )
 
@@ -288,10 +292,13 @@ func (c *Compactor) foldBlock(ctx context.Context, ts *db.ExplorationStore, g *c
 	body, err := c.compress(ctx, g, b, nodeByID)
 	if err != nil {
 		log.Printf("[compaction] compress exp=%d block=%v: %v", ts.ID(), b.Members, err)
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			return foldFailed
+		}
 		if isEmptyCompressionErr(err) {
 			return foldEmptyExhausted
 		}
-		return foldFailed
+		return foldProviderFailed
 	}
 	// Re-read fresh state and drop any member that revived while we compressed.
 	fresh, _, err := loadColdGraph(ts)
@@ -591,15 +598,15 @@ type graphIncompleteStore interface {
 }
 
 // syncGraphIncompleteSignal records or clears the fail-soft signal after a
-// compaction run. Exhausted empty-response retries set it; a successful
-// compression in a run with no such exhaustion clears it. Reused unchanged
+// compaction run. Provider failures set it; a successful
+// compression in a run with no such failure clears it. Reused unchanged
 // digests (no new LLM call) do not clear or set the signal. The signal column
 // is the only write; nodes and goal state are not touched.
-func syncGraphIncompleteSignal(ts graphIncompleteStore, emptyExhausted, compressedOK bool) error {
+func syncGraphIncompleteSignal(ts graphIncompleteStore, compressionFailed, compressedOK bool) error {
 	if ts == nil {
 		return nil
 	}
-	if emptyExhausted {
+	if compressionFailed {
 		return ts.SetGraphIncomplete("graph_compress")
 	}
 	if compressedOK {
