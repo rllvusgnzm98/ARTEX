@@ -181,3 +181,24 @@ func TestPaceProxyHTTPError(t *testing.T) {
 		t.Fatalf("status = %d, want 502", w.Code)
 	}
 }
+
+func TestPaceProxyUpstreamDefaultPort(t *testing.T) {
+	pp, err := NewPaceProxy("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pp.Close()
+	for raw, want := range map[string]string{
+		"http://proxy":      "proxy:80",
+		"https://proxy":     "proxy:443",
+		"socks5://proxy":    "proxy:1080",
+		"http://proxy:3128": "proxy:3128",
+	} {
+		if err := pp.SetUpstreamProxy(raw); err != nil {
+			t.Fatalf("%s: %v", raw, err)
+		}
+		if got := pp.upstream.Load().Host; got != want {
+			t.Fatalf("%s: host %q, want %q", raw, got, want)
+		}
+	}
+}

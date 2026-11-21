@@ -73,8 +73,27 @@ func (pp *PaceProxy) SetUpstreamProxy(raw string) error {
 	if err != nil {
 		return err
 	}
+	if u.Port() == "" {
+		if dp := defaultProxyPort(u.Scheme); dp != "" {
+			u.Host = net.JoinHostPort(u.Host, dp)
+		}
+	}
 	pp.upstream.Store(u)
 	return nil
+}
+
+// defaultProxyPort is the implicit port for an upstream proxy URL that omits one;
+// ValidateProxyURL accepts portless URLs but a TCP/SOCKS dialer needs a port.
+func defaultProxyPort(scheme string) string {
+	switch scheme {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	case "socks5", "socks5h":
+		return "1080"
+	}
+	return ""
 }
 
 func (pp *PaceProxy) UpstreamProxy() string {
@@ -198,16 +217,21 @@ func (pp *PaceProxy) dialTarget(ctx context.Context, hostport string) (net.Conn,
 }
 
 func (pp *PaceProxy) dialViaHTTPConnect(ctx context.Context, up *url.URL, hostport string) (net.Conn, error) {
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", up.Host)
+	conn, err := (&net.Dialer{Timeout: 30 * time.Second}).DialContext(ctx, "tcp", up.Host)
 	if err != nil {
 		return nil, err
 	}
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := conn.SetDeadline(deadline); err != nil {
-			conn.Close()
-			return nil, err
-		}
-		defer conn.SetDeadline(time.Time{})
+	// Bound the CONNECT handshake (CONNECT request + response, plus any TLS to an
+	// https upstream): request contexts carry no deadline, so without this a stalled
+	// upstream would block ReadResponse forever and leak the conn + goroutine. The
+	// deadline is cleared before returning so the established tunnel is not time-boxed.
+	handshake := time.Now().Add(30 * time.Second)
+	if d, ok := ctx.Deadline(); ok && d.Before(handshake) {
+		handshake = d
+	}
+	if err := conn.SetDeadline(handshake); err != nil {
+		conn.Close()
+		return nil, err
 	}
 	if up.Scheme == "https" {
 		conn = tls.Client(conn, &tls.Config{ServerName: up.Hostname()})
@@ -229,6 +253,10 @@ func (pp *PaceProxy) dialViaHTTPConnect(ctx context.Context, up *url.URL, hostpo
 	if resp.StatusCode != http.StatusOK {
 		conn.Close()
 		return nil, fmt.Errorf("upstream CONNECT: %s", resp.Status)
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		conn.Close()
+		return nil, err
 	}
 	return conn, nil
 }
