@@ -99,7 +99,7 @@ func TestHTTPXProbeIsolatesHome(t *testing.T) {
 			t.Setenv("TMPDIR", scratch)
 			receipt := filepath.Join(data, "probe-home")
 			t.Setenv("ARTEX_PROBE_RECEIPT", receipt)
-			body := `[ "$1" = "-version" ] && [ "$2" = "-duc" ] || exit 2
+			body := `[ "$#" = 1 ] && [ "$1" = "-version" ] || exit 2
 printf '%s' "$HOME" > "$ARTEX_PROBE_RECEIPT"
 printf config > "$HOME/httpx-config"
 printf config > "$XDG_CONFIG_HOME/xdg-config"
@@ -130,6 +130,44 @@ echo projectdiscovery.io`
 				}
 			}
 		})
+	}
+}
+
+func TestHTTPXProbeRelativeTMPDIR(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX command fixture")
+	}
+	caller := t.TempDir()
+	t.Chdir(caller)
+	if err := os.Mkdir("scratch", 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", "scratch")
+	home, config, cache, data := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", config)
+	t.Setenv("XDG_CACHE_HOME", cache)
+	commandFixture(t, data, "httpx", `[ "$#" = 1 ] && [ "$1" = "-version" ] || exit 2
+case "$HOME:$XDG_CONFIG_HOME:$XDG_CACHE_HOME" in /*:/*:/*) ;; *) exit 3 ;; esac
+[ "$PWD" = "$HOME" ] || exit 4
+printf config > "$HOME/config"
+printf config > "$XDG_CONFIG_HOME/xdg-config"
+printf cache > "$XDG_CACHE_HOME/xdg-cache"
+printf fallback > config.yaml
+echo projectdiscovery.io`)
+	r := CheckCommand(t.Context(), CommandSpec{Name: "httpx"}, data)
+	if !r.Available {
+		t.Fatalf("relative TMPDIR probe: %+v", r)
+	}
+	for _, dir := range []string{home, config, cache, filepath.Join(caller, "scratch")} {
+		entries, err := os.ReadDir(dir)
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("diagnostic left files in %s: %v %v", dir, entries, err)
+		}
+	}
+	entries, err := os.ReadDir(caller)
+	if err != nil || len(entries) != 1 || entries[0].Name() != "scratch" {
+		t.Fatalf("caller cwd changed: %v %v", entries, err)
 	}
 }
 

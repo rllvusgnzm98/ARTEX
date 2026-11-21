@@ -79,11 +79,19 @@ func CheckCommand(ctx context.Context, spec CommandSpec, dataDir string) Availab
 			r.Error = "httpx identity probe: create temporary home: " + err.Error()
 			return r
 		}
+		absHome, err := filepath.Abs(home)
+		if err != nil {
+			os.RemoveAll(home)
+			r.Error = "httpx identity probe: resolve temporary home: " + err.Error()
+			return r
+		}
+		home = absHome
 		defer os.RemoveAll(home)
 		ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
 		out := &probeOutput{}
-		cmd := exec.CommandContext(ctx, r.Path, "-version", "-duc")
+		cmd := exec.CommandContext(ctx, r.Path, "-version")
+		cmd.Dir = home
 		cmd.Env = append(os.Environ(), "PATH="+CommandPath(dataDir), "HOME="+home, "XDG_CONFIG_HOME="+home, "XDG_CACHE_HOME="+home)
 		cmd.Stdout, cmd.Stderr = out, out
 		cmd.WaitDelay = 100 * time.Millisecond
