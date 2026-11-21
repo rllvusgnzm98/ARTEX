@@ -307,6 +307,87 @@ func TestAmbiguousLatinKeywordBoundaries(t *testing.T) {
 	}
 }
 
+func TestWeb3Skeleton(t *testing.T) {
+	for _, tc := range []struct{ summary, category string }{
+		{"Solidity 智能合约重入审计", "web3"},
+		{"DeFi 协议预言机价格操纵评估", "web3"},
+		{"闪电贷放大清算逻辑", "web3"},
+		{"可升级代理合约存储冲突", "web3"},
+		{"delegatecall 目标可控性", "web3"},
+		{"EIP-712 签名重放与 nonce 重放", "web3"},
+		{"slither 合约审计", "web3"},
+		{"socks 代理搭建内网横向", "pivot"},
+		{"web 渗透常规巡检", ""},
+		{"define the token contract interface", ""},
+		{"sql 注入与重入", "web"},
+	} {
+		t.Run(tc.summary, func(t *testing.T) {
+			out := ForIntent(payload(t, map[string]any{"summary": tc.summary}))
+			if tc.category == "" {
+				if out != "" {
+					t.Fatalf("unexpected skeleton: %s", out)
+				}
+				return
+			}
+			if !strings.Contains(out, `category="`+tc.category+`"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+				t.Fatalf("summary %q want primary %s, got: %s", tc.summary, tc.category, out)
+			}
+		})
+	}
+	if !Valid("web3") {
+		t.Fatal("web3 not registered in Categories")
+	}
+	if err := ValidateChainTags([]string{"web3", "web"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tags := range [][]string{{"web3", "web"}, {"bogus", " WEB3 ", "web"}} {
+		p := payload(t, map[string]any{"summary": "做 sql 注入测试", "chain_tags": tags})
+		out := ForIntent(p)
+		if !strings.Contains(out, `category="web3"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+			t.Fatalf("explicit tag priority failed: %s", out)
+		}
+		if len([]rune(out)) > 8000 || strings.Contains(out, "已截断") {
+			t.Fatal("web3 skeleton exceeds default budget")
+		}
+		if guide := RefsGuideForIntent(p); guide != "" {
+			t.Fatalf("distilled category must have no bundled L4 refs: %s", guide)
+		}
+	}
+	sk, ok := Skeleton("web3")
+	if !ok {
+		t.Fatal("missing web3 skeleton")
+	}
+	lines := strings.Split(sk, "\n")
+	if len(lines) < 2 {
+		t.Fatal("missing first scope gate")
+	}
+	for _, term := range []string{"auth.status=granted", "不得强制或绕过", "仓库脚本", "准确命令及副作用", "单独明确同意"} {
+		if !strings.Contains(lines[1], term) {
+			t.Fatalf("first scope gate missing %s", term)
+		}
+	}
+	for _, term := range []string{"Evidence", "Finding", "Path", "SHA-256", "复现", "脱敏"} {
+		if !strings.Contains(sk, term) {
+			t.Fatalf("web3 missing %s", term)
+		}
+	}
+	if out := ForIntent(payload(t, map[string]any{"chain_tags": []string{"bogus"}})); out != "" {
+		t.Fatalf("all-invalid tags must stay silent: %s", out)
+	}
+	if out := Section([]string{"nope"}); out != "" {
+		t.Fatalf("invalid category must stay silent: %s", out)
+	}
+	if _, ok := Skeleton("web3x"); ok {
+		t.Fatal("invalid skeleton must fail closed")
+	}
+	defer func(orig int) { sectionCapRunes = orig }(sectionCapRunes)
+	sectionCapRunes = 600
+	out := ForIntent(payload(t, map[string]any{"chain_tags": []string{"web3", "web"}}))
+	if !strings.Contains(out, "已截断") || len([]rune(out)) > sectionCapRunes+80 || strings.Contains(out, `category="web"`) {
+		t.Fatalf("primary skeleton truncation failed: %s", out)
+	}
+}
+
 func TestBatch3NewTags(t *testing.T) {
 	for _, tc := range []struct{ summary, category string }{
 		{"软件供应链 SBOM 依赖混淆排查", "supply"},
