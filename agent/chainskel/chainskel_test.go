@@ -314,12 +314,17 @@ func TestWeb3Skeleton(t *testing.T) {
 		{"闪电贷放大清算逻辑", "web3"},
 		{"可升级代理合约存储冲突", "web3"},
 		{"delegatecall 目标可控性", "web3"},
-		{"EIP-712 签名重放与 nonce 重放", "web3"},
+		{"Solidity EIP-712 签名重放与 nonce 重放", "web3"},
 		{"slither 合约审计", "web3"},
 		{"socks 代理搭建内网横向", "pivot"},
 		{"web 渗透常规巡检", ""},
 		{"define the token contract interface", ""},
-		{"sql 注入与重入", "web"},
+		{"sql 注入与智能合约", "web"},
+		{"OIDC 签名重放", "identity"},
+		{"Android 组件重入", "app"},
+		{"reentrancy in kernel driver", ""},
+		{"支付价格操纵逻辑漏洞", "web"},
+		{"数据库存储冲突排查", ""},
 	} {
 		t.Run(tc.summary, func(t *testing.T) {
 			out := ForIntent(payload(t, map[string]any{"summary": tc.summary}))
