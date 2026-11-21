@@ -361,6 +361,11 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 // that also needs the entry seed reads the graph once.
 func (t *ToolSet) graphOverviewDataFrom(g *graphSnapshot) map[string]any {
 	out := map[string]any{}
+	if reason, err := t.ts.GraphIncompleteReason(); err == nil && reason != "" {
+		out["graph_incomplete"] = true
+		out["graph_incomplete_reason"] = reason
+		out["graph_incomplete_hint"] = "Use expand_digest / node_detail to recover graph context before continuing."
+	}
 	for kind, key := range map[string]string{
 		db.KindGoal: "goals_total", db.KindHint: "hints_total",
 		db.KindFinding: "findings_total", db.KindFact: "facts_total",

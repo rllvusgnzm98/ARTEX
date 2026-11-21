@@ -631,7 +631,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 
 	// 实验功能:开启后由 noa 接管上下文压缩(归档集中在 <workDir>/noa/<SessionID> 下,持久)。
 	noaSession := WorkerSessionID(ts.ID(), intent.ID)
-	enableNoa(&opts, w.noaEnabledFn, w.workDir, noaSession, noaWarn(noaSession))
+	enableNoa(&opts, w.noaEnabledFn, w.workDir, noaSession, opts.Compaction.ContextWindow, noaWarn(noaSession))
 	ctx = attachSideCapture(ctx, &opts)
 	s := agentcore.NewSession(opts)
 	defer s.Close() // release the session's background-task manager (temp dir + processes)
@@ -641,8 +641,16 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// session exists the worker continues from where it left off instead of
 	// restarting from scratch.
 	alreadyRecorded := false
+	var resumeWarning string
 	if w.tx != nil {
-		_ = s.Resume(opts.SessionID)
+		resumeWarning = resumeHistory(s, opts.SessionID, name, emitWrap)
+		if resumeWarning != "" {
+			text := fmt.Sprintf("Worker %s, intent #%d, session %s: %s", name, intent.ID, opts.SessionID, strings.TrimSpace(resumeWarning))
+			if _, err := ts.AddNode(db.KindHint, map[string]any{"text": text}, 0, "active", name, nil); err != nil {
+				log.Printf("[resume] session=%s intent=%d: planner hint failed: %v", opts.SessionID, intent.ID, err)
+				emitWrap(db.Activity{Kind: "error", IsError: true, Summary: "history restoration warning could not be saved for planner", Detail: err.Error()})
+			}
+		}
 		alreadyRecorded = requestID != "" && hasWorkerChatMessage(s.Messages(), requestID)
 		if len(s.Messages()) > 0 && message == "" {
 			seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
@@ -669,6 +677,6 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// enters the wrap-up phase on the live ctx, so a run whose tool overran the budget
 	// still settles (no external hard-timeout backstop needed). ctx itself carries only
 	// pause / planner kill / shutdown, which the engine distinguishes and re-queues/stops.
-	_, reason, err := captureRunSession(ctx, s, input, emitWrap)
+	_, reason, err := captureRunSession(ctx, s, resumeWarning+input, emitWrap)
 	return reason, tsx.Writes(), err
 }
