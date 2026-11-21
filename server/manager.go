@@ -253,6 +253,7 @@ type Manager struct {
 	globalProxy string
 	hostPace    float64 // 每主机礼貌限速 req/s;0=关闭
 	pacer       *traffic.Pacer
+	paceProxy   *traffic.PaceProxy
 
 	// taskProxy 按任务 MITM 实例管理器（见 taskproxy.go）；nil = 关闭。
 	// 不得用进程级 SetUpstream 让任务互相踩踏上游。
@@ -468,6 +469,23 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	m.pacer = traffic.NewPacer(m.hostPace, 0)
 	if m.traffic != nil {
 		m.traffic.SetHostPacer(m.pacer)
+	}
+	// Forward-only pacing proxy: with traffic capture off, agent egress routes
+	// through it (see ProxyAddr) so the per-host pacer still applies without
+	// MITM/recording. It chains to the global egress proxy, or dials directly.
+	if pp, err := traffic.NewPaceProxy("127.0.0.1:0"); err != nil {
+		log.Printf("[pace] 礼貌限速代理启动失败,关闭捕获时流量将不限速: %v", err)
+	} else {
+		pp.SetHostPacer(m.pacer)
+		if err := pp.SetUpstreamProxy(m.globalProxy); err != nil {
+			log.Printf("[pace] 全局代理 %q 无效,限速代理改为直连: %v", m.globalProxy, err)
+		}
+		go func() {
+			if err := pp.Start(); err != nil {
+				log.Printf("[pace] 礼貌限速代理监听结束: %v", err)
+			}
+		}()
+		m.paceProxy = pp
 	}
 	m.enrich = enrich.New(m.assets, m.ProxyAddr, 4)
 	// 按任务懒建 MITM。ARTEX_TASK_PROXY=off 关闭；端口池 ARTEX_TASK_PROXY_PORT_RANGE。
@@ -780,8 +798,8 @@ func (m *Manager) Traffic() *traffic.Traffic { return m.traffic }
 // ProxyAddr returns the egress proxy address agents route target traffic through:
 //   - capture ON  → the recording MITM proxy (which itself exits via the global
 //     proxy when one is set); agents also get its CA (see ProxyCACert).
-//   - capture OFF → the global egress proxy directly (empty CA — real target
-//     certs), or "" when no global proxy is set (direct, no recording).
+//   - capture OFF → the forward-only pacing proxy when pacing is active, otherwise
+//     the global egress proxy or "" for direct access (empty CA, no recording).
 //
 // So the global proxy takes effect in both modes: at the MITM's upstream when
 // capturing, in the agent's own bash env / WebFetch when not.
@@ -791,6 +809,9 @@ func (m *Manager) ProxyAddr() string {
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.paceProxy != nil && m.pacer != nil {
+		return "http://" + m.paceProxy.Addr()
+	}
 	return m.globalProxy
 }
 
@@ -846,6 +867,12 @@ func (m *Manager) SetHostPace(rps float64) error {
 	if m.taskProxy != nil {
 		m.taskProxy.ApplyHostPacer()
 	}
+	if m.paceProxy != nil {
+		m.paceProxy.SetHostPacer(p)
+	}
+	// Capture off: toggling pacing on/off changes ProxyAddr (pace proxy vs direct),
+	// so the seeded browser MCP must re-route too — mirror SetGlobalProxy.
+	m.syncBrowserMCPProxy()
 	return nil
 }
 
@@ -871,6 +898,11 @@ func (m *Manager) SetGlobalProxy(raw string) error {
 			return err
 		}
 	}
+	if m.paceProxy != nil {
+		if err := m.paceProxy.SetUpstreamProxy(raw); err != nil {
+			log.Printf("[pace] 全局代理 %q 无效,限速代理上游保持不变: %v", raw, err)
+		}
+	}
 	// 无隧道任务的 MITM 实例以全局代理为回落上游——全局代理变了它们一起换。
 	if m.taskProxy != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -890,6 +922,9 @@ func (m *Manager) Close() error {
 	}
 	if m.traffic != nil {
 		m.traffic.Close()
+	}
+	if m.paceProxy != nil {
+		_ = m.paceProxy.Close()
 	}
 	return m.pg.Close()
 }
