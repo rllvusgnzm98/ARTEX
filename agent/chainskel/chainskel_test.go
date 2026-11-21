@@ -105,10 +105,10 @@ func TestForIntentByTags(t *testing.T) {
 	}
 }
 
-func TestForIntentMultiTagCap2(t *testing.T) {
+func TestForIntentFirstTagOnly(t *testing.T) {
 	out := ForIntent(payload(t, map[string]any{"summary": "x", "chain_tags": []string{"web", "ad", "pivot"}}))
-	if !strings.Contains(out, `category="web"`) || !strings.Contains(out, `category="ad"`) {
-		t.Fatalf("前 2 个 tag 应注入:\n%s", out)
+	if !strings.Contains(out, `category="web"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+		t.Fatalf("只应注入首个合法 tag:\n%s", out)
 	}
 	if strings.Contains(out, `category="pivot"`) {
 		t.Fatal("第 3 个 tag 超出 MaxTagsPerIntent,不应注入")
@@ -168,5 +168,101 @@ func TestSectionMissingCategoryDegrades(t *testing.T) {
 	}
 	if Section([]string{"nope"}) != "" {
 		t.Fatal("全部缺失应返回空串(不注入)")
+	}
+}
+
+func TestOnDemandCategories(t *testing.T) {
+	for _, tc := range []struct{ summary, category string }{
+		{"Patch diff CVE reproduction with SQL injection", "patch"},
+		{"补丁差分验证 CNVD", "patch"},
+		{"Firmware management RCE review", "firmware"},
+		{"固件 squashfs 分析", "firmware"},
+		{"Code audit for SQL injection", "audit"},
+		{"代码审计鉴权", "audit"},
+	} {
+		t.Run(tc.summary, func(t *testing.T) {
+			out := ForIntent(payload(t, map[string]any{"summary": tc.summary}))
+			if !strings.Contains(out, `category="`+tc.category+`"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+				t.Fatalf("wrong primary skeleton: %s", out)
+			}
+		})
+	}
+	for _, summary := range []string{"patch the documentation", "audit logging retention", "dispatch events", "auditor meeting", "CVE reproduction", "CVE 复现", "CVE复现", "CNVD reproduction", "CNVD 复现", "CNVD复现", ""} {
+		if out := ForIntent(payload(t, map[string]any{"summary": summary})); out != "" {
+			t.Fatalf("irrelevant intent %q routed: %s", summary, out)
+		}
+	}
+	for _, category := range []string{"patch", "firmware", "audit"} {
+		if err := ValidateChainTags([]string{category, "web"}); err != nil {
+			t.Fatal(err)
+		}
+		p := payload(t, map[string]any{"summary": "sql injection", "chain_tags": []string{"bogus", " " + strings.ToUpper(category) + " ", "web"}})
+		out := ForIntent(p)
+		if !strings.Contains(out, `category="`+category+`"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+			t.Fatalf("first valid tag lost: %s", out)
+		}
+		if len([]rune(out)) > 8000 || strings.Contains(out, "已截断") {
+			t.Fatalf("primary skeleton exceeds default budget: %s", category)
+		}
+		if guide := RefsGuideForIntent(p); guide != "" {
+			t.Fatalf("distilled category has no bundled L4 refs: %s", guide)
+		}
+		sk, _ := Skeleton(category)
+		lines := strings.Split(sk, "\n")
+		if !strings.Contains(lines[1], "auth.status=granted") || !strings.Contains(lines[1], "不得强制或绕过") {
+			t.Fatalf("missing first scope gate: %s", category)
+		}
+		if !strings.Contains(lines[1], "仓库脚本") || !strings.Contains(lines[1], "准确命令及副作用") || !strings.Contains(lines[1], "单独明确同意") {
+			t.Fatalf("missing separate script approval gate: %s", category)
+		}
+		for _, term := range []string{"Evidence", "Finding", "Path", "SHA-256", "复现", "脱敏"} {
+			// Source audits pin the file hash rather than a firmware image digest.
+			if category == "audit" && term == "SHA-256" {
+				term = "文件哈希"
+			}
+			if !strings.Contains(sk, term) {
+				t.Fatalf("%s missing %s", category, term)
+			}
+		}
+	}
+}
+
+func TestForIntentPrimaryTruncation(t *testing.T) {
+	defer func(orig int) { sectionCapRunes = orig }(sectionCapRunes)
+	sectionCapRunes = 600
+	out := ForIntent(payload(t, map[string]any{"chain_tags": []string{"firmware", "web"}}))
+	if !strings.Contains(out, "已截断") || len([]rune(out)) > sectionCapRunes+80 || strings.Contains(out, `category="web"`) {
+		t.Fatalf("primary skeleton truncation failed: %s", out)
+	}
+}
+
+func TestAmbiguousLatinKeywordBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		summary string
+		want    string
+	}{
+		{"seven-day log retention", ""},
+		{"SQL injection in disaster recovery", "web"},
+		{"n-day patch validation", "patch"},
+		{"Run SAST for SQL injection", "audit"},
+		{"N-day补丁分析", "patch"},
+		{"SAST代码审计", "audit"},
+		{"n-days", ""},
+		{"sast_report", ""},
+		{"seven-day then n-day", "patch"},
+		{"disaster then SAST", "audit"},
+	} {
+		t.Run(tc.summary, func(t *testing.T) {
+			out := ForIntent(payload(t, map[string]any{"summary": tc.summary}))
+			if tc.want == "" {
+				if out != "" {
+					t.Fatalf("unexpected skeleton: %s", out)
+				}
+				return
+			}
+			if !strings.Contains(out, `category="`+tc.want+`"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+				t.Fatalf("want primary %s, got %s", tc.want, out)
+			}
+		})
 	}
 }

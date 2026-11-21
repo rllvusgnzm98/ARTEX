@@ -121,10 +121,10 @@ func TestRefsGuideForIntent(t *testing.T) {
 	if !strings.Contains(out, "skills/chains-web/refs/") || !strings.Contains(out, "精确篇目见对应 SKILL.md") {
 		t.Fatalf("web tag 应给出 refs 指引:\n%s", out)
 	}
-	// 双 tag:两个路径都在一行里。
+	// 仅主类别提供路径。
 	out = RefsGuideForIntent(payload(t, map[string]any{"summary": "x", "chain_tags": []string{"web", "ad", "pivot"}}))
-	if !strings.Contains(out, "skills/chains-web/refs/") || !strings.Contains(out, "skills/chains-ad/refs/") {
-		t.Fatalf("前 2 个 tag 的路径都应在:\n%s", out)
+	if !strings.Contains(out, "skills/chains-web/refs/") || strings.Contains(out, "skills/chains-ad/refs/") {
+		t.Fatalf("只应提供首个 tag 的路径:\n%s", out)
 	}
 	if strings.Contains(out, "chains-pivot") {
 		t.Fatal("第 3 个 tag 超上限不应出现")

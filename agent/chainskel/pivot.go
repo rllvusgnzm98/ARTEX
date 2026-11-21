@@ -84,6 +84,9 @@ func RefsGuideForIntent(payload json.RawMessage) string {
 	if len(cats) == 0 {
 		return ""
 	}
+	if cats[0] == "patch" || cats[0] == "firmware" || cats[0] == "audit" {
+		return ""
+	}
 	paths := make([]string, len(cats))
 	for i, c := range cats {
 		paths[i] = "skills/chains-" + c + "/refs/"
