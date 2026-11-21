@@ -318,7 +318,7 @@ func (s *Server) executeDualVerify(ctx context.Context, in json.RawMessage) (act
 	if err != nil {
 		return actool.Errorf("验证结果计算失败"), nil
 	}
-	evidenceHint := "未自动绑定证据。请求携带 X-Artex-Dualverify: " + marker + ":<step_id>；从 recommended_findings 提交 report_finding 后，通过 traffic_search → traffic_get → bind_finding_traffic 定位并绑定完全匹配的已记录交换；未记录或无法确认的流量不得绑定。"
+	evidenceHint := "可复现证据为本结果的 report 与各步骤 trace 值；每个请求都带 X-Artex-Dualverify: " + marker + ":<step_id> 头。该工具的流量由任务级记录代理单独抓取，agent 的 traffic_search/bind_finding_traffic 读取的是全局记录，无法直接定位；如需把证据绑定到 Finding，请依据该 trace 头在任务流量记录中人工核对对应交换后绑定。可用 recommended_findings 调用 report_finding 登记漏洞。"
 	plan.Notes = append(plan.Notes, evidenceHint)
 	report := dualverify.Report(result, plan)
 	summaries := []map[string]any{}
