@@ -41,6 +41,71 @@ func dualVerifyObservation(t *testing.T, observations []dualverify.Observation, 
 	return dualverify.Observation{}
 }
 
+func TestDualVerifyProvidedMarker(t *testing.T) {
+	for _, leak := range []bool{false, true} {
+		t.Run(map[bool]string{false: "owner only", true: "B reads owner marker"}[leak], func(t *testing.T) {
+			marker, err := dualVerifyMarker(dualVerifyInput{Marker: "  preplanted-unique-marker  "})
+			if err != nil {
+				t.Fatal(err)
+			}
+			secrets := dualVerifyTestSecrets()
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				auth := r.Header.Get("Authorization")
+				if auth == "Bearer "+secrets["A"] || (leak && auth == "Bearer "+secrets["B"]) {
+					io.WriteString(w, marker)
+					return
+				}
+				w.WriteHeader(403)
+			}))
+			defer backend.Close()
+			p := dualVerifyTestPlan(t, backend.URL, false, false, false)
+			p.Marker = marker
+			o, err := runDualVerify(context.Background(), backend.Client(), p, secrets, func(string) (dualverify.Scope, bool) { return dualverify.ScopeIn, false }, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := dualverify.Evaluate(p, o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := dualverify.ControlsHold
+			if leak {
+				want = dualverify.Verified
+			}
+			if r.Verdict != want {
+				t.Fatal(r)
+			}
+		})
+	}
+	for _, a := range []dualVerifyInput{{}, {Write: true}, {AllowWrite: true}} {
+		if _, err := dualVerifyMarker(a); err == nil || !strings.Contains(err.Error(), "write + allow_write") {
+			t.Fatalf("missing operator guidance: %v", err)
+		}
+	}
+	var s Server
+	res, err := s.executeDualVerify(context.Background(), json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(res)
+	if !strings.Contains(string(raw), "write + allow_write") {
+		t.Fatalf("missing tool error: %s", raw)
+	}
+	for _, marker := range []string{"short", "marker{{bad}}", "marker\nbad", "marker\rbad", strings.Repeat("x", 257), strings.Repeat("界", 86)} {
+		if _, err := dualVerifyMarker(dualVerifyInput{Marker: marker}); err == nil {
+			t.Errorf("accepted invalid marker %q", marker)
+		}
+	}
+	for _, marker := range []string{strings.Repeat("界", 8), strings.Repeat("x", 256)} {
+		if got, err := dualVerifyMarker(dualVerifyInput{Marker: marker}); err != nil || got != marker {
+			t.Fatalf("valid marker rejected: %v", err)
+		}
+	}
+	if marker, err := dualVerifyMarker(dualVerifyInput{Write: true, AllowWrite: true}); err != nil || !strings.HasPrefix(marker, "artex-mark-") {
+		t.Fatalf("automatic marker: %q %v", marker, err)
+	}
+}
+
 func TestDualVerifyReplay(t *testing.T) {
 	for _, tc := range []struct {
 		name                                  string

@@ -22,6 +22,7 @@ type dualVerifyInput struct {
 	Plant        dualverify.Request `json:"plant"`
 	Cleanup      dualverify.Request `json:"cleanup"`
 	ResourceID   string             `json:"resource_id"`
+	Marker       string             `json:"marker"`
 	A            json.RawMessage    `json:"a_credential_id"`
 	B            json.RawMessage    `json:"b_credential_id"`
 	Expired      json.RawMessage    `json:"b_expired_credential_id"`
@@ -50,6 +51,7 @@ func dualVerifySchema() map[string]any {
 	props := map[string]any{
 		"target": request(), "plant": request(), "cleanup": request(),
 		"resource_id": strParam("A 拥有的私有资源 ID"),
+		"marker":      strParam("A 私有资源中已存在的唯一且非敏感标记（自行预置）；写入模式可留空自动生成。标记会出现在报告中，不要填真实秘密。"),
 		"asset_ids":   map[string]any{"type": "array", "items": map[string]any{"type": "integer"}},
 		"vulnclass":   strParam("可选漏洞分类；默认 idor 或 token-trust"),
 	}
@@ -181,10 +183,33 @@ func dualVerifyInputHasSecret(in any, secrets map[string]string) bool {
 	return false
 }
 
+func dualVerifyMarker(a dualVerifyInput) (string, error) {
+	provided := strings.TrimSpace(a.Marker)
+	willPlant := a.Write && a.AllowWrite
+	if provided != "" {
+		if strings.ContainsAny(provided, "{}\r\n") || len([]rune(provided)) < 8 || len(provided) > 256 {
+			return "", errors.New("marker 必须至少 8 个字符、最多 256 字节，且不能包含花括号或换行")
+		}
+		return provided, nil
+	}
+	if willPlant {
+		marker, err := dualverify.NewMarker()
+		if err != nil {
+			return "", errors.New("生成私有标记失败")
+		}
+		return marker, nil
+	}
+	return "", errors.New("请提供 marker（已自行预置在 A 私有资源中的唯一且非敏感标记），或启用 write + allow_write 自动种植标记")
+}
+
 func (s *Server) executeDualVerify(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 	var a dualVerifyInput
 	if err := json.Unmarshal(in, &a); err != nil {
 		return actool.Errorf("dual_account_verify 参数无效"), nil
+	}
+	marker, err := dualVerifyMarker(a)
+	if err != nil {
+		return actool.Errorf(err.Error()), nil
 	}
 	taskID := agent.RunInfoFrom(ctx).TaskID
 	if taskID <= 0 || s.m == nil || s.m.pg == nil || s.credStore == nil {
@@ -227,10 +252,6 @@ func (s *Server) executeDualVerify(ctx context.Context, in json.RawMessage) (act
 				return actool.Errorf(err.Error()), nil
 			}
 		}
-	}
-	marker, err := dualverify.NewMarker()
-	if err != nil {
-		return actool.Errorf("生成私有标记失败"), nil
 	}
 	fp := s.taskFootprint(taskID)
 	read := a.Read == nil || *a.Read
