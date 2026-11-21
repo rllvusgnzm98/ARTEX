@@ -192,6 +192,7 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	if mainSeg > 0 {
 		noaSession = fmt.Sprintf("exp%d-main-s%d", ts.ID(), mainSeg)
 	}
+	installRuntimeCompactor(&opts, ts)
 	enableNoa(&opts, m.noaEnabledFn, m.workDir, noaSession, window, noaWarn(noaSession))
 	attachToolOutputSpilling(&opts)
 	ctx = attachSideCapture(ctx, &opts)

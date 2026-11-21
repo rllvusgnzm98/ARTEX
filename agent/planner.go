@@ -451,6 +451,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	}
 	// 实验功能:开启后由 noa 接管上下文压缩(归档集中在 <workDir>/noa/<SessionID> 下,持久)。
 	noaSession := fmt.Sprintf("exp%d-planner", ts.ID())
+	installRuntimeCompactor(&opts, ts)
 	enableNoa(&opts, p.noaEnabledFn, p.workDir, noaSession, window, noaWarn(noaSession))
 	attachToolOutputSpilling(&opts)
 	// 态势（刚完成的意图 + 完整图）现在拼进本轮 user 输入（见下方 input）。user 里还有
