@@ -306,3 +306,105 @@ func TestAmbiguousLatinKeywordBoundaries(t *testing.T) {
 		})
 	}
 }
+
+func TestBatch3NewTags(t *testing.T) {
+	for _, tc := range []struct{ summary, category string }{
+		{"软件供应链 SBOM 依赖混淆排查", "supply"},
+		{"cosign 制品签名与依赖投毒", "supply"},
+		{"LLM 提示注入与系统提示词提取", "ai"},
+		{"ai agent 工具滥用越权调用", "ai"},
+		{"工控 SCADA Modbus 暴露面评估", "ot"},
+		{"PLC 寄存器与 Purdue 分区", "ot"},
+		{"WiFi WPA 握手包离线口令评估", "wireless"},
+		{"SDR 射频信号解调分析", "wireless"},
+		{"浏览器扩展 manifest.json 权限面审查", "extension"},
+		{"crx 解包与 content script 分析", "extension"},
+		{"Electron 桌面客户端 ipc 与自动更新劫持", "client"},
+		{"厚客户端 dll 劫持与本地凭据", "client"},
+		{"JTAG 调试接口与安全启动评估", "hardware"},
+		{"硬件安全 flash 提取与哈希保全", "hardware"},
+		{"数据库未授权与危险配置审计", "database"},
+		{"xp_cmdshell 与 file_priv 危险功能", "database"},
+		{"SPF DKIM DMARC 对齐与邮件伪造", "email"},
+		{"钓鱼邮件 BEC 与邮箱接管", "email"},
+		{"案例复盘与证据链一致性复核", "report"},
+		{"report review 与 scope 一致性", "report"},
+	} {
+		t.Run(tc.summary, func(t *testing.T) {
+			out := ForIntent(payload(t, map[string]any{"summary": tc.summary}))
+			if !strings.Contains(out, `category="`+tc.category+`"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+				t.Fatalf("summary %q want primary %s, got: %s", tc.summary, tc.category, out)
+			}
+		})
+	}
+	// explicit chain_tags take priority over summary keywords, first valid tag only, one block
+	out := ForIntent(payload(t, map[string]any{"summary": "做 sql 注入测试", "chain_tags": []string{"ai", "web"}}))
+	if !strings.Contains(out, `category="ai"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+		t.Fatalf("explicit new-tag priority failed: %s", out)
+	}
+	// all-invalid tags stay fail-closed (no L3 injection)
+	if o := ForIntent(payload(t, map[string]any{"chain_tags": []string{"bogus"}})); o != "" {
+		t.Fatal("all-invalid tags must stay silent")
+	}
+}
+
+func TestBatch3Folds(t *testing.T) {
+	for _, tc := range []struct{ summary, category string }{
+		{"bindiff 定位改动函数做差分", "patch"},       // binary-diff -> patch
+		{"前端请求签名还原与 js 加密", "web"},           // js-reverse -> web
+		{"apk 静态脱壳分析", "app"},                // apk-reverse -> app (app 先于 rev)
+		{"iOS 运行时 hook 校验绕过", "app"},         // mobile-reverse -> app
+		{"Mach-O 代码签名与 dotnet 程序集逆向", "rev"}, // macos/dotnet-reverse -> rev
+		{"golang 逆向 stripped 二进制", "rev"},    // go-rust-reverse -> rev
+		{"虚拟机保护 vmp 还原", "rev"},              // dsl-vm-reverse -> rev
+		{"攻击链串联内网横向", "pivot"},               // attack-chain -> pivot
+		{"堆溢出 tcache 利用链", "pwn"},            // pwn-chain -> pwn
+		{"活动目录 kerberoast 委派滥用", "ad"},       // windows-ad -> ad
+		{"src 众测资产梳理与信息收集", "recon"},         // src-hunter -> recon
+	} {
+		t.Run(tc.summary, func(t *testing.T) {
+			out := ForIntent(payload(t, map[string]any{"summary": tc.summary}))
+			if !strings.Contains(out, `category="`+tc.category+`"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+				t.Fatalf("fold summary %q want %s, got: %s", tc.summary, tc.category, out)
+			}
+		})
+	}
+}
+
+func TestBatch3SkeletonDiscipline(t *testing.T) {
+	for _, category := range []string{"supply", "ai", "ot", "wireless", "extension", "client", "hardware", "database", "email", "report"} {
+		if !Valid(category) {
+			t.Fatalf("new category %s not registered in Categories", category)
+		}
+		if err := ValidateChainTags([]string{category, "web"}); err != nil {
+			t.Fatal(err)
+		}
+		p := payload(t, map[string]any{"summary": "sql injection", "chain_tags": []string{"bogus", " " + strings.ToUpper(category) + " ", "web"}})
+		out := ForIntent(p)
+		if !strings.Contains(out, `category="`+category+`"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+			t.Fatalf("first valid tag lost: %s -> %s", category, out)
+		}
+		if len([]rune(out)) > 8000 || strings.Contains(out, "已截断") {
+			t.Fatalf("primary skeleton exceeds default budget: %s", category)
+		}
+		if guide := RefsGuideForIntent(p); guide != "" {
+			t.Fatalf("distilled category must have no bundled L4 refs: %s -> %s", category, guide)
+		}
+		sk, ok := Skeleton(category)
+		if !ok {
+			t.Fatalf("missing skeleton: %s", category)
+		}
+		lines := strings.Split(sk, "\n")
+		if !strings.Contains(lines[1], "auth.status=granted") || !strings.Contains(lines[1], "不得强制或绕过") {
+			t.Fatalf("missing first scope gate: %s", category)
+		}
+		if !strings.Contains(lines[1], "仓库脚本") || !strings.Contains(lines[1], "准确命令及副作用") || !strings.Contains(lines[1], "单独明确同意") {
+			t.Fatalf("missing separate script approval gate: %s", category)
+		}
+		for _, term := range []string{"Evidence", "Finding", "Path", "SHA-256", "复现", "脱敏"} {
+			if !strings.Contains(sk, term) {
+				t.Fatalf("%s missing %s", category, term)
+			}
+		}
+	}
+}
