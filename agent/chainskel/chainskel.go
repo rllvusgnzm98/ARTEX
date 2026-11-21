@@ -116,10 +116,10 @@ var keywordRules = []struct {
 	{"pivot", []string{"隧道", "代理", "横向", "内网", "穿透", "socks", "chisel", "frp", "端口转发", "跳板", "立足点", "webshell"}},
 }
 
+// matchesKeyword 以 ASCII 词边界匹配关键词,避免短 ASCII 词命中更长英文单词内部
+// (如 sso⊂processor、eks⊂weeks、rce⊂source)。边界字节为 [a-z0-9_];中文/空格/
+// 连字符等均视为边界,故中文关键词与多词关键词行为不变。
 func matchesKeyword(text, keyword string) bool {
-	if keyword != "n-day" && keyword != "sast" {
-		return strings.Contains(text, keyword)
-	}
 	isTokenByte := func(b byte) bool {
 		return b >= 'a' && b <= 'z' || b >= '0' && b <= '9' || b == '_'
 	}

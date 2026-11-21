@@ -284,6 +284,11 @@ func TestAmbiguousLatinKeywordBoundaries(t *testing.T) {
 		{"sast_report", ""},
 		{"seven-day then n-day", "patch"},
 		{"disaster then SAST", "audit"},
+		{"反编译 MessageProcessor", "rev"},      // sso ⊂ processor must not route identity
+		{"task planned for three weeks", ""}, // eks ⊂ weeks must not route cloud
+		{"grep the sourcecode", ""},          // rce ⊂ sourcecode must not route web
+		{"oauth 账号接管", "identity"},           // standalone latin token still matches
+		{"k8s 逃逸", "cloud"},
 	} {
 		t.Run(tc.summary, func(t *testing.T) {
 			out := ForIntent(payload(t, map[string]any{"summary": tc.summary}))
