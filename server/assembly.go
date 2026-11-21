@@ -24,6 +24,7 @@ import (
 // capture is on) to add to EVERY agent's base list — the DB tools table then
 // filters them per-agent binding. Empty/nil → no host tools this run (capture off).
 func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.CoreTool, map[string][]string)) {
+	skills := &skillDirCache{}
 	agent.ToolAugment = func(ctx context.Context, agentKey string) ([]actool.CoreTool, agent.DeferredInfo, func()) {
 		a, err := pg.GetAgentByKey(agentKey)
 		if err != nil || a == nil {
@@ -39,7 +40,7 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 			for _, n := range names {
 				nameSet[n] = true
 			}
-			if allReg, err := skill.LoadDir(skillDir); err == nil && allReg != nil {
+			if allReg, err := skills.load(skillDir); err == nil && allReg != nil {
 				reg = skill.NewRegistry()
 				for _, s := range allReg.List() {
 					// match by directory name (Base of Dir), not by skill display Name

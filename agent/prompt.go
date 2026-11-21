@@ -2,6 +2,8 @@ package agent
 
 import (
 	"bytes"
+	"sync"
+	"sync/atomic"
 	"text/template"
 	"time"
 )
@@ -75,8 +77,36 @@ func renderSystemVariant(agentKey, variant, def string, vars any) string {
 	return def
 }
 
-func renderTmpl(tmpl string, vars any) (string, error) {
+// Parsed templates keyed by their source text. Built-in prompts never change and
+// DB overrides only change on edit, so each text is parsed once. Size is capped
+// so repeated prompt edits can't grow it without bound.
+var (
+	tmplCache  sync.Map // string → *template.Template
+	tmplCached atomic.Int64
+)
+
+const tmplCacheMax = 256
+
+func compileTmpl(tmpl string) (*template.Template, error) {
+	if t, ok := tmplCache.Load(tmpl); ok {
+		return t.(*template.Template), nil
+	}
 	t, err := template.New("p").Option("missingkey=error").Parse(tmpl)
+	if err != nil {
+		return nil, err
+	}
+	if tmplCached.Load() >= tmplCacheMax {
+		tmplCache.Range(func(k, _ any) bool { tmplCache.Delete(k); return true })
+		tmplCached.Store(0)
+	}
+	if _, loaded := tmplCache.LoadOrStore(tmpl, t); !loaded {
+		tmplCached.Add(1)
+	}
+	return t, nil
+}
+
+func renderTmpl(tmpl string, vars any) (string, error) {
+	t, err := compileTmpl(tmpl)
 	if err != nil {
 		return "", err
 	}

@@ -339,6 +339,10 @@ type quotaAwareTransport struct {
 	sessionHeaderKey string
 }
 
+// quotaProbeMaxBytes bounds how much of a 429 body is buffered for quota
+// classification.
+const quotaProbeMaxBytes = 64 << 10
+
 func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Custom session-id header: name is user-configured, value is THIS run's
 	// session id (norma stashes it on the context via transcript.WithSessionID).
@@ -368,14 +372,23 @@ func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error
 	if resp.StatusCode != http.StatusTooManyRequests {
 		return resp, nil
 	}
-	body, readErr := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	resp.ContentLength = int64(len(body))
-	if readErr != nil {
-		return resp, nil
+	// Only the head is needed to classify; a gateway returning a huge 429 page must
+	// not be buffered whole. Anything past the head is streamed through unchanged.
+	head, readErr := io.ReadAll(io.LimitReader(resp.Body, quotaProbeMaxBytes))
+	if readErr != nil || int64(len(head)) < quotaProbeMaxBytes {
+		_ = resp.Body.Close()
+		resp.Body = io.NopCloser(bytes.NewReader(head))
+		resp.ContentLength = int64(len(head))
+		if readErr != nil {
+			return resp, nil
+		}
+	} else {
+		resp.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(head), resp.Body), resp.Body}
 	}
-	if IsQuotaExhaustedMessage(string(body)) {
+	if IsQuotaExhaustedMessage(string(head)) {
 		resp.StatusCode = http.StatusPaymentRequired
 		resp.Status = "402 Payment Required"
 	}

@@ -353,9 +353,15 @@ func (t *ToolSet) graphOverview() actool.CoreTool {
 // the model needn't spend a turn calling the tool — every plan round starts with
 // an empty context and always needs this first).
 func (t *ToolSet) graphOverviewData() map[string]any {
+	return t.graphOverviewDataFrom(newGraphSnapshot(t.ts))
+}
+
+// graphOverviewDataFrom builds the overview from a shared snapshot so a caller
+// that also needs the entry seed reads the graph once.
+func (t *ToolSet) graphOverviewDataFrom(g *graphSnapshot) map[string]any {
 	out := map[string]any{}
 	// goals summary folded in so the planner needn't call list_goals each round.
-	goals, _ := t.ts.ListByKind(db.KindGoal, 100)
+	goals, _ := g.listByKind(db.KindGoal, 100)
 	gsum := make([]map[string]any, 0, len(goals))
 	for _, g := range goals {
 		var p map[string]any
@@ -365,7 +371,7 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	out["goals"] = gsum
 	// hints: 人类/主 agent 通过 add_hint 挂上图的战略提示；folded in so the
 	// planner reads them every round when generating intents (否则只写不读).
-	hints, _ := t.ts.ListByKind(db.KindHint, 50)
+	hints, _ := g.listByKind(db.KindHint, 50)
 	hsum := make([]map[string]any, 0, len(hints))
 	for _, h := range hints {
 		var p map[string]any
@@ -381,7 +387,7 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// derived_from — possibly several facts combined) and its yields (the
 	// facts/findings it produced). factFrom maps a fact → the intent that
 	// produced it. This is the relationship layer the flat lists lacked.
-	edges, _ := t.ts.Edges(5000)
+	edges, _ := g.edgeList(5000)
 	parentsOf := map[int64][]int64{}
 	yieldsOf := map[int64][]int64{}
 	factFrom := map[int64]int64{}
@@ -405,14 +411,14 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// — hidden() only folds a member out when it is covered AND still cold. Computed
 	// every round (cheap for real graph sizes); nil map degrades safely.
 	var hotAtRender map[int64]bool
-	if cg, _, err := loadColdGraph(t.ts); err == nil {
+	if cg, err := g.coldGraph(); err == nil {
 		hotAtRender = cg.hotSet()
 	}
 	hidden := func(id int64) bool { _, c := covered[id]; return c && !hotAtRender[id] }
 	const openIntentsCap = 30
-	fr, _ := t.ts.Frontier(openIntentsCap) // priority DESC, id ASC —— 优先级最高的前 N 条；真实总数见 frontier_open
+	fr, _ := g.frontier(openIntentsCap) // priority DESC, id ASC —— 优先级最高的前 N 条；真实总数见 frontier_open
 	out["open_intents"] = compactIntents(fr, parentsOf, yieldsOf)
-	all, _ := t.ts.ListByKind(db.KindIntent, 300)
+	all, _ := g.listByKind(db.KindIntent, 300)
 	var running, recentDone []*db.Node
 	for _, n := range all {
 		switch n.State {
@@ -429,11 +435,11 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// done_intents_total：已结束意图（done/blocked/exhausted）总数，与 recent_done_intents
 	// 平行命名——后者只是它的最新窗口截断视图。两键并排即自描述："看到的是 N/总数"，
 	// 让 planner 去重时别把"没显示"当成"没派过"，无需在提示词里另行解释。
-	if dt, err := t.ts.CountFinishedIntents(); err == nil {
+	if dt, err := g.countFinishedIntents(); err == nil {
 		out["done_intents_total"] = dt
 	}
 	// frontier_open：开放意图真实总数（open_intents 只是其中优先级最高的前 N 条截断视图）。
-	if fo, err := t.ts.CountOpenIntents(); err == nil {
+	if fo, err := g.countOpenIntents(); err == nil {
 		out["frontier_open"] = fo
 	} else {
 		out["frontier_open"] = len(fr)
@@ -442,10 +448,10 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// now distinct node kinds. recent_facts surfaces fact summaries (esp.
 	// negative results) so the planner sees them in one call; full content
 	// via node_detail(id).
-	vulnNodes, _ := t.ts.ListByKind(db.KindFinding, 1000)
-	factNodes, _ := t.ts.ListByKind(db.KindFact, 1000) // newest first
-	out["findings_total"] = len(vulnNodes)             // 确认漏洞总数（目标判定看它）；明细见 finding_list（最新一窗）
-	out["facts"] = len(factNodes)                      // 探索事实/结论数（含否定结论）
+	vulnNodes, _ := g.listByKind(db.KindFinding, 1000)
+	factNodes, _ := g.listByKind(db.KindFact, 1000) // newest first
+	out["findings_total"] = len(vulnNodes)          // 确认漏洞总数（目标判定看它）；明细见 finding_list（最新一窗）
+	out["facts"] = len(factNodes)                   // 探索事实/结论数（含否定结论）
 	// findings 是任务里最高价值的产物 → 概览带最新一窗（≤10 条，vulnNodes 已按 id 降序即最新在前），
 	// 让 planner 每轮判目标时一眼看到最近确认的漏洞；全量/更早的用 list_findings 取。
 	// 每条只留 {id, summary, from_intent?}：from_intent 是产生本漏洞的意图。

@@ -341,6 +341,21 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 	return seed
 }
 
+// Entry-seed render caps: a long-running task can accumulate many relevant
+// confirmed facts with long details; the rest stay one list_facts call away.
+const (
+	entrySeedFactCap   = 60
+	entrySeedDetailCap = 600
+)
+
+func clipRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…（已截断，完整见 node_detail）"
+}
+
 // RenderWorkerEntrySeed formats the pre-seed, incomplete-graph marker, and
 // entry hard-step for the worker system prompt. Always fail-soft: an incomplete
 // graph still returns a prompt block and never a hard error.
@@ -368,7 +383,12 @@ func RenderWorkerEntrySeed(seed WorkerEntrySeed) string {
 	}
 
 	b.WriteString("\n\n【进场预塞：与本意图相关的已确认事实】\n")
-	for _, f := range seed.ConfirmedFacts {
+	facts := seed.ConfirmedFacts
+	if omitted := len(facts) - entrySeedFactCap; omitted > 0 {
+		facts = facts[omitted:] // sorted by id ASC → keep the newest
+		fmt.Fprintf(&b, "（另有 %d 条更早的相关事实未列出，需要时用 list_facts / node_detail 查）\n", omitted)
+	}
+	for _, f := range facts {
 		conf := f.Confidence
 		if conf == "" {
 			conf = "confirmed"
@@ -382,7 +402,7 @@ func RenderWorkerEntrySeed(seed WorkerEntrySeed) string {
 		}
 		b.WriteByte('\n')
 		if d := strings.TrimSpace(f.Detail); d != "" {
-			fmt.Fprintf(&b, "  细节：%s\n", d)
+			fmt.Fprintf(&b, "  细节：%s\n", clipRunes(d, entrySeedDetailCap))
 		}
 	}
 
@@ -434,6 +454,11 @@ func attachStoredGraphIncomplete(g *EntryGraph, src graphIncompleteReader) {
 // LoadWorkerEntrySeed prefetches the exploration graph for a claimed intent.
 // Compression and listing errors fail soft. This function only reads.
 func LoadWorkerEntrySeed(ts *db.ExplorationStore, as *db.AssetStore, intent *db.Node) WorkerEntrySeed {
+	return loadWorkerEntrySeedFrom(ts, newGraphSnapshot(ts), as, intent)
+}
+
+// loadWorkerEntrySeedFrom is LoadWorkerEntrySeed reading through a shared snapshot.
+func loadWorkerEntrySeedFrom(ts *db.ExplorationStore, snap *graphSnapshot, as *db.AssetStore, intent *db.Node) WorkerEntrySeed {
 	g := EntryGraph{Intent: intent, Anchors: map[int64][]int64{}, Assets: map[int64]string{}}
 	if intent != nil {
 		g.IntentAssetIDs = intentAssetIDs(intent)
@@ -443,7 +468,7 @@ func LoadWorkerEntrySeed(ts *db.ExplorationStore, as *db.AssetStore, intent *db.
 		return BuildWorkerEntrySeed(g)
 	}
 
-	if _, _, err := loadColdGraph(ts); err != nil {
+	if _, err := snap.coldGraph(); err != nil {
 		g.CompressErr = err
 	}
 	attachStoredGraphIncomplete(&g, ts)
@@ -455,16 +480,16 @@ func LoadWorkerEntrySeed(ts *db.ExplorationStore, as *db.AssetStore, intent *db.
 		}
 	}
 
-	facts, err := ts.ListByKind(db.KindFact, 1000)
+	facts, err := snap.listByKind(db.KindFact, 1000)
 	collect(err)
 	g.Facts = facts
-	findings, err := ts.ListByKind(db.KindFinding, 1000)
+	findings, err := snap.listByKind(db.KindFinding, 1000)
 	collect(err)
 	g.Findings = findings
-	goals, err := ts.ListByKind(db.KindGoal, 200)
+	goals, err := snap.listByKind(db.KindGoal, 200)
 	collect(err)
 	g.Goals = goals
-	edges, err := ts.Edges(5000)
+	edges, err := snap.edgeList(5000)
 	collect(err)
 	g.Edges = edges
 
