@@ -503,7 +503,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// The run-wide intent is not the current tool action. Do not forward it or
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
-	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
+	snap := newGraphSnapshot(ts) // overview + entry seed share one graph read
+	overview := renderWorkerGraphOverview(tsx.graphOverviewDataFrom(snap))
 	proxyAddr, proxyCA := w.proxyForTask(taskID)
 	sysBody := workerSystem(proxyAddr, proxyCA, w.workDir, runDir, w.intranetForTask(taskID))
 	if w.wantConstraints() {
@@ -532,7 +533,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	}
 	// 进场预塞：与本意图相关的已确认事实 + 已确认可达但未兑现的下一跳。
 	// 压缩/预取失败只打「图谱不完整」标记，fail-soft，不阻断进场、不写目标失败。
-	sysBody += RenderWorkerEntrySeed(LoadWorkerEntrySeed(ts, as, intent))
+	sysBody += RenderWorkerEntrySeed(loadWorkerEntrySeedFrom(ts, snap, as, intent))
 	sysBody += w.credentialSeedBlock(ctx, taskID) // 无继承凭据或查询失败时为空串
 	sysBody += "\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。"
 	system, boundary := deferredSystem(sysBody, def)

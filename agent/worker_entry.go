@@ -434,6 +434,11 @@ func attachStoredGraphIncomplete(g *EntryGraph, src graphIncompleteReader) {
 // LoadWorkerEntrySeed prefetches the exploration graph for a claimed intent.
 // Compression and listing errors fail soft. This function only reads.
 func LoadWorkerEntrySeed(ts *db.ExplorationStore, as *db.AssetStore, intent *db.Node) WorkerEntrySeed {
+	return loadWorkerEntrySeedFrom(ts, newGraphSnapshot(ts), as, intent)
+}
+
+// loadWorkerEntrySeedFrom is LoadWorkerEntrySeed reading through a shared snapshot.
+func loadWorkerEntrySeedFrom(ts *db.ExplorationStore, snap *graphSnapshot, as *db.AssetStore, intent *db.Node) WorkerEntrySeed {
 	g := EntryGraph{Intent: intent, Anchors: map[int64][]int64{}, Assets: map[int64]string{}}
 	if intent != nil {
 		g.IntentAssetIDs = intentAssetIDs(intent)
@@ -443,7 +448,7 @@ func LoadWorkerEntrySeed(ts *db.ExplorationStore, as *db.AssetStore, intent *db.
 		return BuildWorkerEntrySeed(g)
 	}
 
-	if _, _, err := loadColdGraph(ts); err != nil {
+	if _, err := snap.coldGraph(); err != nil {
 		g.CompressErr = err
 	}
 	attachStoredGraphIncomplete(&g, ts)
@@ -455,16 +460,16 @@ func LoadWorkerEntrySeed(ts *db.ExplorationStore, as *db.AssetStore, intent *db.
 		}
 	}
 
-	facts, err := ts.ListByKind(db.KindFact, 1000)
+	facts, err := snap.listByKind(db.KindFact, 1000)
 	collect(err)
 	g.Facts = facts
-	findings, err := ts.ListByKind(db.KindFinding, 1000)
+	findings, err := snap.listByKind(db.KindFinding, 1000)
 	collect(err)
 	g.Findings = findings
-	goals, err := ts.ListByKind(db.KindGoal, 200)
+	goals, err := snap.listByKind(db.KindGoal, 200)
 	collect(err)
 	g.Goals = goals
-	edges, err := ts.Edges(5000)
+	edges, err := snap.edgeList(5000)
 	collect(err)
 	g.Edges = edges
 
