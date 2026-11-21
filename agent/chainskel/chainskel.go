@@ -22,7 +22,16 @@ import (
 var skeletonFS embed.FS
 
 // Categories 是合法的 chain_tags 取值。
-var Categories = []string{"web", "ad", "app", "priv", "pwn", "recon", "rev", "pivot", "meta", "patch", "firmware", "audit", "identity", "cloud", "protocol"}
+var Categories = []string{"web", "ad", "app", "priv", "pwn", "recon", "rev", "pivot", "meta", "patch", "firmware", "audit", "identity", "cloud", "protocol", "supply", "ai", "ot", "wireless", "extension", "client", "hardware", "database", "email", "report"}
+
+// distilledCategories 是离线蒸馏的"按需"类别:仅内置 L3 骨架,不随包携带 L4 原文
+// refs 目录(与老九类 web/ad/app/priv/pwn/recon/rev/pivot/meta 不同),故
+// RefsGuideForIntent 对其返回空,避免指向不存在的 skills/chains-<类别>/refs/。
+var distilledCategories = map[string]bool{
+	"patch": true, "firmware": true, "audit": true, "identity": true, "cloud": true, "protocol": true,
+	"supply": true, "ai": true, "ot": true, "wireless": true, "extension": true, "client": true,
+	"hardware": true, "database": true, "email": true, "report": true,
+}
 
 // MaxTagsPerIntent 是公开标签校验上限;ForIntent 只注入首个主类别。
 const MaxTagsPerIntent = 2
@@ -100,20 +109,31 @@ var keywordRules = []struct {
 	cat      string
 	keywords []string
 }{
-	{"patch", []string{"patch diff", "补丁差分", "补丁分析", "补丁对比", "n-day", "ghidriff", "diaphora"}},
+	{"patch", []string{"patch diff", "补丁差分", "补丁分析", "补丁对比", "n-day", "ghidriff", "diaphora", "bindiff", "二进制差分", "版本比对", "diffing"}},
 	{"firmware", []string{"firmware", "固件", "binwalk", "squashfs", "ubifs", "嵌入式安全", "iot security", "iot pentest"}},
 	{"audit", []string{"code audit", "code-audit", "source code security", "security code review", "源码审计", "代码审计", "白盒审计", "semgrep", "codeql", "gosec", "sast"}},
-	{"web", []string{"sql", "注入", "xss", "ssrf", "ssti", "xxe", "反序列化", "文件上传", "上传点", "命令注入", "命令执行", "代码执行", "rce", "waf", "逻辑漏洞", "越权", "jwt", "文件包含", "目录遍历", "cms", "graphql", "bola", "bfla", "idor", "接口鉴权", "接口测试", "批量赋值", "mass assignment", "限速绕过", "rest api", "websocket"}},
+	{"ai", []string{"llm", "大模型", "大语言模型", "提示注入", "提示词注入", "prompt injection", "prompt-injection", "越狱", "jailbreak", "间接注入", "rag 投毒", "知识库投毒", "记忆投毒", "ai agent", "ai 安全", "智能体安全", "工具滥用", "mcp 工具", "模型供应链"}},
+	// hardware 置于 web 之前:其"故障注入"等含 web 泛词"注入"的复合关键词需先于 web 命中(同 ai 的"提示注入")。
+	{"hardware", []string{"硬件安全", "嵌入式接口", "jtag", "uart", "swd", "idcode", "安全启动", "secure boot", "调试接口", "调试口", "故障注入", "glitch", "侧信道", "flash 提取", "逻辑分析仪", "bus pirate"}},
+	{"web", []string{"sql", "注入", "xss", "ssrf", "ssti", "xxe", "反序列化", "文件上传", "上传点", "命令注入", "命令执行", "代码执行", "rce", "waf", "逻辑漏洞", "越权", "jwt", "文件包含", "目录遍历", "cms", "graphql", "bola", "bfla", "idor", "接口鉴权", "接口测试", "批量赋值", "mass assignment", "限速绕过", "rest api", "websocket", "前端加密", "前端签名", "js 加密", "sourcemap", "webpack 还原", "请求签名"}},
 	{"identity", []string{"saml", "oidc", "openid", "oauth", "sso", "单点登录", "身份联邦", "联邦登录", "账号接管", "account takeover", "redirect_uri", "assertion 篡改", "idp 元数据"}},
 	{"cloud", []string{"k8s", "kubernetes", "云原生", "imds", "元数据凭据", "公开桶", "存储桶", "iam 角色", "iam 权限", "过度授权", "rbac", "eks", "gke", "serviceaccount", "云控制面"}},
+	{"supply", []string{"供应链安全", "软件供应链", "sbom", "软件组成分析", "依赖混淆", "dependency confusion", "typosquat", "依赖投毒", "包投毒", "供应链投毒", "cosign", "制品签名", "制品完整性", "第三方 action", "osv-scanner", "dependency-track"}},
+	{"ot", []string{"工控", "工控安全", "ics 安全", "ot 安全", "scada", "dcs", "plc", "rtu", "hmi", "modbus", "dnp3", "ethernet/ip", "profinet", "s7comm", "purdue", "工程师站", "安全仪表"}},
+	{"wireless", []string{"wifi", "wi-fi", "无线安全", "无线网络", "wpa", "wpa2", "wpa3", "802.11", "pmkid", "握手包", "aircrack", "deauth", "rogue ap", "流氓 ap", "蓝牙", "bluetooth", "ble", "zigbee", "sdr", "射频", "无线电", "gnuradio", "hackrf", "rtl-sdr", "rfid", "ads-b"}},
+	{"extension", []string{"浏览器扩展", "browser extension", "chrome 扩展", "edge 扩展", "firefox 扩展", "扩展程序", "manifest.json", "content script", "content_script", "service worker 扩展", "webextension", "crx", "xpi", "扩展权限"}},
+	{"client", []string{"厚客户端", "胖客户端", "thick client", "桌面客户端", "c/s 架构", "electron", "asar", "客户端 ipc", "命名管道", "自动更新劫持", "更新通道", "代码签名验证", "dll 劫持"}},
+	{"database", []string{"数据库安全", "数据库未授权", "数据库弱口令", "redis 未授权", "mongodb 未授权", "memcached 未授权", "xp_cmdshell", "load_file", "file_priv", "copy program", "udf 提权", "数据库提权", "数据库配置审计", "rds 配置审计"}},
+	{"email", []string{"邮件安全", "钓鱼邮件", "spf", "dkim", "dmarc", "邮件伪造", "发件人伪造", "return-path", "smtp 伪造", "open relay", "邮件钓鱼", "bec", "邮箱接管", "arc 签名"}},
 	{"protocol", []string{"protobuf", "grpc", "协议逆向", "私有协议", "二进制协议", "pcap", "流量还原", "帧布局", "帧结构", "tlv", "mqtt", "kaitai", "dissector", "报文解析", "decode_raw"}},
 	{"ad", []string{"kerberos", "域控", "ad域", "活动目录", "ntlm", "dcsync", "kerberoast", "委派", "adcs", "黄金票据", "白银票据", "as-rep", "域渗透", "域内", "密码喷洒"}},
 	{"app", []string{"apk", "frida", "小程序", "安卓", "android", "ios", "抓包", "app"}},
 	{"priv", []string{"提权", "权限提升", "privesc", "suid", "内核漏洞", "disable_functions", "容器逃逸", "逃逸"}},
 	{"pwn", []string{"栈溢出", "堆溢出", "堆喷", "格式化字符串", "ctf", "pwn", "shellcode", "rop", "uaf", "double free", "tcache", "栈迁移"}},
-	{"recon", []string{"侦察", "指纹", "子域", "信息收集", "osint", "端口扫描", "目录扫描", "资产测绘", "踩点", "敏感信息", "泄露"}},
-	{"rev", []string{"逆向", "脱壳", "反编译", "加壳", "反调试", "混淆", "静态分析", "动态调试", "算法恢复"}},
-	{"pivot", []string{"隧道", "代理", "横向", "内网", "穿透", "socks", "chisel", "frp", "端口转发", "跳板", "立足点", "webshell"}},
+	{"recon", []string{"侦察", "指纹", "子域", "信息收集", "osint", "端口扫描", "目录扫描", "资产测绘", "踩点", "敏感信息", "泄露", "src 挖掘", "众测", "漏洞赏金", "资产梳理"}},
+	{"rev", []string{"逆向", "脱壳", "反编译", "加壳", "反调试", "混淆", "静态分析", "动态调试", "算法恢复", "dotnet", ".net 逆向", "mach-o", "golang 逆向", "rust 逆向", "虚拟机保护", "vmp", "dsl 虚拟机"}},
+	{"pivot", []string{"隧道", "代理", "横向", "内网", "穿透", "socks", "chisel", "frp", "端口转发", "跳板", "立足点", "webshell", "攻击链", "影响路径", "杀伤链"}},
+	{"report", []string{"案例复盘", "报告复核", "提报复核", "提交前复核", "证据链一致性", "证据图复核", "可复现性校验", "可复现性复核", "case review", "report review", "scope 一致性", "提报质量"}},
 }
 
 // matchesKeyword 匹配关键词,并仅在关键词自身边缘为 ASCII token 字节时,

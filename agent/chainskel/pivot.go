@@ -84,8 +84,8 @@ func RefsGuideForIntent(payload json.RawMessage) string {
 	if len(cats) == 0 {
 		return ""
 	}
-	if cats[0] == "patch" || cats[0] == "firmware" || cats[0] == "audit" || cats[0] == "identity" || cats[0] == "cloud" || cats[0] == "protocol" {
-		return ""
+	if distilledCategories[cats[0]] {
+		return "" // 蒸馏类别无随包 L4 refs 目录,静默不给原文指引
 	}
 	paths := make([]string, len(cats))
 	for i, c := range cats {
