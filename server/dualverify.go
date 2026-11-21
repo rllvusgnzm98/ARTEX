@@ -210,7 +210,7 @@ func (s *Server) executeDualVerify(ctx context.Context, in json.RawMessage) (act
 	if err != nil {
 		return actool.Errorf(err.Error()), nil
 	}
-	if ot := parseProfileID(a.OtherTenant); ot > 0 {
+	if ot := parseProfileID(a.OtherTenant); a.TenantRole && ot > 0 {
 		if ot == parseProfileID(a.A) {
 			return actool.Errorf("B_other_tenant 不能与 A 使用相同凭据：所有者自读不是跨租户访问"), nil
 		}
@@ -242,7 +242,7 @@ func (s *Server) executeDualVerify(ctx context.Context, in json.RawMessage) (act
 	if secrets["A"] == secrets["B"] {
 		return actool.Errorf("A/B 必须为不同账号凭据，不能使用相同秘密"), nil
 	}
-	if ot, ok := secrets["B_other_tenant"]; ok {
+	if ot, ok := secrets["B_other_tenant"]; a.TenantRole && ok {
 		if ot == secrets["A"] {
 			return actool.Errorf("B_other_tenant 不能与 A 使用相同凭据：所有者自读不是跨租户访问"), nil
 		}
