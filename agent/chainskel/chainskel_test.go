@@ -322,6 +322,7 @@ func TestBatch3NewTags(t *testing.T) {
 		{"Electron 桌面客户端 ipc 与自动更新劫持", "client"},
 		{"厚客户端 dll 劫持与本地凭据", "client"},
 		{"JTAG 调试接口与安全启动评估", "hardware"},
+		{"JTAG 故障注入评估", "hardware"}, // 故障注入 含 web 的"注入",须路由 hardware 而非 web
 		{"硬件安全 flash 提取与哈希保全", "hardware"},
 		{"数据库未授权与危险配置审计", "database"},
 		{"xp_cmdshell 与 file_priv 危险功能", "database"},
