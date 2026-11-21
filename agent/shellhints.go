@@ -1,5 +1,23 @@
 package agent
 
+import (
+	"context"
+
+	"github.com/Autumn-27/artex/tools"
+)
+
+func ShellHintAvailability(ctx context.Context, dataDir string) []tools.Availability {
+	var specs []tools.CommandSpec
+	for _, seed := range ShellHintSeeds() {
+		specs = append(specs, tools.CommandSpec{Name: seed.Key, Optional: seed.Key == "nxc"})
+	}
+	return tools.CheckCommands(ctx, specs, dataDir)
+}
+
+func shellEnv(dataDir string, extra []string) []string {
+	return append(extra, "PATH="+tools.CommandPath(dataDir))
+}
+
 // ShellHintSeed is a kind=shell environment declaration: a CLI that may be
 // present on PATH and advertised in the Bash tool description. It is not a
 // callable tool, is not deferred, and is not discovered via SearchExtraTools.
@@ -39,11 +57,11 @@ func ShellHintSeeds() []ShellHintSeed {
 		{Key: "httpx", Desc: "用于对一批目标做 HTTP 探活、状态与基础指纹。Bash 说明里已列出时优先用它，不要为同一类探活手写 curl 循环。"},
 		{Key: "jq", Desc: "用于在 Bash 里解析和筛选 JSON。Bash 说明里已列出时优先用它，不要为同一类处理再写一层 Python 包装。"},
 		{Key: "nxc", Desc: "已授权内网按需使用的环境声明，不是默认必装工具，也不写入 packaging 必装清单。能力边界是在已授权内网环境下检查常见 Windows/SMB 等管理协议的认证与可见信息；仅当 Bash 说明里已列出且任务需要时使用。不要为同一类事手写协议脚本。"},
-		{Key: "impacket-secretsdump", Desc: "已授权内网按需使用的环境声明，不是默认必装工具，也不写入 packaging 必装清单。能力边界是在已授权前提下处理 Windows 凭据材料的转储或解析；仅当 Bash 说明里已列出且任务需要时使用。不要为同一类事手写协议脚本。"},
-		{Key: "impacket-psexec", Desc: "已授权内网按需使用的环境声明，不是默认必装工具，也不写入 packaging 必装清单。能力边界是在已授权前提下进行 Windows 远程执行；仅当 Bash 说明里已列出且任务需要时使用。不要为同一类事手写协议脚本。"},
-		{Key: "impacket-wmiexec", Desc: "已授权内网按需使用的环境声明，不是默认必装工具，也不写入 packaging 必装清单。能力边界是在已授权前提下经 WMI 进行 Windows 远程执行；仅当 Bash 说明里已列出且任务需要时使用。不要为同一类事手写协议脚本。"},
-		{Key: "impacket-smbclient", Desc: "已授权内网按需使用的环境声明，不是默认必装工具，也不写入 packaging 必装清单。能力边界是在已授权前提下访问或列举 SMB 共享；仅当 Bash 说明里已列出且任务需要时使用。不要为同一类事手写协议脚本。"},
-		{Key: "impacket-GetUserSPNs", Desc: "已授权内网按需使用的环境声明，不是默认必装工具，也不写入 packaging 必装清单。能力边界是在已授权前提下查询 Kerberos 服务主体（SPN）信息；仅当 Bash 说明里已列出且任务需要时使用。不要为同一类事手写协议脚本。"},
+		{Key: "impacket-secretsdump", Desc: "已授权内网按需使用的环境声明，随镜像提供，在授权范围内按需使用。能力边界是在已授权前提下处理 Windows 凭据材料的转储或解析；仅当 Bash 说明里已列出且任务需要时使用。不要为同一类事手写协议脚本。"},
+		{Key: "impacket-psexec", Desc: "已授权内网按需使用的环境声明，随镜像提供，在授权范围内按需使用。能力边界是在已授权前提下进行 Windows 远程执行；仅当 Bash 说明里已列出且任务需要时使用。不要为同一类事手写协议脚本。"},
+		{Key: "impacket-wmiexec", Desc: "已授权内网按需使用的环境声明，随镜像提供，在授权范围内按需使用。能力边界是在已授权前提下经 WMI 进行 Windows 远程执行；仅当 Bash 说明里已列出且任务需要时使用。不要为同一类事手写协议脚本。"},
+		{Key: "impacket-smbclient", Desc: "已授权内网按需使用的环境声明，随镜像提供，在授权范围内按需使用。能力边界是在已授权前提下访问或列举 SMB 共享；仅当 Bash 说明里已列出且任务需要时使用。不要为同一类事手写协议脚本。"},
+		{Key: "impacket-GetUserSPNs", Desc: "已授权内网按需使用的环境声明，随镜像提供，在授权范围内按需使用。能力边界是在已授权前提下查询 Kerberos 服务主体（SPN）信息；仅当 Bash 说明里已列出且任务需要时使用。不要为同一类事手写协议脚本。"},
 	}
 }
 

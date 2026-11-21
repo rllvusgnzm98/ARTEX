@@ -117,27 +117,9 @@ func TestPivotHintsForIntent(t *testing.T) {
 }
 
 func TestRefsGuideForIntent(t *testing.T) {
-	out := RefsGuideForIntent(payload(t, map[string]any{"summary": "打某站", "chain_tags": []string{"web"}}))
-	if !strings.Contains(out, "skills/chains-web/refs/") || !strings.Contains(out, "精确篇目见对应 SKILL.md") {
-		t.Fatalf("web tag 应给出 refs 指引:\n%s", out)
-	}
-	// 仅主类别提供路径。
-	out = RefsGuideForIntent(payload(t, map[string]any{"summary": "x", "chain_tags": []string{"web", "ad", "pivot"}}))
-	if !strings.Contains(out, "skills/chains-web/refs/") || strings.Contains(out, "skills/chains-ad/refs/") {
-		t.Fatalf("只应提供首个 tag 的路径:\n%s", out)
-	}
-	if strings.Contains(out, "chains-pivot") {
-		t.Fatal("第 3 个 tag 超上限不应出现")
-	}
-	// 无 tag 回退关键词;无命中静默。
-	out = RefsGuideForIntent(payload(t, map[string]any{"summary": "做 sql 注入测试"}))
-	if !strings.Contains(out, "skills/chains-web/refs/") {
-		t.Fatalf("关键词回退应给出 web refs 指引:\n%s", out)
-	}
-	if out := RefsGuideForIntent(payload(t, map[string]any{"summary": "随便看看"})); out != "" {
-		t.Fatalf("匹配不中应静默不注入, got:\n%s", out)
-	}
-	if out := RefsGuideForIntent(json.RawMessage(`{bad json`)); out != "" {
-		t.Fatal("payload 解析失败应静默不注入")
+	for _, p := range []json.RawMessage{json.RawMessage(`{"chain_tags":["web"]}`), json.RawMessage(`{bad`), nil} {
+		if got := RefsGuideForIntent(p); got != "" {
+			t.Fatalf("unavailable refs must not be advertised: %s", got)
+		}
 	}
 }

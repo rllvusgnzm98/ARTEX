@@ -1,4 +1,4 @@
-# chains-app L3 决策骨架(场景→判据→转向;蒸馏自 chains 语料,完整 Q&A 见 skills/chains-app/refs/)
+# chains-app L3 决策骨架(场景→判据→转向;蒸馏自 chains 语料)
 - 场景:拿到未知 APK 抽接口/密钥|判据:先 unzip 扫目录:Manifest 看权限/exported、lib/ 看特征 so,5 分钟分诊"纯 Java"还是"核心在 native/壳"|转向:主 dex 无业务类、application:name 指向加固 SDK 即按加固
 - 场景:jadx 类名全是单字母|判据:混淆≠加固——搜 http/api/包名,搜到业务字符串是混淆,dex 只剩壳 SDK 是加固|转向:混淆走字符串驱动精读,加固先榨 assets/meta-data 明文再定脱壳
 - 场景:快速捞明文密钥|判据:搜 secret/appkey/ak/sk/BEGIN、云前缀 AKIA/LTAI/AKID、高熵串,中 60% 低垂果实;assets 最易漏|转向:按能否验活排序(CLI 最小调用),失效 key 当情报横向找同类

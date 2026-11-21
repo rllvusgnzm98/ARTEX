@@ -210,6 +210,9 @@ func TestSectionTruncation(t *testing.T) {
 	if !strings.Contains(out, "已截断") {
 		t.Fatalf("超出 cap 应有截断标注:\n%s", out)
 	}
+	if strings.Contains(out, "/refs/") {
+		t.Fatal("truncation must not advertise unavailable refs")
+	}
 	if n := len([]rune(out)); n > sectionCapRunes+80 { // 标注本身另算,给足余量
 		t.Fatalf("截断后总长 %d 远超 cap %d", n, sectionCapRunes)
 	}

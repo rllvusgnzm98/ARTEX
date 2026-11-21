@@ -1,4 +1,4 @@
-# chains-priv L3 决策骨架(场景→判据→转向;蒸馏自 chains 语料,完整 Q&A 见 skills/chains-priv/refs/)
+# chains-priv L3 决策骨架(场景→判据→转向;蒸馏自 chains 语料)
 - 场景:刚拿 shell 想直接提权|判据:先三问:我是谁(id/组)、什么环境(/.dockerenv、/proc/1/cgroup 见 docker/kubepods 命中两条判容器)、通道稳不稳|转向:不稳先升全 TTY 再收集
 - 场景:低权 shell 定枚举顺序|判据:低成本高命中:id/sudo -l/uname -a/ss -tlnp 30 秒定主干,SUID/getcap/cron 次之,翻凭据最后;配置类榨干前不碰内核 exp|转向:无货转 pspy 与 id 附加组(docker/lxd/disk/shadow)
 - 场景:sudo -l 有输出|判据:NOPASSWD 命令能否按 GTFOBins 撬成任意执行;env_keep 留 LD_PRELOAD/PYTHONPATH 即送分;自定义脚本找相对路径调用|转向:要密码→查 sudo --version 对 Baron Samedit 窗口,仍无则离 sudo 面

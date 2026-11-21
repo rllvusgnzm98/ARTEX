@@ -27,9 +27,10 @@ ARG PLAYWRIGHT_DOWNLOAD_HOST=
 # 常用工具：ripgrep / curl / vim，加一批 recon 常备件（按需增删）。
 # apt 改源前备份 sources.list 与 debian.sources；update 失败则 cp 回原文件，
 # 再用 apt-get -o Acquire::Retries=3 继续。bookworm slim 实际用的是 debian.sources。
-# Docker 会展开 ARG（${NODE_MAJOR:-20}、${APT_MIRROR} 等）。shell 自己的变量写成 $$。
+# RUN 中的变量由 shell 展开。
 RUN set -eu; \
     node_major="${NODE_MAJOR:-20}"; \
+    printf 'path-include /usr/share/doc/python3-impacket\npath-include /usr/share/doc/python3-impacket/*\n' > /etc/dpkg/dpkg.cfg.d/zz-artex-impacket; \
     if [ -f /etc/apt/sources.list ]; then cp /etc/apt/sources.list /tmp/sources.list.bak; fi; \
     if [ -f /etc/apt/sources.list.d/debian.sources ]; then cp /etc/apt/sources.list.d/debian.sources /tmp/debian.sources.bak; fi; \
     if [ -n "$APT_MIRROR" ]; then \
@@ -48,13 +49,14 @@ RUN set -eu; \
     fi; \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
       ca-certificates bash ripgrep curl wget vim git jq unzip \
-      dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap; \
+      dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
+      ffuf gobuster sqlmap hydra whatweb hashcat john python3-impacket libpcap0.8; \
     if [ -n "$NODESOURCE_URL" ]; then \
-      if ! curl -fsSL "${NODESOURCE_URL}/setup_$${node_major}.x" -o /tmp/nodesource-setup.sh; then \
-        curl -fsSL "https://deb.nodesource.com/setup_$${node_major}.x" -o /tmp/nodesource-setup.sh; \
+      if ! curl -fsSL "${NODESOURCE_URL}/setup_${node_major}.x" -o /tmp/nodesource-setup.sh; then \
+        curl -fsSL "https://deb.nodesource.com/setup_${node_major}.x" -o /tmp/nodesource-setup.sh; \
       fi; \
     else \
-      curl -fsSL "https://deb.nodesource.com/setup_$${node_major}.x" -o /tmp/nodesource-setup.sh; \
+      curl -fsSL "https://deb.nodesource.com/setup_${node_major}.x" -o /tmp/nodesource-setup.sh; \
     fi; \
     bash /tmp/nodesource-setup.sh; \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends nodejs; \
@@ -92,7 +94,23 @@ COPY start.sh /app/start.sh
 RUN chmod +x /app/artex /app/start.sh
 COPY skills/ /app/skills/
 # doctor / 运行时按可执行文件目录下的 packaging/tools-manifest.json 做工具自检。
-COPY packaging/tools-manifest.json /app/packaging/tools-manifest.json
+COPY packaging/tools-manifest.json packaging/image-tools.json /app/packaging/
+COPY tools-manifest.sh /app/tools-manifest.sh
+RUN bash /app/tools-manifest.sh fetch --platform "linux/${TARGETARCH}" --dest /opt/artex/tools \
+    && bash /app/tools-manifest.sh fetch --manifest /app/packaging/image-tools.json --platform "linux/${TARGETARCH}" --dest /opt/artex/tools
+RUN set -eu; \
+    for name in secretsdump psexec wmiexec smbclient GetUserSPNs; do \
+      test -f "/usr/share/doc/python3-impacket/examples/$name.py"; \
+      printf '#!/bin/sh\nexec /usr/bin/python3 /usr/share/doc/python3-impacket/examples/%s.py "$@"\n' "$name" > "/usr/local/bin/impacket-$name"; \
+      chmod +x "/usr/local/bin/impacket-$name"; \
+      "/usr/local/bin/impacket-$name" -h >/dev/null; \
+    done; \
+    git clone --depth 1 --branch v4.0 https://github.com/commixproject/commix.git /opt/commix; \
+    test "$(git -C /opt/commix rev-parse HEAD)" = 13d51481cb3998fbf9247743217bcc6c5fd2da86; \
+    rm -rf /opt/commix/.git; \
+    printf '#!/bin/sh\nexec /usr/local/bin/python3 /opt/commix/commix.py "$@"\n' > /usr/local/bin/commix; \
+    chmod +x /usr/local/bin/commix
+ENV PATH="/opt/artex/tools:${PATH}"
 # data/（SQLite + jwt.key）持久化点
 VOLUME ["/app/data"]
 EXPOSE 8787 8788

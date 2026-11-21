@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/config"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/server"
@@ -80,6 +82,8 @@ func runDoctor(args []string) int {
 	}
 
 	// 1. PostgreSQL 可连接（复用现有配置解析；轻量 ping，不走 Open 的迁移/seed）
+	checkShellAvailability(context.Background(), *dataDir, *strictTools, check)
+
 	dsn, source, dsnErr := db.DSN()
 	profiles, dbOK, llmChecked := -1, false, false
 	if dsnErr != nil {
@@ -302,6 +306,22 @@ func runDoctor(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+func checkShellAvailability(ctx context.Context, dataDir string, strict bool, check func(doctorStatus, string, string)) {
+	for _, result := range agent.ShellHintAvailability(ctx, dataDir) {
+		status, note := docOK, result.Path
+		if !result.Available {
+			status, note = docWarn, result.Error
+			if strict && !result.Optional {
+				status = docFail
+			}
+		}
+		if result.Optional {
+			note += " (optional)"
+		}
+		check(status, "CLI "+result.Name, note)
+	}
 }
 
 // doctorSkillDir 只读地解析技能根目录：与 config.SkillDir() 优先级相同

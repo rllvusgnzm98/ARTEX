@@ -24,6 +24,7 @@ import hashlib
 import io
 import json
 import os
+import platform
 import re
 import sys
 import tarfile
@@ -333,7 +334,8 @@ def cmd_verify(manifest_path, optional_path):
 def apply_pins(manifest, results):
     by_name = {}
     for entry in manifest.get("tools") or []:
-        by_name[entry.get("name")] = entry
+        if entry.get("platform") == "linux/amd64":
+            by_name[entry.get("name")] = entry
     for tool, info in results.items():
         entry = by_name.get(tool)
         if entry is None:
@@ -378,12 +380,26 @@ def cmd_pin(manifest_path, write):
     return 0
 
 
-def cmd_fetch(manifest_path, dest):
+def host_platform():
+    arch = {"x86_64": "amd64", "aarch64": "arm64", "AMD64": "amd64"}.get(platform.machine(), platform.machine())
+    return platform.system().lower() + "/" + arch
+
+
+def platform_matches(value, target):
+    values = re.split(r"[,;|\s]+", (value or "").lower().strip())
+    return not value or "any" in values or target.lower() in values
+
+
+def cmd_fetch(manifest_path, dest, target=None):
+    target = target or host_platform()
     manifest = load_json(manifest_path)
     os.makedirs(dest, exist_ok=True)
     failed = 0
     for entry in manifest.get("tools") or []:
         name = entry.get("name") or ""
+        if not platform_matches(entry.get("platform"), target):
+            print("SKIP %s: platform %s != %s" % (name, entry.get("platform"), target))
+            continue
         sha = str(entry.get("sha256") or "").strip().lower()
         url = str(entry.get("url") or "").strip()
         if not sha:
@@ -419,6 +435,7 @@ def parse_args(argv):
     write = False
     dest = "data/tools"
     manifest = "packaging/tools-manifest.json"
+    target = None
     i = 1
     while i < len(argv):
         arg = argv[i]
@@ -430,21 +447,24 @@ def parse_args(argv):
         elif arg == "--manifest" and i + 1 < len(argv):
             i += 1
             manifest = argv[i]
+        elif arg == "--platform" and i + 1 < len(argv):
+            i += 1
+            target = argv[i]
         else:
             die("未知参数: %s" % arg)
         i += 1
-    return cmd, write, dest, manifest
+    return cmd, write, dest, manifest, target
 
 
 def main():
-    cmd, write, dest, manifest = parse_args(sys.argv[1:])
+    cmd, write, dest, manifest, target = parse_args(sys.argv[1:])
     optional = os.path.join(os.path.dirname(manifest) or ".", "tools-manifest.optional.json")
     if cmd == "verify":
         cmd_verify(manifest, optional)
     elif cmd == "pin":
         cmd_pin(manifest, write)
     elif cmd == "fetch":
-        cmd_fetch(manifest, dest)
+        cmd_fetch(manifest, dest, target)
     else:
         die("未知子命令: %s" % cmd)
 

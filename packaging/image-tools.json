@@ -1,0 +1,48 @@
+{
+  "tools": [
+    {
+      "name": "nuclei",
+      "version": "v3.4.10",
+      "platform": "linux/amd64",
+      "url": "https://github.com/projectdiscovery/nuclei/releases/download/v3.4.10/nuclei_3.4.10_linux_amd64.zip",
+      "sha256": "794b5033f3e7b40b23bcf8a4e1c886d16275e0be2aaa19f0d8716a7bcb9e1489",
+      "path": "tools/nuclei",
+      "env": "",
+      "category": "arsenal",
+      "optional": false
+    },
+    {
+      "name": "feroxbuster",
+      "version": "v2.11.0",
+      "platform": "linux/amd64",
+      "url": "https://github.com/epi052/feroxbuster/releases/download/v2.11.0/x86_64-linux-feroxbuster.zip",
+      "sha256": "b3fda5c2a432ce698f7ecfd6e13aca99db9f86e612df9a6e45f5d527f3211ed1",
+      "path": "tools/feroxbuster",
+      "env": "",
+      "category": "arsenal",
+      "optional": false
+    },
+    {
+      "name": "nuclei",
+      "version": "v3.4.10",
+      "platform": "linux/arm64",
+      "url": "https://github.com/projectdiscovery/nuclei/releases/download/v3.4.10/nuclei_3.4.10_linux_arm64.zip",
+      "sha256": "4db94b2dd84dbe1ab7a9e0939b93708c7ece9fc811a25dab8e2052e34f23f68c",
+      "path": "tools/nuclei",
+      "env": "",
+      "category": "arsenal",
+      "optional": false
+    },
+    {
+      "name": "feroxbuster",
+      "version": "v2.11.0",
+      "platform": "linux/arm64",
+      "url": "https://github.com/epi052/feroxbuster/releases/download/v2.11.0/aarch64-linux-feroxbuster.zip",
+      "sha256": "ff693ecca459d913ea1fef333972c6e48e6bc5ef5a687e3c6710b9404e793384",
+      "path": "tools/feroxbuster",
+      "env": "",
+      "category": "arsenal",
+      "optional": false
+    }
+  ]
+}

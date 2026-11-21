@@ -20,6 +20,7 @@ import (
 	"github.com/Autumn-27/artex/config"
 	"github.com/Autumn-27/artex/selfupdate"
 	"github.com/Autumn-27/artex/server"
+	"github.com/Autumn-27/artex/tools"
 )
 
 // version is the build version, injected at release time via
@@ -74,6 +75,12 @@ func run() int {
 	// capture backend logs into the in-memory sink (still to stderr) so the /logs
 	// page can show a live log stream. Do this first, to catch startup logs too.
 	server.StartLogCapture()
+	availability := agent.ShellHintAvailability(context.Background(), *dataDir)
+	if summary, missing := tools.AvailabilitySummary(availability); missing {
+		log.Printf("[tools] WARN %s", summary)
+	} else {
+		log.Printf("[tools] %s", summary)
+	}
 
 	// Self-update bootstrap: swap in a staged binary, or count a post-swap boot
 	// attempt and roll back if the new build keeps dying. Must run before we open

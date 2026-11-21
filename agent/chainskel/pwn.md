@@ -1,4 +1,4 @@
-# chains-pwn L3 决策骨架(场景→判据→转向;蒸馏自 chains 语料,完整 Q&A 见 skills/chains-pwn/refs/)
+# chains-pwn L3 决策骨架(场景→判据→转向;蒸馏自 chains 语料)
 - 场景:拿到未知二进制不知从何下手|判据:file 看架构/静态/strip,checksec 看 Canary/NX/PIE/RELRO,strings 找 system//bin/sh,五个开关即定利用骨架|转向:先定性(远程服务/交互/静态 musl)再逆向,别通读全程序
 - 场景:checksec 全绿无从下手|判据:防护全开=题目必给泄露原语,规划"先 leak 后打"两阶段|转向:先找 fmt/越界读/栈残留泄 canary+基址;2h 无 leak 无崩就转逻辑洞
 - 场景:定位栈溢出偏移|判据:cyclic 发入,崩溃后取栈顶 pattern 反查(64 位看 RSP 指向的返回地址,非 PC);ROP 落地崩查 movaps 需 16 字节对齐|转向:链首加 ret 对齐;静态看不清就喂 pattern 让崩点指路

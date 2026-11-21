@@ -51,63 +51,123 @@
     },
     {
       "name": "gogo",
-      "purpose": "内网端口扫描与服务识别",
       "version": "v2.15.0",
       "platform": "linux/amd64",
-      "sha256": "3b51080a909023f7d484e2443740b572307ce0054eb9e32d98f0a06bfcd2db90",
       "url": "https://github.com/chainreactors/gogo/releases/download/v2.15.0/gogo_linux_amd64",
+      "sha256": "3b51080a909023f7d484e2443740b572307ce0054eb9e32d98f0a06bfcd2db90",
       "path": "tools/gogo",
       "env": "",
       "category": "arsenal",
-      "optional": false
+      "optional": false,
+      "purpose": "内网端口扫描与服务识别"
     },
     {
       "name": "naabu",
-      "purpose": "快速端口扫描",
       "version": "v2.7.0",
       "platform": "linux/amd64",
-      "sha256": "34b22eb195238380947792e9c83f4276d2182871df1842d2eb927db0659e6276",
       "url": "https://github.com/projectdiscovery/naabu/releases/download/v2.7.0/naabu_2.7.0_linux_amd64.zip",
+      "sha256": "34b22eb195238380947792e9c83f4276d2182871df1842d2eb927db0659e6276",
       "path": "tools/naabu",
       "env": "",
       "category": "arsenal",
-      "optional": false
+      "optional": false,
+      "purpose": "快速端口扫描"
     },
     {
       "name": "httpx",
-      "purpose": "HTTP 服务探活与指纹/标题识别",
       "version": "v1.12.0",
       "platform": "linux/amd64",
-      "sha256": "6d78b83b4da452a7e0bd3613c4fae04cbf523209f083904b563f4d4406a680b0",
       "url": "https://github.com/projectdiscovery/httpx/releases/download/v1.12.0/httpx_1.12.0_linux_amd64.zip",
+      "sha256": "6d78b83b4da452a7e0bd3613c4fae04cbf523209f083904b563f4d4406a680b0",
       "path": "tools/httpx",
       "env": "",
       "category": "arsenal",
-      "optional": false
+      "optional": false,
+      "purpose": "HTTP 服务探活与指纹/标题识别"
     },
     {
       "name": "katana",
-      "purpose": "Web 爬虫与端点发现",
       "version": "v1.8.0",
       "platform": "linux/amd64",
-      "sha256": "3214c11a0548667b37ec17bbb691706b7e0de1f0f24b3ead2ee12c301ebc1bbc",
       "url": "https://github.com/projectdiscovery/katana/releases/download/v1.8.0/katana_1.8.0_linux_amd64.zip",
+      "sha256": "3214c11a0548667b37ec17bbb691706b7e0de1f0f24b3ead2ee12c301ebc1bbc",
       "path": "tools/katana",
       "env": "",
       "category": "arsenal",
-      "optional": false
+      "optional": false,
+      "purpose": "Web 爬虫与端点发现"
     },
     {
       "name": "fscan",
-      "purpose": "内网综合扫描：端口与服务识别",
       "version": "v2.2.2",
       "platform": "linux/amd64",
-      "sha256": "e5c645434b4fb3b9bfa8d7402e2e6e80189c9ec9533ebdc8620aaace686cd84c",
       "url": "https://github.com/shadow1ng/fscan/releases/download/v2.2.2/fscan_2.2.2_linux_x64",
+      "sha256": "e5c645434b4fb3b9bfa8d7402e2e6e80189c9ec9533ebdc8620aaace686cd84c",
       "path": "tools/fscan",
       "env": "",
       "category": "arsenal",
-      "optional": false
+      "optional": false,
+      "purpose": "内网综合扫描：端口与服务识别"
+    },
+    {
+      "name": "gogo",
+      "version": "v2.15.0",
+      "platform": "linux/arm64",
+      "url": "https://github.com/chainreactors/gogo/releases/download/v2.15.0/gogo_linux_arm64",
+      "sha256": "f34e248bc1d0f8e18101655850082b9f48f5f9f5a102cbac107086f3798c20a9",
+      "path": "tools/gogo",
+      "env": "",
+      "category": "arsenal",
+      "optional": false,
+      "purpose": "内网端口扫描与服务识别"
+    },
+    {
+      "name": "naabu",
+      "version": "v2.7.0",
+      "platform": "linux/arm64",
+      "url": "https://github.com/projectdiscovery/naabu/releases/download/v2.7.0/naabu_2.7.0_linux_arm64.zip",
+      "sha256": "4069be13f4170bd4dffe855a01d5e8977b2a70e05b71b6c45e519a4c1e8dfe2a",
+      "path": "tools/naabu",
+      "env": "",
+      "category": "arsenal",
+      "optional": false,
+      "purpose": "快速端口扫描"
+    },
+    {
+      "name": "httpx",
+      "version": "v1.12.0",
+      "platform": "linux/arm64",
+      "url": "https://github.com/projectdiscovery/httpx/releases/download/v1.12.0/httpx_1.12.0_linux_arm64.zip",
+      "sha256": "28dec1033bf23c29bd2b3b0c65589f01efc8d726f3eb056ef5ce6bc19566ef7c",
+      "path": "tools/httpx",
+      "env": "",
+      "category": "arsenal",
+      "optional": false,
+      "purpose": "HTTP 服务探活与指纹/标题识别"
+    },
+    {
+      "name": "katana",
+      "version": "v1.8.0",
+      "platform": "linux/arm64",
+      "url": "https://github.com/projectdiscovery/katana/releases/download/v1.8.0/katana_1.8.0_linux_arm64.zip",
+      "sha256": "d1cad5684a2561ede5d79844cbe5fc18ab783742c215df7c53a89baddd5800c7",
+      "path": "tools/katana",
+      "env": "",
+      "category": "arsenal",
+      "optional": false,
+      "purpose": "Web 爬虫与端点发现"
+    },
+    {
+      "name": "fscan",
+      "version": "v2.2.2",
+      "platform": "linux/arm64",
+      "url": "https://github.com/shadow1ng/fscan/releases/download/v2.2.2/fscan_2.2.2_linux_arm64",
+      "sha256": "cfa5a78adc0b310811af11c0b9bdaaeda0d8443d271ad2c0b28b8b52064eb9fe",
+      "path": "tools/fscan",
+      "env": "",
+      "category": "arsenal",
+      "optional": false,
+      "purpose": "内网综合扫描：端口与服务识别"
     }
   ]
 }

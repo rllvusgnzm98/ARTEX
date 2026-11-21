@@ -5,12 +5,12 @@ import (
 	"encoding/json"
 	"io"
 	"log"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	toolenv "github.com/Autumn-27/artex/tools"
 	"github.com/Autumn-27/artex/traffic"
 	"github.com/Autumn-27/norma/skill"
 	actool "github.com/Autumn-27/norma/tool"
@@ -211,7 +211,11 @@ func seedPrompts(pg *db.DB) {
 // tool-assembly time each built-in tool is filtered by its agent binding / enabled
 // flag and, if kept, wrapped so the model sees the DB-overridden description/schema
 // and缺省入参 get injected. MCP/skill/host tools have no row and pass through.
-func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
+func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool, dataDirs ...string) {
+	dataDir := ""
+	if len(dataDirs) > 0 {
+		dataDir = dataDirs[0]
+	}
 	agent.FindingTrafficBindingEnabled = func() bool { return pg.GetBool(settingAgentTrafficBinding, false) }
 	// Seed the built-in domain tools (first-insert only; DO NOTHING preserves edits).
 	// No startup prune: rows we didn't seed are left alone so future user-defined
@@ -298,7 +302,7 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 		// does not claim they are installed. Unregistered tools are unchanged.
 		var shellHints []string
 		for _, row := range rows {
-			if row.Kind == "shell" && row.Enabled && contains(row.Agents, agentKey) && shellHintOnPATH(row.Key) {
+			if row.Kind == "shell" && row.Enabled && contains(row.Agents, agentKey) && shellHintOnPATH(ctx, row.Key, dataDir) {
 				shellHints = append(shellHints, "- "+row.Key+": "+row.Description)
 			}
 		}
@@ -353,9 +357,8 @@ func seedShellHints(pg *db.DB) {
 // current PATH. Looked up at resolve time (not cached at process start) so a
 // change to PATH is visible on the next assembly. Aliases or alternate
 // filenames (e.g. secretsdump.py vs impacket-secretsdump) do not match.
-func shellHintOnPATH(name string) bool {
-	_, err := exec.LookPath(name)
-	return err == nil
+func shellHintOnPATH(ctx context.Context, name, dataDir string) bool {
+	return toolenv.CheckCommand(ctx, toolenv.CommandSpec{Name: name}, dataDir).Available
 }
 
 func contains(ss []string, v string) bool {

@@ -1,4 +1,4 @@
-# chains-pivot L3 决策骨架(场景→判据→转向;蒸馏自 chains 语料,完整 Q&A 见 skills/chains-pivot/refs/)
+# chains-pivot L3 决策骨架(场景→判据→转向;蒸馏自 chains 语料)
 - 场景:初始 RCE 后立足点怎么建(foothold ladder)|判据:优先写 webshell 建持久主通道——复用入站 HTTP、零出网依赖、混在业务流量里;反弹 shell 只作临时通道|转向:需 PTY 提权/大文件/隧道调试才临时拉反弹,用完即收、受管 TTL 不常驻
 - 场景:目标完全不出网(no-reverse)|判据:分层验证 DNS/HTTP/ICMP 出站,判"协议维度"还是"目的地维度"阻断;全断即确认无出网|转向:只能靠 webshell 会话执行;或转拉模式——周期 pull 可控 SaaS/白名单域名取指令
 - 场景:起隧道前摸出网能力|判据:curl/nc/dig/ping 分层测 TCP 443/80/53、UDP 53/123、ICMP、DNS 递归;探测须拟态低频|转向:全被 reset 即白名单出网,看 DNS 兜底与强制代理(环境变量/pac),走 CONNECT 出

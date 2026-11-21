@@ -235,10 +235,10 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		}
 		wireAgentAugment(m.pg, s.skillDir, s.hostTools) // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
 		domainReg := buildDomainReg(m.Assets())
-		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
-		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
-		s.seedOrchestrationTools() // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
-		s.seedHackbotsTools()      // Hackbots 脚本工具 seed 进 tools 表(仅首插入,不覆盖用户改动)
+		wireTools(m.pg, domainReg, m.dir) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
+		seedPrompts(m.pg)                 // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
+		s.seedOrchestrationTools()        // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
+		s.seedHackbotsTools()             // Hackbots 脚本工具 seed 进 tools 表(仅首插入,不覆盖用户改动)
 		if err := s.seedFindingRetester(); err != nil {
 			log.Printf("[retester] seed: %v", err)
 		}
@@ -691,6 +691,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/auth/rotate-key", s.authRotateKey)
 
 	mux.HandleFunc("GET /api/health", s.health)
+	mux.HandleFunc("GET /api/system/tools", s.toolAvailability)
 	mux.HandleFunc("GET /api/stats", s.stats)
 	mux.HandleFunc("GET /api/logs", s.getLogs)
 	mux.HandleFunc("GET /api/logs/history", s.getLogsHistory)
