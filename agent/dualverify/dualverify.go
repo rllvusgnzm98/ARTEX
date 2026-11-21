@@ -305,6 +305,26 @@ func Evaluate(p Plan, observations []Observation) (Result, error) {
 	default:
 		r.Reason = "B 状态与标记矛盾，未验证"
 	}
+	if r.Verdict != FalsePositive {
+		kept := r.Defects[:0]
+		for _, d := range r.Defects {
+			switch d.Kind {
+			case "cross-tenant":
+				// 跨租户缺陷依赖标记确属 A 的私有数据：需公开排除控制成立且 A 正向控制成立
+				if pub.Pass && a.Pass {
+					kept = append(kept, d)
+				}
+			case "token-trust":
+				// 令牌信任缺陷只在资源确实非公开（公开被正确拒绝）时才有意义
+				if pub.Pass {
+					kept = append(kept, d)
+				}
+			default:
+				kept = append(kept, d)
+			}
+		}
+		r.Defects = kept
+	}
 	return r, nil
 }
 

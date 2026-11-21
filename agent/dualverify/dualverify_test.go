@@ -367,6 +367,44 @@ func TestDualVerifyCrossTenantDefects(t *testing.T) {
 	}
 }
 
+func TestDualVerifyDefectControls(t *testing.T) {
+	s := testSpec()
+	s.TenantRole, s.SessionToken = true, true
+	p := testPlan(t, s)
+	for _, tc := range []struct {
+		name                    string
+		edit                    func([]Observation)
+		crossTenant, tokenTrust int
+	}{
+		{"sound controls", func([]Observation) {}, 1, 1},
+		{"owner denied", func(o []Observation) { change(o, "owner", func(o *Observation) { o.Status = 403 }) }, 0, 1},
+		{"owner marker absent", func(o []Observation) { change(o, "owner", func(o *Observation) { o.MarkerSeen = false }) }, 0, 1},
+		{"public marker", func(o []Observation) {
+			change(o, "public", func(o *Observation) { o.Status = 200; o.MarkerSeen = true })
+		}, 0, 0},
+		{"public unrecorded", func(o []Observation) { change(o, "public", func(o *Observation) { o.ProxyBypass = true }) }, 0, 0},
+		{"public missing", func(o []Observation) { change(o, "public", func(o *Observation) { o.NotExecuted = true }) }, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := baseline(p)
+			change(o, "tenant", func(o *Observation) { o.Status = 200; o.MarkerSeen = true })
+			change(o, "B_expired", func(o *Observation) { o.Status = 200 })
+			tc.edit(o)
+			r, err := Evaluate(p, o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			counts := map[string]int{}
+			for _, d := range r.Defects {
+				counts[d.Kind]++
+			}
+			if counts["cross-tenant"] != tc.crossTenant || counts["token-trust"] != tc.tokenTrust {
+				t.Fatalf("unexpected defects: %+v", r)
+			}
+		})
+	}
+}
+
 func TestEvaluationErrors(t *testing.T) {
 	p := testPlan(t, testSpec())
 	for _, o := range [][]Observation{{{StepID: "unknown"}}, {{StepID: "probe"}, {StepID: "probe"}}} {
