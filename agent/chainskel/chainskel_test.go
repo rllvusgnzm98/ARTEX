@@ -289,6 +289,8 @@ func TestAmbiguousLatinKeywordBoundaries(t *testing.T) {
 		{"grep the sourcecode", ""},          // rce ⊂ sourcecode must not route web
 		{"oauth 账号接管", "identity"},           // standalone latin token still matches
 		{"k8s 逃逸", "cloud"},
+		{"Linux提权", "priv"},            // 中文词紧贴 ASCII 仍需命中
+		{"反编译MessageProcessor", "rev"}, // 中文词在前,ASCII 紧随其后
 	} {
 		t.Run(tc.summary, func(t *testing.T) {
 			out := ForIntent(payload(t, map[string]any{"summary": tc.summary}))
