@@ -643,7 +643,11 @@ func TestProfileDeleteRestoresQuotaBlockedIntentWhenFallbackAvailable(t *testing
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer m.Close()
+	t.Cleanup(func() {
+		if err := m.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	profileID, err := m.pg.SaveProfile(&db.LLMProfile{
 		Name:   fmt.Sprintf("delete-quota-fallback-%d", time.Now().UnixNano()),
@@ -662,8 +666,12 @@ func TestProfileDeleteRestoresQuotaBlockedIntentWhenFallbackAvailable(t *testing
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = m.DeleteTask(task.ID, DeleteTaskOptions{})
-		_ = m.pg.DeleteProfile(profileID)
+		if _, err := m.DeleteTask(task.ID, DeleteTaskOptions{}); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+		if err := m.pg.DeleteProfile(profileID); err != nil && !errors.Is(err, db.ErrLLMProfileNotFound) {
+			t.Errorf("cleanup: %v", err)
+		}
 	})
 
 	intentID, err := task.Store.AddIntent(map[string]any{"action": "retry after fallback"}, 1, nil, "planner")

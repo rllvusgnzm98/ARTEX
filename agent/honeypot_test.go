@@ -89,7 +89,11 @@ func TestHoneypotBlockNilAndEmpty(t *testing.T) {
 
 func TestHoneypotBlockListsOnlyIntentAssets(t *testing.T) {
 	d := testDB(t)
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 	task, err := d.CreateTask("honeypot block fixture", "fixture", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -100,7 +104,9 @@ func TestHoneypotBlockListsOnlyIntentAssets(t *testing.T) {
 	const thisURL = "http://admin:" + secret + "@203.0.113.70:8080/this-intent"
 	const otherURL = "http://203.0.113.71:8080/other-intent"
 	t.Cleanup(func() {
-		_, _ = d.Exec(`DELETE FROM assets WHERE url IN ($1,$2)`, thisURL, otherURL)
+		if _, err := d.Exec(`DELETE FROM assets WHERE url IN ($1,$2)`, thisURL, otherURL); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
 	})
 
 	as := d.Assets()

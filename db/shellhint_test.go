@@ -20,7 +20,11 @@ func TestSeedShellHintNewAndExistingDB(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	// Isolate catalog-shaped keys plus a user row so this test does not depend
 	// on leftover data. Cleanup deletes only the keys we touch.
@@ -29,7 +33,9 @@ func TestSeedShellHintNewAndExistingDB(t *testing.T) {
 	cleanup := append([]string{userKey, "t-shellhint-nonshell", "t-shellhint-edited"}, catalog...)
 	t.Cleanup(func() {
 		for _, k := range cleanup {
-			_, _ = d.Exec(`DELETE FROM tools WHERE key=$1`, k)
+			if _, err := d.Exec(`DELETE FROM tools WHERE key=$1`, k); err != nil {
+				t.Errorf("cleanup: %v", err)
+			}
 		}
 	})
 	for _, k := range cleanup {
@@ -97,12 +103,18 @@ func TestSeedShellHintPreservesUserEditsAndForeignKind(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	editedKey := "t-shellhint-edited"
 	foreignKey := "t-shellhint-nonshell"
 	t.Cleanup(func() {
-		_, _ = d.Exec(`DELETE FROM tools WHERE key=$1 OR key=$2`, editedKey, foreignKey)
+		if _, err := d.Exec(`DELETE FROM tools WHERE key=$1 OR key=$2`, editedKey, foreignKey); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
 	})
 	_, _ = d.Exec(`DELETE FROM tools WHERE key=$1 OR key=$2`, editedKey, foreignKey)
 
@@ -151,12 +163,18 @@ func TestUpsertToolForceAndResetShellHint(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	key := "t-shellhint-reset"
 	foreign := "t-shellhint-reset-builtin"
 	t.Cleanup(func() {
-		_, _ = d.Exec(`DELETE FROM tools WHERE key=$1 OR key=$2`, key, foreign)
+		if _, err := d.Exec(`DELETE FROM tools WHERE key=$1 OR key=$2`, key, foreign); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
 	})
 	_, _ = d.Exec(`DELETE FROM tools WHERE key=$1 OR key=$2`, key, foreign)
 

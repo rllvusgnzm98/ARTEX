@@ -78,7 +78,11 @@ func TestSessionStoreCRUD(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 	store := NewSessionStore(d, []byte("test-jwt-key-material-32bytes!!!"))
 	ctx := context.Background()
 
@@ -93,7 +97,11 @@ func TestSessionStoreCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	t.Cleanup(func() { _ = store.Delete(context.Background(), id) })
+	t.Cleanup(func() {
+		if err := store.Delete(context.Background(), id); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 
 	// DB 里不得是明文。
 	var raw string

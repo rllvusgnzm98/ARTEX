@@ -31,7 +31,11 @@ func TestWireTools(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer pg.Close()
+	t.Cleanup(func() {
+		if err := pg.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	wireTools(pg, nil) // nil domainReg: test only covers filter/decoration, not injection
 	t.Cleanup(func() { agent.ToolResolve = nil })
@@ -86,7 +90,11 @@ func TestWireTools(t *testing.T) {
 
 	// Edit description + add a default to a scalar param, then confirm the resolved
 	// worker tool reflects both. Restore from code default on cleanup.
-	t.Cleanup(func() { _ = pg.UpsertToolForce(rf.Key, rf.Description, rf.Schema, mustJSON(rf.Agents)) })
+	t.Cleanup(func() {
+		if err := pg.UpsertToolForce(rf.Key, rf.Description, rf.Schema, mustJSON(rf.Agents)); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 	var schema map[string]any
 	_ = json.Unmarshal(rf.Schema, &schema)
 	if props, ok := schema["properties"].(map[string]any); ok {

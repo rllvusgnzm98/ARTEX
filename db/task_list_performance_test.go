@@ -11,7 +11,11 @@ func TestListTasksBulkHydratesTaskContext(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	stamp := time.Now().UnixNano()
 	profileID, err := d.SaveProfile(&LLMProfile{
@@ -20,17 +24,29 @@ func TestListTasksBulkHydratesTaskContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteProfile(profileID) })
+	t.Cleanup(func() {
+		if err := d.DeleteProfile(profileID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 	source, err := d.CreateTask(fmt.Sprintf("bulk-list-source-%d", stamp), "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(source.ID) })
+	t.Cleanup(func() {
+		if err := d.DeleteTask(source.ID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 	companyID, _, err := d.Companies().UpsertCompany(fmt.Sprintf("Bulk List Company %d", stamp), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.Companies().DeleteCompany(companyID) })
+	t.Cleanup(func() {
+		if err := d.Companies().DeleteCompany(companyID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 	child, err := d.CreateTaskWithOptions("bulk-list-child", "goal", TaskCreateOptions{
 		LLMProfileIDs: []int64{profileID},
 		SourceTaskIDs: []int64{source.ID},
@@ -39,7 +55,11 @@ func TestListTasksBulkHydratesTaskContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(child.ID) })
+	t.Cleanup(func() {
+		if err := d.DeleteTask(child.ID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 
 	tasks, err := d.ListTasks()
 	if err != nil {
@@ -72,13 +92,21 @@ func TestTaskListMetricsAll(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	task, err := d.CreateTask("task-list-metrics", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+	t.Cleanup(func() {
+		if err := d.DeleteTask(task.ID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 
 	resultAt := time.Now().Add(-time.Second).Truncate(time.Second)
 	latestAt := resultAt.Add(time.Second)

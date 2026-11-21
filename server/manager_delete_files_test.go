@@ -17,13 +17,19 @@ func TestSeedAssociatesTargetAssetWithTask(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer m.Close()
+	t.Cleanup(func() {
+		if err := m.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 	task, err := m.CreateTask("seed ownership", "seed ownership", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = m.DeleteTask(task.ID, DeleteTaskOptions{DeleteAssets: true})
+		if _, err := m.DeleteTask(task.ID, DeleteTaskOptions{DeleteAssets: true}); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
 	})
 
 	host := fmt.Sprintf("seed-%s.example.test", task.ID)

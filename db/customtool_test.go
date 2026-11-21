@@ -12,7 +12,11 @@ func TestCustomToolCRUD(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	key := "ct_test_tool"
 	_ = d.DeleteCustomTool(key) // clean slate
@@ -30,7 +34,11 @@ func TestCustomToolCRUD(t *testing.T) {
 	if err := d.CreateCustomTool(in); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	t.Cleanup(func() { _ = d.DeleteCustomTool(key) })
+	t.Cleanup(func() {
+		if err := d.DeleteCustomTool(key); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 
 	got, err := d.GetTool(key)
 	if err != nil || got == nil {

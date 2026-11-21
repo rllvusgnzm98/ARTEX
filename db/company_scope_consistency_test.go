@@ -10,7 +10,11 @@ import (
 
 func TestAssetUpsertWaitsForCompanyScopeMutation(t *testing.T) {
 	d, assets, companies := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	stamp := time.Now().UnixNano()
 	domain := fmt.Sprintf("scope-lock-%d.example", stamp)
@@ -23,8 +27,12 @@ func TestAssetUpsertWaitsForCompanyScopeMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = d.Exec(`DELETE FROM assets WHERE domain = $1`, domain)
-		_, _ = d.Exec(`DELETE FROM companies WHERE id IN ($1,$2)`, oldCompany, newCompany)
+		if _, err := d.Exec(`DELETE FROM assets WHERE domain = $1`, domain); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+		if _, err := d.Exec(`DELETE FROM companies WHERE id IN ($1,$2)`, oldCompany, newCompany); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
 	})
 	if added, _, invalid, validationErrors, err := companies.AddScopeInputsChecked(oldCompany, []ScopeInput{
 		{Kind: "domain", Value: domain},
@@ -90,7 +98,11 @@ func TestAssetUpsertWaitsForCompanyScopeMutation(t *testing.T) {
 
 func TestResolveAndRecomputeUseStableCompanyIDTieBreak(t *testing.T) {
 	d, assets, companies := testSetup(t)
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	stamp := time.Now().UnixNano()
 	first, _, err := companies.UpsertCompany(fmt.Sprintf("Tie Break First %d", stamp), "")
@@ -109,8 +121,12 @@ func TestResolveAndRecomputeUseStableCompanyIDTieBreak(t *testing.T) {
 	icp := fmt.Sprintf("ICP-TIE-%d", stamp)
 	appName := fmt.Sprintf("Tie Break App %d", stamp)
 	t.Cleanup(func() {
-		_, _ = d.Exec(`DELETE FROM assets WHERE domain=$1 OR ip=$2 OR app_name=$3`, domain, ip, appName)
-		_, _ = d.Exec(`DELETE FROM companies WHERE id IN ($1,$2)`, first, second)
+		if _, err := d.Exec(`DELETE FROM assets WHERE domain=$1 OR ip=$2 OR app_name=$3`, domain, ip, appName); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+		if _, err := d.Exec(`DELETE FROM companies WHERE id IN ($1,$2)`, first, second); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
 	})
 
 	rules := []ScopeInput{

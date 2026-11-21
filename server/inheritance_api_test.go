@@ -16,7 +16,11 @@ func TestInheritedActivityDetailAndRelationDeletion(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer m.Close()
+	t.Cleanup(func() {
+		if err := m.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	source, err := m.CreateTaskWithOptions("detail source", "source goal", db.TaskCreateOptions{})
 	if err != nil {
@@ -28,8 +32,12 @@ func TestInheritedActivityDetailAndRelationDeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = m.DeleteTask(current.ID, DeleteTaskOptions{})
-		_, _ = m.DeleteTask(source.ID, DeleteTaskOptions{})
+		if _, err := m.DeleteTask(current.ID, DeleteTaskOptions{}); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+		if _, err := m.DeleteTask(source.ID, DeleteTaskOptions{}); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
 	})
 
 	plannerStep, err := source.Store.AppendActivity(db.Activity{

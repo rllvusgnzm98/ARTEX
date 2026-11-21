@@ -27,14 +27,22 @@ func callReadJSON(t *testing.T, tool actool.CoreTool, input string) any {
 
 func TestGraphOverviewKeepsAssociatedCompanyScopeCompact(t *testing.T) {
 	d := testDB(t)
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	companies := d.Companies()
 	companyID, _, err := companies.UpsertCompany(fmt.Sprintf("overview-scope-%d", time.Now().UnixNano()), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = companies.DeleteCompany(companyID) })
+	t.Cleanup(func() {
+		if err := companies.DeleteCompany(companyID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 
 	domain := fmt.Sprintf("overview-scope-%d.invalid", companyID)
 	ip := fmt.Sprintf("2001:db8:%x::42", companyID%0xffff)
@@ -57,7 +65,11 @@ func TestGraphOverviewKeepsAssociatedCompanyScopeCompact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = assets.DeleteByIDs([]int64{assetID}) })
+	t.Cleanup(func() {
+		if _, err := assets.DeleteByIDs([]int64{assetID}); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 
 	task, err := d.CreateTaskWithOptions("company context", "read configured scope", db.TaskCreateOptions{
 		CompanyIDs: []int64{companyID},
@@ -65,7 +77,11 @@ func TestGraphOverviewKeepsAssociatedCompanyScopeCompact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+	t.Cleanup(func() {
+		if err := d.DeleteTask(task.ID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 
 	tools := NewToolSet(d.Exploration(task.ExplorationID), "planner")
 	tools.SetTaskID(task.ID)
@@ -160,7 +176,11 @@ func TestGraphOverviewKeepsAssociatedCompanyScopeCompact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(disabledTask.ID) })
+	t.Cleanup(func() {
+		if err := d.DeleteTask(disabledTask.ID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 	disabledTools := NewToolSet(d.Exploration(disabledTask.ExplorationID), "planner")
 	disabledTools.SetTaskID(disabledTask.ID)
 	disabledTools.SetCoverageEnabled(false)
@@ -211,7 +231,11 @@ func companiesName(t *testing.T, companies *db.CompanyStore, companyID int64) st
 
 func TestBlackboardToolsReadDirectSources(t *testing.T) {
 	d := testDB(t)
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	grand, err := d.CreateTask("grand", "grand goal", nil, 0, 0)
 	if err != nil {
@@ -226,9 +250,15 @@ func TestBlackboardToolsReadDirectSources(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = d.DeleteTask(current.ID)
-		_ = d.DeleteTask(source.ID)
-		_ = d.DeleteTask(grand.ID)
+		if err := d.DeleteTask(current.ID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+		if err := d.DeleteTask(source.ID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+		if err := d.DeleteTask(grand.ID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
 	})
 
 	grandStore := d.Exploration(grand.ExplorationID)
@@ -276,7 +306,11 @@ func TestBlackboardToolsReadDirectSources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = assets.DeleteByIDs([]int64{assetID}) })
+	t.Cleanup(func() {
+		if _, err := assets.DeleteByIDs([]int64{assetID}); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 	if _, err := sourceStore.AddNode(db.KindFact, map[string]any{"summary": "source host anchor"}, 0, "confirmed", "worker", []int64{assetID}); err != nil {
 		t.Fatal(err)
 	}
@@ -395,13 +429,21 @@ func TestBlackboardToolsReadDirectSources(t *testing.T) {
 // model which ids it deferred, after de-duplicating and dropping invalid ids.
 func TestGetWorkerTraceStepIDsDegradeGracefully(t *testing.T) {
 	d := testDB(t)
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	task, err := d.CreateTask("trace-cap", "goal", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+	t.Cleanup(func() {
+		if err := d.DeleteTask(task.ID); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 	store := d.Exploration(task.ExplorationID)
 	intent, err := store.AddIntent(map[string]any{"summary": "cap work"}, 1, nil, "planner")
 	if err != nil {

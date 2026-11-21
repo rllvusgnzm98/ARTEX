@@ -14,7 +14,11 @@ func TestProfileRetryRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	want := RetryOverride{
 		Connect: RetryRule{Attempts: 5, IntervalMS: 2000},
@@ -27,7 +31,11 @@ func TestProfileRetryRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { d.Exec(`DELETE FROM llm_profiles WHERE id=$1`, id) })
+	t.Cleanup(func() {
+		if _, err := d.Exec(`DELETE FROM llm_profiles WHERE id=$1`, id); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 
 	got, err := d.ProfileByID(id)
 	if err != nil || got == nil {
@@ -71,7 +79,11 @@ func TestProfileRetryClampedOnSave(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	id, err := d.SaveProfile(&LLMProfile{
 		Name: "t-retry-clamp", Format: "openai", Model: "m", APIKey: "k",
@@ -80,7 +92,11 @@ func TestProfileRetryClampedOnSave(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { d.Exec(`DELETE FROM llm_profiles WHERE id=$1`, id) })
+	t.Cleanup(func() {
+		if _, err := d.Exec(`DELETE FROM llm_profiles WHERE id=$1`, id); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
 	got, err := d.ProfileByID(id)
 	if err != nil || got == nil {
 		t.Fatalf("ProfileByID: %v", err)
@@ -97,7 +113,11 @@ func TestLLMRetryPolicyRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
+	t.Cleanup(func() {
+		if err := d.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	before, hadBefore, err := d.GetSetting(settingLLMRetryPolicy)
 	if err != nil {
@@ -105,9 +125,13 @@ func TestLLMRetryPolicyRoundTrip(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		if hadBefore {
-			d.SetSetting(settingLLMRetryPolicy, before)
+			if err := d.SetSetting(settingLLMRetryPolicy, before); err != nil {
+				t.Errorf("cleanup: %v", err)
+			}
 		} else {
-			d.Exec(`DELETE FROM settings WHERE key=$1`, settingLLMRetryPolicy)
+			if _, err := d.Exec(`DELETE FROM settings WHERE key=$1`, settingLLMRetryPolicy); err != nil {
+				t.Errorf("cleanup: %v", err)
+			}
 		}
 	})
 
