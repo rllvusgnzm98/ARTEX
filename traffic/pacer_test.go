@@ -8,7 +8,7 @@ import (
 func TestPacerReserve(t *testing.T) {
 	base := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
 	interval := 100 * time.Millisecond
-	p := newPacer(interval, 3)
+	p := newPacerInterval(interval, 3)
 	p.now = func() time.Time { return base }
 	for i := 0; i < 3; i++ {
 		if got := p.reserve("a"); !got.Equal(base) {
@@ -31,17 +31,47 @@ func TestPacerReserve(t *testing.T) {
 	}
 }
 
-func TestNewPacer(t *testing.T) {
+func TestNewPacerInterval(t *testing.T) {
 	for _, interval := range []time.Duration{0, -time.Second} {
-		if p := newPacer(interval, 3); p != nil {
+		if p := newPacerInterval(interval, 3); p != nil {
 			t.Fatalf("interval %v: got non-nil pacer", interval)
 		}
 	}
 	for _, burst := range []int{0, -1, 1} {
-		p := newPacer(100*time.Millisecond, burst)
+		p := newPacerInterval(100*time.Millisecond, burst)
 		if p.burst != 0 {
 			t.Fatalf("burst %d: tolerance = %v, want 0", burst, p.burst)
 		}
+	}
+}
+
+func TestNewPacer(t *testing.T) {
+	p := NewPacer(10, 0)
+	if p == nil || p.interval != 100*time.Millisecond {
+		t.Fatalf("NewPacer(10, 0) = %v, want interval 100ms", p)
+	}
+	for _, rps := range []float64{0, -1} {
+		if p := NewPacer(rps, 0); p != nil {
+			t.Fatalf("NewPacer(%v, 0) = %v, want nil", rps, p)
+		}
+	}
+}
+
+func TestSharedPacer(t *testing.T) {
+	base := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	p := NewPacer(10, 1)
+	p.now = func() time.Time { return base }
+	var global, taskA, taskB Traffic
+	for i, tr := range []*Traffic{&global, &taskA, &taskB} {
+		tr.SetHostPacer(p)
+		want := base.Add(time.Duration(i) * 100 * time.Millisecond)
+		if got := tr.pace.Load().reserve("example.com"); !got.Equal(want) {
+			t.Fatalf("proxy %d reservation = %v, want %v", i, got, want)
+		}
+	}
+	taskA.SetHostPacer(nil)
+	if taskA.pace.Load() != nil || global.pace.Load() != p || taskB.pace.Load() != p {
+		t.Fatal("clearing one proxy changed another proxy's pacer")
 	}
 }
 

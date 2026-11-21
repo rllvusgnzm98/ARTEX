@@ -117,7 +117,7 @@ type taskProxyManager struct {
 	dir         string
 	store       tunnelLister
 	globalProxy func() string
-	hostPace    func() float64
+	hostPacer   func() *traffic.Pacer
 	portMin     int
 	portMax     int
 	mu          sync.Mutex
@@ -125,9 +125,9 @@ type taskProxyManager struct {
 	roe         *roeGateCache
 }
 
-func newTaskProxyManager(dir string, store tunnelLister, globalProxy func() string, hostPace func() float64, portMin, portMax int) *taskProxyManager {
+func newTaskProxyManager(dir string, store tunnelLister, globalProxy func() string, hostPacer func() *traffic.Pacer, portMin, portMax int) *taskProxyManager {
 	return &taskProxyManager{
-		dir: filepath.Join(dir, "traffic-tasks"), store: store, globalProxy: globalProxy, hostPace: hostPace,
+		dir: filepath.Join(dir, "traffic-tasks"), store: store, globalProxy: globalProxy, hostPacer: hostPacer,
 		portMin: portMin, portMax: portMax, proxies: map[int64]*taskProxyInst{},
 	}
 }
@@ -231,8 +231,8 @@ func (m *taskProxyManager) buildLocked(ctx context.Context, taskID int64) (*task
 	if gate := m.hostGate(taskID); gate != nil {
 		tr.SetHostGate(gate)
 	}
-	if m.hostPace != nil {
-		tr.SetHostPace(m.hostPace(), 0)
+	if m.hostPacer != nil {
+		tr.SetHostPacer(m.hostPacer())
 	}
 	go func() {
 		if err := tr.Start(); err != nil {
@@ -278,16 +278,16 @@ func (m *taskProxyManager) RefreshAll(ctx context.Context) {
 	}
 }
 
-// ApplyHostPace 把当前每主机礼貌限速推给所有在用任务实例(全局设置变更时调用)。
-func (m *taskProxyManager) ApplyHostPace() {
-	if m == nil || m.hostPace == nil {
+// ApplyHostPacer 把当前共享限速器指针推给所有在用任务实例(全局设置变更时调用)。
+func (m *taskProxyManager) ApplyHostPacer() {
+	if m == nil || m.hostPacer == nil {
 		return
 	}
-	rps := m.hostPace()
+	p := m.hostPacer()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, inst := range m.proxies {
-		inst.tr.SetHostPace(rps, 0)
+		inst.tr.SetHostPacer(p)
 	}
 }
 

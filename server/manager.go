@@ -252,6 +252,7 @@ type Manager struct {
 	// injected into agent bash env / WebFetch directly. See ProxyAddr.
 	globalProxy string
 	hostPace    float64 // 每主机礼貌限速 req/s;0=关闭
+	pacer       *traffic.Pacer
 
 	// taskProxy 按任务 MITM 实例管理器（见 taskproxy.go）；nil = 关闭。
 	// 不得用进程级 SetUpstream 让任务互相踩踏上游。
@@ -464,8 +465,9 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 			m.hostPace = f
 		}
 	}
+	m.pacer = traffic.NewPacer(m.hostPace, 0)
 	if m.traffic != nil {
-		m.traffic.SetHostPace(m.hostPace, 0)
+		m.traffic.SetHostPacer(m.pacer)
 	}
 	m.enrich = enrich.New(m.assets, m.ProxyAddr, 4)
 	// 按任务懒建 MITM。ARTEX_TASK_PROXY=off 关闭；端口池 ARTEX_TASK_PROXY_PORT_RANGE。
@@ -473,7 +475,7 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		if pmin, pmax, err := tunnel.ParsePortRange(config.TaskProxyPortRange()); err != nil {
 			log.Printf("[taskproxy] 端口池非法,按任务 MITM 关闭: %v", err)
 		} else {
-			m.taskProxy = newTaskProxyManager(dir, pgdb.NewTunnelStore(pg), m.GlobalProxy, m.HostPace, pmin, pmax)
+			m.taskProxy = newTaskProxyManager(dir, pgdb.NewTunnelStore(pg), m.GlobalProxy, m.HostPacer, pmin, pmax)
 			m.taskProxy.useRoE(m.proxyRoEDeps())
 			agent.TaskScopeChanged = m.InvalidateProxyRoE
 		}
@@ -818,6 +820,13 @@ func (m *Manager) HostPace() float64 {
 	return m.hostPace
 }
 
+// HostPacer 返回当前共享的每主机限速器(nil=关闭),供任务代理安装同一指针。
+func (m *Manager) HostPacer() *traffic.Pacer {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.pacer
+}
+
 // SetHostPace 持久化并即时应用每主机礼貌限速(req/s;<=0=关闭),覆盖全局出口与所有在用任务代理。
 func (m *Manager) SetHostPace(rps float64) error {
 	if rps < 0 {
@@ -826,14 +835,16 @@ func (m *Manager) SetHostPace(rps float64) error {
 	if err := m.pg.SetSetting(settingHostPace, strconv.FormatFloat(rps, 'f', -1, 64)); err != nil {
 		return err
 	}
+	p := traffic.NewPacer(rps, 0)
 	m.mu.Lock()
 	m.hostPace = rps
+	m.pacer = p
 	m.mu.Unlock()
 	if m.traffic != nil {
-		m.traffic.SetHostPace(rps, 0)
+		m.traffic.SetHostPacer(p)
 	}
 	if m.taskProxy != nil {
-		m.taskProxy.ApplyHostPace()
+		m.taskProxy.ApplyHostPacer()
 	}
 	return nil
 }

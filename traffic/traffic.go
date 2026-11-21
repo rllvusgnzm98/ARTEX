@@ -16,7 +16,6 @@ import (
 	"io"
 	"io/fs"
 	"log"
-	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -176,7 +175,7 @@ type Traffic struct {
 	hostGate atomic.Pointer[hostGateFn]
 	// pace, when non-nil, delays requests per target host for politeness.
 	// Hot-swappable; nil means no pacing. Loopback is never paced.
-	pace atomic.Pointer[pacer]
+	pace atomic.Pointer[Pacer]
 }
 
 // hostGateFn is the RoE host check installed by SetHostGate.
@@ -347,24 +346,9 @@ func (t *Traffic) SetHostGate(fn func(host string) error) {
 	t.hostGate.Store(&f)
 }
 
-// SetHostPace installs a polite per-host request pacer on the egress path:
-// sustained traffic to any one target host is held to rps requests/second, with
-// short bursts up to `burst` let through immediately. rps<=0 removes pacing.
-// burst<1 defaults to ceil(rps). Hot-swappable; takes effect on the next request.
-func (t *Traffic) SetHostPace(rps float64, burst int) {
-	if rps <= 0 {
-		t.pace.Store(nil)
-		return
-	}
-	interval := time.Duration(float64(time.Second) / rps)
-	if burst < 1 {
-		burst = int(math.Ceil(rps))
-		if burst < 1 {
-			burst = 1
-		}
-	}
-	t.pace.Store(newPacer(interval, burst))
-}
+// SetHostPacer installs (nil clears) the shared polite per-host pacer on this
+// proxy's egress path. Hot-swappable; takes effect on the next request.
+func (t *Traffic) SetHostPacer(p *Pacer) { t.pace.Store(p) }
 
 // paceHost blocks for as long as the pacer requires before a request to host may
 // proceed. No-op when pacing is off or host is loopback.
