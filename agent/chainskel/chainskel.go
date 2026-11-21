@@ -1,7 +1,7 @@
 // Package chainskel 承载反问思维链(chains)的 L2/L3 蒸馏产物与路由逻辑
 // (CHAINS-INTEGRATION-DESIGN.md §3):
 //
-//   - L3 场景骨架:9 个分类(web/ad/app/priv/pwn/recon/rev/pivot/meta)的
+//   - L3 场景骨架:按 Categories 分类的
 //     "场景→判据→转向"决策骨架,离线人工蒸馏为 <category>.md,go:embed 进二进制,
 //     按意图 chain_tags(或回退关键词匹配)注入 worker system —— 代码路由,不靠模型。
 //   - L2 meta 铁律:planner/worker 两份常量文本(meta_rules.go),追加在各自
@@ -21,10 +21,10 @@ import (
 //go:embed *.md
 var skeletonFS embed.FS
 
-// Categories 是合法的 chain_tags 取值(9 类,与语料前缀一致)。
-var Categories = []string{"web", "ad", "app", "priv", "pwn", "recon", "rev", "pivot", "meta"}
+// Categories 是合法的 chain_tags 取值。
+var Categories = []string{"web", "ad", "app", "priv", "pwn", "recon", "rev", "pivot", "meta", "patch", "firmware", "audit"}
 
-// MaxTagsPerIntent 是每条意图最多注入的骨架类别数(L3 路由上限)。
+// MaxTagsPerIntent 是公开标签校验上限;ForIntent 只注入首个主类别。
 const MaxTagsPerIntent = 2
 
 // sectionCapRunes 是注入 worker system 的骨架块总字符(rune)上限,超出截断并标注。
@@ -64,7 +64,7 @@ func NormalizeChainTags(tags []string) []string {
 }
 
 // ValidateChainTags 校验标签:取值必须 ∈ Categories,且至多 MaxTagsPerIntent 个
-// (注入侧只取前 2 个,多给是 planner 的误用,直接报错让它修正)。
+// (兼容已有双标签 payload;主骨架只取首个合法标签)。
 func ValidateChainTags(tags []string) error {
 	for _, t := range tags {
 		if !Valid(t) {
@@ -100,6 +100,9 @@ var keywordRules = []struct {
 	cat      string
 	keywords []string
 }{
+	{"patch", []string{"patch diff", "补丁差分", "补丁分析", "补丁对比", "n-day", "ghidriff", "diaphora"}},
+	{"firmware", []string{"firmware", "固件", "binwalk", "squashfs", "ubifs", "嵌入式安全", "iot security", "iot pentest"}},
+	{"audit", []string{"code audit", "code-audit", "source code security", "security code review", "源码审计", "代码审计", "白盒审计", "semgrep", "codeql", "gosec", "sast"}},
 	{"web", []string{"sql", "注入", "xss", "ssrf", "ssti", "xxe", "反序列化", "文件上传", "上传点", "命令注入", "命令执行", "代码执行", "rce", "waf", "逻辑漏洞", "越权", "jwt", "文件包含", "目录遍历", "cms"}},
 	{"ad", []string{"kerberos", "域控", "ad域", "活动目录", "ntlm", "dcsync", "kerberoast", "委派", "adcs", "黄金票据", "白银票据", "as-rep", "域渗透", "域内", "密码喷洒"}},
 	{"app", []string{"apk", "frida", "小程序", "安卓", "android", "ios", "抓包", "app"}},
@@ -190,8 +193,7 @@ func Section(cats []string) string {
 }
 
 // intentCats 是 ForIntent/RefsGuideForIntent 共用的类别解析:优先取 chain_tags
-// (规整后取合法的前 MaxTagsPerIntent 个,非法值忽略);无合法 tags 时回退到
-// summary 关键词匹配;匹配不中返回 nil。
+// (规整后取首个合法值,非法值忽略);无合法 tags 时取首个确定性关键词匹配。
 func intentCats(payload json.RawMessage) []string {
 	var p struct {
 		Summary   string   `json:"summary"`
@@ -205,18 +207,21 @@ func intentCats(payload json.RawMessage) []string {
 		if Valid(t) {
 			cats = append(cats, t)
 		}
-		if len(cats) >= MaxTagsPerIntent {
+		if len(cats) > 0 {
 			break
 		}
 	}
 	if len(cats) == 0 {
 		cats = Match(p.Summary)
 	}
+	if len(cats) > 1 {
+		cats = cats[:1]
+	}
 	return cats
 }
 
 // ForIntent 从意图节点 payload 构建 L3 注入块:优先取 chain_tags(规整后取合法
-// 的前 2 个,非法值忽略);无 tags 时回退到 summary 关键词匹配;匹配不中或骨架
+// 的首个合法值);无 tags 时取首个 summary 关键词匹配;匹配不中或骨架
 // 缺失返回 ""(不注入,不阻断 worker)。
 func ForIntent(payload json.RawMessage) string {
 	cats := intentCats(payload)
