@@ -361,6 +361,17 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 // that also needs the entry seed reads the graph once.
 func (t *ToolSet) graphOverviewDataFrom(g *graphSnapshot) map[string]any {
 	out := map[string]any{}
+	for kind, key := range map[string]string{
+		db.KindGoal: "goals_total", db.KindHint: "hints_total",
+		db.KindFinding: "findings_total", db.KindFact: "facts_total",
+	} {
+		if count, err := g.countByKind(kind); err == nil {
+			out[key] = count
+			if kind == db.KindFact {
+				out["facts"] = count
+			}
+		}
+	}
 	// goals summary folded in so the planner needn't call list_goals each round.
 	goals, _ := g.listByKind(db.KindGoal, 100)
 	gsum := make([]map[string]any, 0, len(goals))
@@ -420,11 +431,10 @@ func (t *ToolSet) graphOverviewDataFrom(g *graphSnapshot) map[string]any {
 	fr, _ := g.frontier(openIntentsCap) // priority DESC, id ASC —— 优先级最高的前 N 条；真实总数见 frontier_open
 	out["open_intents"] = compactIntents(fr, parentsOf, yieldsOf)
 	all, _ := g.listByKind(db.KindIntent, 300)
-	var running, recentDone []*db.Node
+	running, runningErr := g.runningIntents()
+	var recentDone []*db.Node
 	for _, n := range all {
 		switch n.State {
-		case "running":
-			running = append(running, n)
 		case "done", "blocked", "exhausted":
 			if hidden(n.ID) {
 				continue // in a cold_digest and still cold — shown via cold_digests (§6.2)
@@ -433,6 +443,9 @@ func (t *ToolSet) graphOverviewDataFrom(g *graphSnapshot) map[string]any {
 		}
 	}
 	out["running_intents"] = compactIntents(running, parentsOf, yieldsOf)
+	if runningErr == nil {
+		out["running_intents_total"] = len(running)
+	}
 	// done_intents_total：已结束意图（done/blocked/exhausted）总数，与 recent_done_intents
 	// 平行命名——后者只是它的最新窗口截断视图。两键并排即自描述："看到的是 N/总数"，
 	// 让 planner 去重时别把"没显示"当成"没派过"，无需在提示词里另行解释。
@@ -451,8 +464,6 @@ func (t *ToolSet) graphOverviewDataFrom(g *graphSnapshot) map[string]any {
 	// via node_detail(id).
 	vulnNodes, _ := g.listByKind(db.KindFinding, 1000)
 	factNodes, _ := g.listByKind(db.KindFact, 1000) // newest first
-	out["findings_total"] = len(vulnNodes)          // 确认漏洞总数（目标判定看它）；明细见 finding_list（最新一窗）
-	out["facts"] = len(factNodes)                   // 探索事实/结论数（含否定结论）
 	// findings 是任务里最高价值的产物 → 概览带最新一窗（≤10 条，vulnNodes 已按 id 降序即最新在前），
 	// 让 planner 每轮判目标时一眼看到最近确认的漏洞；全量/更早的用 list_findings 取。
 	// 每条只留 {id, summary, from_intent?}：from_intent 是产生本漏洞的意图。
@@ -1788,23 +1799,9 @@ func (t *ToolSet) getWorkerOutput() actool.CoreTool {
 			if intentNode == nil || intentNode.Kind != db.KindIntent {
 				return actool.Errorf("intent_id 不属于本任务或其直接关联任务"), nil
 			}
-			acts, _, err := t.ts.ActivityListWithSources(id, 0, 1000)
+			pick, err := t.ts.LatestWorkerOutputWithSources(id)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
-			}
-			var chosen, fallback *db.Activity
-			for i := range acts {
-				switch acts[i].Kind {
-				case "result":
-					chosen = &acts[i]
-					fallback = &acts[i]
-				case "text":
-					fallback = &acts[i]
-				}
-			}
-			pick := chosen
-			if pick == nil {
-				pick = fallback
 			}
 			if pick == nil {
 				if intentNode.Inherited {
@@ -1814,7 +1811,7 @@ func (t *ToolSet) getWorkerOutput() actool.CoreTool {
 				}
 				return actool.Text("（该 work 尚无任何输出）"), nil
 			}
-			detail, _ := t.ts.ActivityDetailWithSources(pick.ID)
+			detail := pick.Detail
 			if detail == "" {
 				detail = pick.Summary
 			}

@@ -58,6 +58,32 @@ func (s *graphSnapshot) listByKind(kind string, limit int) ([]*db.Node, error) {
 	return out, nil
 }
 
+func (s *graphSnapshot) countByKind(kind string) (int, error) {
+	if s.load() != nil {
+		return s.ts.CountByKind(kind)
+	}
+	n := 0
+	for _, node := range s.nodes {
+		if node.Kind == kind {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (s *graphSnapshot) runningIntents() ([]*db.Node, error) {
+	if s.load() != nil {
+		return s.ts.RunningIntents()
+	}
+	var out []*db.Node
+	for i := len(s.nodes) - 1; i >= 0; i-- {
+		if n := s.nodes[i]; n.Kind == db.KindIntent && n.State == "running" {
+			out = append(out, n)
+		}
+	}
+	return out, nil
+}
+
 // edges matches ExplorationStore.Edges: at most limit edges, same default cap.
 func (s *graphSnapshot) edgeList(limit int) ([]db.Edge, error) {
 	if s.load() != nil {

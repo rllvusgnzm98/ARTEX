@@ -235,9 +235,34 @@ func (s *ExplorationStore) ActivityTraceWithSources(nodeID int64, limit int) ([]
 	return []Activity{}, nil
 }
 
-// ActivityListWithSources is the source-aware equivalent used by
-// get_worker_output. Node ids are global, so the first owning exploration is
-// unambiguous even when the work has not emitted any activity yet.
+// LatestWorkerOutputWithSources restricts inherited output to terminal intents.
+func (s *ExplorationStore) LatestWorkerOutputWithSources(nodeID int64) (*Activity, error) {
+	node, err := s.GetNode(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	if node != nil {
+		return s.LatestWorkerOutput(nodeID)
+	}
+	sources, err := s.DirectSourceStores()
+	if err != nil {
+		return nil, err
+	}
+	for _, source := range sources {
+		a, err := source.Store.latestWorkerOutput(nodeID, true)
+		if err != nil {
+			return nil, err
+		}
+		if a != nil {
+			a.Inherited = true
+			a.SourceTaskID = source.Task.TaskID
+			return a, nil
+		}
+	}
+	return nil, nil
+}
+
+// ActivityListWithSources is the source-aware incremental activity view.
 func (s *ExplorationStore) ActivityListWithSources(nodeID, sinceID int64, limit int) ([]Activity, int64, error) {
 	node, err := s.GetNode(nodeID)
 	if err != nil {
