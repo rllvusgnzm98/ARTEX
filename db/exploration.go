@@ -796,6 +796,20 @@ func (s *ExplorationStore) countByKindFiltered(kind, q string) (int, error) {
 	return n, err
 }
 
+func (s *ExplorationStore) CountByKind(kind string) (int, error) {
+	return s.countByKindFiltered(kind, "")
+}
+
+func (s *ExplorationStore) RunningIntents() ([]*Node, error) {
+	rows, err := s.db.Query(`SELECT `+nodeCols+` FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='intent' AND state='running' ORDER BY id DESC`, s.expID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanNodes(rows)
+}
+
 // CountFinishedIntents counts this exploration's intents in a terminal explored
 // state (done/blocked/exhausted) — graph_overview's done_intents_total, so the planner
 // knows recent_done_intents (capped at a recent window) is a truncated view and
@@ -1472,6 +1486,29 @@ func (s *ExplorationStore) TokenStatsBySession() ([]SessionTokenUsage, error) {
 		out = append(out, u)
 	}
 	return out, rows.Err()
+}
+
+// LatestWorkerOutput returns the newest result, or newest text if no result exists.
+func (s *ExplorationStore) LatestWorkerOutput(nodeID int64) (*Activity, error) {
+	return s.latestWorkerOutput(nodeID, false)
+}
+
+func (s *ExplorationStore) latestWorkerOutput(nodeID int64, terminalOnly bool) (*Activity, error) {
+	var a Activity
+	err := s.db.QueryRow(`SELECT a.id, a.node_id, a.kind, COALESCE(a.summary,''), COALESCE(a.detail,''), a.is_error
+FROM activity a JOIN exploration_nodes n ON n.id=a.node_id AND n.exploration_id=a.exploration_id
+WHERE a.exploration_id=$1 AND a.node_id=$2 AND n.kind='intent'
+  AND a.kind IN ('result','text')
+  AND (NOT $3 OR n.state IN ('done','blocked','exhausted','stopped'))
+ORDER BY (a.kind='result') DESC, a.id DESC LIMIT 1`, s.expID, nodeID, terminalOnly).
+		Scan(&a.ID, &a.NodeID, &a.Kind, &a.Summary, &a.Detail, &a.IsError)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
 }
 
 // ActivityList returns steps after sinceID (exclusive), optionally filtered by node.
