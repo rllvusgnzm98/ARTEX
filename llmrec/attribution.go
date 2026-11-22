@@ -4,16 +4,57 @@ import (
 	"context"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
 type attributionKey struct{}
 
 type attribution struct {
-	intentID  int64
-	instance  string
-	planRound int64
-	calls     atomic.Int64
+	intentID         int64
+	instance         string
+	planRound        int64
+	calls            atomic.Int64
+	intentMu         sync.Mutex
+	added, cancelled int64
+	observeIntents   func(int64, int64)
+}
+
+func RecordIntentCreated(ctx context.Context)   { recordIntent(ctx, false) }
+func RecordIntentCancelled(ctx context.Context) { recordIntent(ctx, true) }
+
+func recordIntent(ctx context.Context, cancelled bool) {
+	if ctx == nil {
+		return
+	}
+	a, _ := ctx.Value(attributionKey{}).(*attribution)
+	if a == nil || a.instance != "planner" || a.planRound <= 0 {
+		return
+	}
+	a.intentMu.Lock()
+	defer a.intentMu.Unlock()
+	if cancelled {
+		a.cancelled++
+	} else {
+		a.added++
+	}
+	if a.observeIntents != nil {
+		a.observeIntents(a.added, a.cancelled)
+	}
+}
+
+// ObserveIntentCounts delivers the current counts and subsequent successful writes serially.
+// A killed worker can finish its state write after the planner has returned.
+func ObserveIntentCounts(ctx context.Context, observe func(int64, int64)) {
+	a, _ := ctx.Value(attributionKey{}).(*attribution)
+	if a == nil {
+		observe(0, 0)
+		return
+	}
+	a.intentMu.Lock()
+	defer a.intentMu.Unlock()
+	a.observeIntents = observe
+	observe(a.added, a.cancelled)
 }
 
 // WithAttribution starts a call counter shared by all descendants of this run.

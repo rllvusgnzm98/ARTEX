@@ -11,6 +11,29 @@ import (
 	"github.com/Autumn-27/norma/transcript"
 )
 
+func TestPlannerIntentCounters(t *testing.T) {
+	ctx := WithAttribution(t.Context(), 0, "planner", 1)
+	var observed [][2]int64
+	ObserveIntentCounts(ctx, func(a, c int64) { observed = append(observed, [2]int64{a, c}) })
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Go(func() { RecordIntentCreated(ctx); RecordIntentCancelled(ctx) })
+	}
+	wg.Wait()
+	if got := observed[len(observed)-1]; got != [2]int64{20, 20} {
+		t.Fatalf("counts=%v", got)
+	}
+	for _, empty := range []context.Context{t.Context(), WithAttribution(t.Context(), 1, "work#1", 0)} {
+		RecordIntentCreated(empty)
+		RecordIntentCancelled(empty)
+		ObserveIntentCounts(empty, func(a, c int64) {
+			if a != 0 || c != 0 {
+				t.Fatalf("non-planner counts=%d/%d", a, c)
+			}
+		})
+	}
+}
+
 func TestIntentFromSession(t *testing.T) {
 	for _, tc := range []struct {
 		session string

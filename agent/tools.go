@@ -9,6 +9,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent/chainskel"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/llmrec"
 	acperm "github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -74,7 +75,7 @@ type ToolSet struct {
 	writes    WriteCounts
 	// killWork, if set, terminates a running work by intent id (engine callback,
 	// wired by the planner). nil = the kill_work tool reports unavailable.
-	killWork func(intentID int64) error
+	killWork func(context.Context, int64) error
 	// steerWork, if set, queues a mid-run course-correction for the work running an
 	// intent id (engine callback, wired by the planner): the worker injects it before
 	// its next tool call and re-plans, without being killed. nil = tool unavailable.
@@ -1146,7 +1147,7 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 			"priority":   intp("优先级 0-10，默认5"),
 			"chain_tags": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "【强烈建议传】本方向的主要攻击面标签，决定 worker 进场注入哪套反问决策链骨架（" + strings.Join(chainskel.Categories, "/") + "）。**至多 2 个**，仅首个合法标签注入主骨架，主要攻击面放首位；取值非法或超过 2 个会直接报错。只描述攻击面，不是优先级。"},
 		}),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				Intents    []intentItem `json:"intents"`
 				intentItem              // 单条模式：顶层 summary/asset_ids/parent_ids/priority
@@ -1168,6 +1169,7 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 					continue
 				}
 				ids[i] = id
+				llmrec.RecordIntentCreated(ctx)
 				createdAny = true
 			}
 
@@ -1747,7 +1749,7 @@ func (t *ToolSet) addHint() actool.CoreTool {
 func (t *ToolSet) killWorkTool() actool.CoreTool {
 	return t.writeExpTool("kill_work", "终止一条正在运行的意图(work)。用于叫停跑偏/无意义的探索；被终止的意图标记为 stopped，不再自动重领。先用 get_worker_output 看看它在干嘛再决定。",
 		obj(map[string]any{"intent_id": idp("要终止的意图 id（= work 句柄）")}, "intent_id"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.killWork == nil {
 				return actool.Errorf("kill_work 当前不可用"), nil
 			}
@@ -1763,7 +1765,7 @@ func (t *ToolSet) killWorkTool() actool.CoreTool {
 			if err != nil || node == nil || node.Kind != db.KindIntent {
 				return actool.Errorf("intent_id 必须是本任务的意图（关联任务意图只读）"), nil
 			}
-			if err := t.killWork(id); err != nil {
+			if err := t.killWork(ctx, id); err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
 			return actool.Text(fmt.Sprintf("已向意图 %d 的 work 发送终止信号", id)), nil

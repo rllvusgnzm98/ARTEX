@@ -164,9 +164,10 @@ type taskRuntime struct {
 }
 
 type workExecution struct {
-	cancel context.CancelCauseFunc
-	done   chan error
-	action string // user action: pause | cancel
+	cancel     context.CancelCauseFunc
+	done       chan error
+	action     string // user action: pause | cancel
+	plannerCtx context.Context
 }
 
 // nextPlannerRound returns the next planner round number for a task (1-based).
@@ -417,11 +418,17 @@ func (e *Engine) registerWork(intentID int64, cancel context.CancelCauseFunc) {
 // must be called after the final intent state write so a waiting cancel handler can
 // safely delete the worker's blackboard output without racing a late write.
 func (e *Engine) detachWork(intentID int64) (action string, complete func(error)) {
+	action, complete, _ = e.detachWorkAttributed(intentID)
+	return
+}
+
+func (e *Engine) detachWorkAttributed(intentID int64) (action string, complete func(error), plannerCtx context.Context) {
 	e.workMu.Lock()
 	run := e.work[intentID]
 	if run != nil {
 		delete(e.work, intentID)
 		action = run.action
+		plannerCtx = run.plannerCtx
 		run.cancel(agent.AbortWorkFinished) // release resources (no-op if already cancelled)
 	}
 	e.workMu.Unlock()
@@ -429,9 +436,9 @@ func (e *Engine) detachWork(intentID int64) (action string, complete func(error)
 	delete(e.steerBox, intentID) // drop any undelivered steering for a finished work
 	e.steerMu.Unlock()
 	if run == nil {
-		return action, func(error) {}
+		return action, func(error) {}, plannerCtx
 	}
-	return action, func(err error) { run.done <- err }
+	return action, func(err error) { run.done <- err }, plannerCtx
 }
 
 // ControlWork requests a user-visible pause or cancellation and waits until the
@@ -635,12 +642,20 @@ func (h steerHooks) Stop(ctx context.Context, messages []llm.Message) (bool, []s
 // KillWork cancels the in-flight work running intentID (planner's kill_work tool).
 // The work's agent-core session honors ctx cancellation and aborts promptly.
 func (e *Engine) KillWork(intentID int64) error {
+	return e.killWorkAttributed(context.Background(), intentID)
+}
+
+func (e *Engine) killWorkAttributed(ctx context.Context, intentID int64) error {
 	e.workMu.Lock()
 	run := e.work[intentID]
-	e.workMu.Unlock()
 	if run == nil {
+		e.workMu.Unlock()
 		return fmt.Errorf("意图 %d 当前没有运行中的 work（可能已结束或未被领取）", intentID)
 	}
+	if run.plannerCtx == nil && run.action == "" {
+		run.plannerCtx = ctx
+	}
+	e.workMu.Unlock()
 	run.cancel(agent.AbortKilledByPlanner)
 	return nil
 }
@@ -896,7 +911,6 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		triggers := t.drainTriggers()
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
 		ectx = llmrec.WithAttribution(ectx, 0, "planner", int64(round))
-		before := planIntentCounts(ectx, t)
 		e.BeginLLMCall(t.ID)
 		started := time.Now()
 		met, reason, err := planner.Plan(ectx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit)
@@ -928,7 +942,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		e.touch(t.ID)
 		e.recordPlanRound(ectx, t, db.PlanRound{TaskID: t.ID, Round: int64(round), StartedAt: started,
 			DurationMS: duration.Milliseconds(), TriggerSrc: src, TriggerCount: len(triggers),
-			LLMCalls: calls, Outcome: outcome}, before)
+			LLMCalls: calls, Outcome: outcome})
 	}
 
 	for {
@@ -1092,7 +1106,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// work would be wrongly marked stopped.
 	workCause := context.Cause(workCtx)
 	killed := workCtx.Err() != nil && ectx.Err() == nil
-	action, completeWork := e.detachWork(intent.ID)
+	action, completeWork, plannerCtx := e.detachWorkAttributed(intent.ID)
 	// A caller may stop waiting and release its in-memory reservation before the
 	// agent honors cancellation. The named context cause remains authoritative and
 	// still settles the stopped run into a recoverable state.
@@ -1162,6 +1176,8 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	if killed {
 		if err := transitionIntentState(t.Store, intent.ID, "running", "stopped"); err != nil {
 			log.Printf("[worker %s] task %s 意图 #%d planner 停止落库失败: %v", name, t.ID, intent.ID, err)
+		} else {
+			llmrec.RecordIntentCancelled(plannerCtx)
 		}
 		log.Printf("[worker %s] task %s 意图 #%d 被终止(stopped)", name, t.ID, intent.ID)
 		e.touch(t.ID)
