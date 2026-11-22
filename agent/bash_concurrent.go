@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"runtime"
 	"strings"
 
 	actool "github.com/Autumn-27/norma/tool"
@@ -10,10 +11,27 @@ import (
 type concurrentBash struct{ actool.CoreTool }
 
 func (t *concurrentBash) IsConcurrencySafe(in json.RawMessage) bool {
-	var input struct {
-		Command string `json:"command"`
+	// The classifier below assumes a POSIX shell (bash -c) with bash quoting
+	// and a unix command allowlist. On Windows the Bash tool runs through
+	// PowerShell, whose parsing, escaping and command names differ, so the
+	// classification is unsound there: stay serial (fail safe).
+	if runtime.GOOS == "windows" {
+		return false
 	}
-	return json.Unmarshal(in, &input) == nil && bashCommandReadOnly(input.Command)
+	var input struct {
+		Command         string `json:"command"`
+		RunInBackground bool   `json:"run_in_background"`
+	}
+	if json.Unmarshal(in, &input) != nil {
+		return false
+	}
+	// A background launch mutates the task manager (it registers a new job),
+	// so a same-turn TaskList/TaskOutput could race ahead of registration.
+	// Only plain foreground reads are eligible for concurrency.
+	if input.RunInBackground {
+		return false
+	}
+	return bashCommandReadOnly(input.Command)
 }
 
 func wrapConcurrentBash(t actool.CoreTool) actool.CoreTool {

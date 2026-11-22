@@ -62,6 +62,10 @@ func TestConcurrentBashWrapper(t *testing.T) {
 	}{
 		{`{"command":"cat f"}`, true}, {`{"command":"rm -rf x"}`, false},
 		{`{`, false}, {`{}`, false}, {`null`, false}, {`[]`, false}, {`{"command":42}`, false},
+		// A background launch registers a task; it must stay serial so a
+		// same-turn TaskList can't race ahead of job registration.
+		{`{"command":"cat f","run_in_background":true}`, false},
+		{`{"command":"cat f","run_in_background":false}`, true},
 	} {
 		in := json.RawMessage(tc.input)
 		if wrapped.IsConcurrencySafe(in) != tc.safe {
