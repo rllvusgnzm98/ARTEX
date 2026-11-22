@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"time"
 
 	actool "github.com/Autumn-27/norma/tool"
 
@@ -34,14 +35,25 @@ func meterTool(t actool.CoreTool, recorder toolUsageRecorder, toolKey, agentKey 
 }
 
 func (m *meteredTool) Call(ctx context.Context, input json.RawMessage, tc *actool.ToolContext) (actool.Result, error) {
-	if err := m.recorder.InsertToolUsage(&db.ToolUsage{
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	usage := &db.ToolUsage{
 		ToolKey:       m.toolKey,
 		AgentKey:      m.agentKey,
 		TaskID:        m.ri.TaskID,
 		ExplorationID: m.ri.ExplorationID,
 		IntentID:      m.ri.IntentID,
 		SessionID:     m.ri.SessionID,
-	}); err != nil {
+	}
+	var err error
+	if contextual, ok := m.recorder.(interface {
+		InsertToolUsageCtx(context.Context, *db.ToolUsage) error
+	}); ok {
+		err = contextual.InsertToolUsageCtx(writeCtx, usage)
+	} else {
+		err = m.recorder.InsertToolUsage(usage)
+	}
+	if err != nil {
 		log.Printf("[toolusage] insert %s: %v", m.toolKey, err)
 	}
 	return m.CoreTool.Call(ctx, input, tc)

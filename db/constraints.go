@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"fmt"
 	"time"
 )
@@ -40,6 +41,10 @@ ORDER BY (kind='deny'), id`, s.expID)
 
 // AddConstraint inserts one constraint (kind must be allow|deny) and returns its id.
 func (s *ExplorationStore) AddConstraint(kind, text, origin string) (int64, error) {
+	return s.AddConstraintCtx(context.Background(), kind, text, origin)
+}
+
+func (s *ExplorationStore) AddConstraintCtx(ctx context.Context, kind, text, origin string) (int64, error) {
 	if kind != "allow" && kind != "deny" {
 		return 0, fmt.Errorf("kind 必须是 allow 或 deny")
 	}
@@ -47,7 +52,7 @@ func (s *ExplorationStore) AddConstraint(kind, text, origin string) (int64, erro
 		origin = "system"
 	}
 	var id int64
-	err := s.db.QueryRow(`
+	err := s.db.QueryRowContext(ctx, `
 INSERT INTO task_constraints(exploration_id, kind, text, origin)
 VALUES ($1, $2, $3, $4) RETURNING id`, s.expID, kind, text, origin).Scan(&id)
 	return id, err

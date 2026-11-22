@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"time"
@@ -74,6 +75,10 @@ func (d *DB) GetInterceptDetail(id int64) (*InterceptDetail, error) {
 // ResolveIntercept atomically settles a pending request. A timeout cannot
 // overwrite a human decision and repeat decisions cannot rewrite history.
 func (d *DB) ResolveIntercept(id int64, status, action, reason string) (bool, error) {
+	return d.ResolveInterceptCtx(context.Background(), id, status, action, reason)
+}
+
+func (d *DB) ResolveInterceptCtx(ctx context.Context, id int64, status, action, reason string) (bool, error) {
 	execution := "not_executed"
 	if action == "allow" {
 		execution = "awaiting_result"
@@ -84,7 +89,7 @@ func (d *DB) ResolveIntercept(id int64, status, action, reason string) (bool, er
 	if err != nil {
 		return false, err
 	}
-	r, err := d.Exec(`UPDATE intercept_pending SET status=$2, decided_at=NOW(),
+	r, err := d.ExecContext(ctx, `UPDATE intercept_pending SET status=$2, decided_at=NOW(),
 		audit=CASE WHEN audit IS NULL THEN NULL ELSE audit || $3::jsonb ||
         CASE WHEN $4='allow' AND audit->>'correlation' IS DISTINCT FROM 'exact'
         THEN '{"execution_status":"unknown"}'::jsonb ELSE '{}'::jsonb END END
@@ -99,6 +104,10 @@ func (d *DB) ResolveIntercept(id int64, status, action, reason string) (bool, er
 // CompleteIntercept only updates the exact recorded call after it was allowed.
 // A blocked tool_result must never be presented as a failed execution.
 func (d *DB) CompleteIntercept(id int64, runID, toolUseID, status, output string, truncated bool) error {
+	return d.CompleteInterceptCtx(context.Background(), id, runID, toolUseID, status, output, truncated)
+}
+
+func (d *DB) CompleteInterceptCtx(ctx context.Context, id int64, runID, toolUseID, status, output string, truncated bool) error {
 	patch, err := json.Marshal(map[string]any{
 		"execution_status": status, "output": output, "output_truncated": truncated,
 		"execution_ended_at": time.Now().UTC(),
@@ -106,7 +115,7 @@ func (d *DB) CompleteIntercept(id int64, runID, toolUseID, status, output string
 	if err != nil {
 		return err
 	}
-	_, err = d.Exec(`UPDATE intercept_pending SET audit=audit || $4::jsonb
+	_, err = d.ExecContext(ctx, `UPDATE intercept_pending SET audit=audit || $4::jsonb
 		WHERE id=$1 AND audit->>'run_id'=$2 AND audit->>'tool_use_id'=$3
 		AND audit->>'effective_action'='allow' AND audit->>'execution_status'='awaiting_result'`,
 		id, runID, toolUseID, patch)

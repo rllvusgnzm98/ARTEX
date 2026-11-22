@@ -1,5 +1,7 @@
 package db
 
+import "context"
+
 // ToolUsage is one catalog tool invocation. It stores attribution dimensions only:
 // tool arguments and results are deliberately excluded from the ledger.
 type ToolUsage struct {
@@ -14,7 +16,11 @@ type ToolUsage struct {
 // InsertToolUsage appends one ledger row. Runtime callers treat metering as
 // best-effort so a statistics failure never interrupts the tool itself.
 func (d *DB) InsertToolUsage(u *ToolUsage) error {
-	_, err := d.Exec(`
+	return d.InsertToolUsageCtx(context.Background(), u)
+}
+
+func (d *DB) InsertToolUsageCtx(ctx context.Context, u *ToolUsage) error {
+	_, err := d.ExecContext(ctx, `
 INSERT INTO tool_usage(tool_key, agent_key, task_id, exploration_id, intent_id, session_id)
 VALUES ($1, NULLIF($2,''), $3, $4, $5, NULLIF($6,''))`,
 		u.ToolKey, u.AgentKey, nullIfZero(u.TaskID), nullIfZero(u.ExplorationID),

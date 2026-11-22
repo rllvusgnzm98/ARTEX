@@ -6,6 +6,7 @@ import (
 	"log"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Autumn-27/norma/skill"
 	actool "github.com/Autumn-27/norma/tool"
@@ -40,13 +41,13 @@ func meterSkillTool(t actool.CoreTool, pg *db.DB, reg *skill.Registry, agentKey 
 }
 
 func (m *meteredSkill) Call(ctx context.Context, input json.RawMessage, tc *actool.ToolContext) (actool.Result, error) {
-	m.record(input)
+	m.record(ctx, input)
 	return m.CoreTool.Call(ctx, input, tc)
 }
 
 // record appends the ledger row. Best-effort by design: a metering failure must
 // never turn into a failed skill invocation, so every error path just logs.
-func (m *meteredSkill) record(input json.RawMessage) {
+func (m *meteredSkill) record(ctx context.Context, input json.RawMessage) {
 	var in struct {
 		Name string `json:"name"`
 		Args string `json:"args"`
@@ -72,7 +73,9 @@ func (m *meteredSkill) record(input json.RawMessage) {
 	if len(name) > maxLedgerSkillName {
 		name = name[:maxLedgerSkillName]
 	}
-	err := m.pg.InsertSkillUsage(&db.SkillUsage{
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	err := m.pg.InsertSkillUsageCtx(writeCtx, &db.SkillUsage{
 		Skill:         name,
 		AgentKey:      m.agentKey,
 		TaskID:        m.ri.TaskID,

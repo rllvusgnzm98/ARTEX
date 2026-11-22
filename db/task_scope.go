@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"net"
@@ -85,9 +86,9 @@ ON CONFLICT DO NOTHING`
 		err    error
 	)
 	if s.tx != nil {
-		result, err = s.tx.Exec(query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason)
+		result, err = s.tx.ExecContext(s.ctx, query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason)
 	} else {
-		result, err = s.db.Exec(query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason)
+		result, err = s.db.ExecContext(s.ctx, query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason)
 	}
 	if err != nil {
 		return false, err
@@ -106,6 +107,11 @@ func (s *AssetStore) upsertTaskScope(ts TaskScope) error {
 // never from a db-layer side effect (linkHostAssets), so派生资产不会盲目扩大范围。
 // Rule: scope granularity follows the asset's own type. taskID<=0 → no-op.
 func (s *AssetStore) AddAutoScope(taskID int64, assetType, domain, rawURL, ip string) error {
+	return s.AddAutoScopeCtx(context.Background(), taskID, assetType, domain, rawURL, ip)
+}
+
+func (s *AssetStore) AddAutoScopeCtx(ctx context.Context, taskID int64, assetType, domain, rawURL, ip string) error {
+	s = s.withContext(ctx)
 	if taskID <= 0 {
 		return nil
 	}
@@ -144,6 +150,11 @@ func (s *AssetStore) AddAutoScope(taskID int64, assetType, domain, rawURL, ip st
 // company: value = company name or id (must already exist). root_domain/subdomain:
 // value = a domain. ip/cidr: value = an IP or CIDR (bare IP → /32,/128).
 func (s *AssetStore) AddAgentScope(taskID int64, kind, value, reason, source string) (TaskScope, error) {
+	return s.AddAgentScopeCtx(context.Background(), taskID, kind, value, reason, source)
+}
+
+func (s *AssetStore) AddAgentScopeCtx(ctx context.Context, taskID int64, kind, value, reason, source string) (TaskScope, error) {
+	s = s.withContext(ctx)
 	if source == "" {
 		source = "agent"
 	}

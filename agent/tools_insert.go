@@ -208,7 +208,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 				}, "type"),
 			},
 		}, "assets"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.as == nil {
 				return actool.Errorf("insert_assets 未启用: AssetStore 未初始化"), nil
 			}
@@ -263,14 +263,14 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 
 				switch typ {
 				case "root_domain":
-					id, err = t.as.UpsertRootDomain(db.UpsertRootDomainReq{
+					id, err = t.as.UpsertRootDomainCtx(ctx, db.UpsertRootDomainReq{
 						Domain: item.Domain,
 						ICP:    item.ICP,
 						TaskID: taskID,
 					})
 
 				case "ip":
-					id, err = t.as.UpsertIP(db.UpsertIPReq{
+					id, err = t.as.UpsertIPCtx(ctx, db.UpsertIPReq{
 						IP:           item.IP,
 						BoundDomains: item.BoundDomains,
 						OpenPorts:    item.OpenPorts,
@@ -278,7 +278,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 					})
 
 				case "subdomain":
-					id, err = t.as.UpsertSubdomain(db.UpsertSubdomainReq{
+					id, err = t.as.UpsertSubdomainCtx(ctx, db.UpsertSubdomainReq{
 						Domain:      item.Domain,
 						RecordType:  item.RecordType,
 						RecordValue: item.RecordValue,
@@ -287,7 +287,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 					})
 
 				case "app":
-					id, err = t.as.UpsertApp(db.UpsertAppReq{
+					id, err = t.as.UpsertAppCtx(ctx, db.UpsertAppReq{
 						Name:        item.AppName,
 						BundleID:    item.BundleID,
 						Category:    item.Category,
@@ -305,7 +305,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 						if svcIP == "" {
 							svcIP = item.IP
 						}
-						id, err = t.as.UpsertHTTPService(db.UpsertHTTPServiceReq{
+						id, err = t.as.UpsertHTTPServiceCtx(ctx, db.UpsertHTTPServiceReq{
 							URL:           item.URL,
 							Technologies:  item.Technologies,
 							StatusCode:    item.StatusCode,
@@ -320,7 +320,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 							t.evaluateHoneypot(id, serviceViewFromItem(item, true))
 						}
 					} else {
-						id, err = t.as.UpsertOtherService(db.UpsertOtherServiceReq{
+						id, err = t.as.UpsertOtherServiceCtx(ctx, db.UpsertOtherServiceReq{
 							Domain:      item.Domain,
 							IP:          item.IP,
 							Port:        item.Port,
@@ -334,7 +334,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 					}
 
 				case "endpoint":
-					id, err = t.as.UpsertEndpoint(db.UpsertEndpointReq{
+					id, err = t.as.UpsertEndpointCtx(ctx, db.UpsertEndpointReq{
 						URL:    item.URL,
 						Method: item.Method,
 						Params: item.Params,
@@ -364,7 +364,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 					if t.ownerNode > 0 {
 						summary = fmt.Sprintf("Worker 意图 #%d 通过 insert_assets 登记", t.ownerNode)
 					}
-					_ = t.as.SetTaskAssetSource(taskID, id, "agent", summary, sourceNodeID)
+					_ = t.as.SetTaskAssetSourceCtx(ctx, taskID, id, "agent", summary, sourceNodeID)
 				}
 				// 自动入测试范围(source='auto')：只对 worker 顶层显式插入的这一项，按其
 				// 类型加保守范围；side-effect 派生的资产不经此处，故范围不盲目扩大。taskID=0 时无操作。
@@ -375,7 +375,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 					if svcIP == "" {
 						svcIP = item.IP
 					}
-					_ = t.as.AddAutoScope(taskID, typ, item.Domain, item.URL, svcIP)
+					_ = t.as.AddAutoScopeCtx(ctx, taskID, typ, item.Domain, item.URL, svcIP)
 				}
 			}
 
@@ -402,7 +402,7 @@ func (t *ToolSet) addCompanyScope() actool.CoreTool {
 			"reason":  str("归属依据(证据/来源)，务必填写"),
 			"logo":    str("公司图标 URL(可选；仅新建公司时生效)"),
 		}, "company", "scope"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.cs == nil {
 				return actool.Errorf("add_company_scope 未启用: CompanyStore 未初始化"), nil
 			}
@@ -461,7 +461,7 @@ func (t *ToolSet) addTaskScope() actool.CoreTool {
 			"value":   str("[单条] 公司名或id / 域名 / IP / CIDR / ICP / 关键词"),
 			"reason":  str("加入依据(用于审计)，务必填写"),
 		}),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.as == nil {
 				return actool.Errorf("add_task_scope 未启用: AssetStore 未初始化"), nil
 			}
@@ -485,7 +485,7 @@ func (t *ToolSet) addTaskScope() actool.CoreTool {
 			var added []map[string]any
 			errs := map[string]string{}
 			for i, e := range items {
-				ts, err := t.as.AddAgentScope(t.taskID, strings.TrimSpace(e.Kind), e.Value, a.Reason, "agent")
+				ts, err := t.as.AddAgentScopeCtx(ctx, t.taskID, strings.TrimSpace(e.Kind), e.Value, a.Reason, "agent")
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
 					continue
@@ -517,7 +517,7 @@ func (t *ToolSet) listUntestedAssets() actool.CoreTool {
 			"page":      intp("页码，从 1 起（默认 1）"),
 			"page_size": intp("每页数量（默认 10）"),
 		}),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.as == nil {
 				return actool.Errorf("list_untested_assets 未启用: AssetStore 未初始化"), nil
 			}
@@ -565,7 +565,7 @@ func (t *ToolSet) listAssets() actool.CoreTool {
 			"limit":  intp("返回上限，默认 10（可选）"),
 			"offset": intp("分页偏移，默认 0（可选）"),
 		}),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.as == nil {
 				return actool.Errorf("list_assets 未启用: AssetStore 未初始化"), nil
 			}
@@ -615,7 +615,7 @@ func (t *ToolSet) listCompanies() actool.CoreTool {
 		obj(map[string]any{
 			"search": str("按公司名模糊过滤(可选，不区分大小写)；留空返回全部"),
 		}),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.cs == nil {
 				return actool.Errorf("list_companies 未启用: CompanyStore 未初始化"), nil
 			}

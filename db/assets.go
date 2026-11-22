@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -88,11 +89,21 @@ type AssetStore struct {
 	db      *DB
 	company *CompanyStore
 	tx      *sql.Tx
+	ctx     context.Context
 }
 
 // Assets returns the asset store.
 func (d *DB) Assets() *AssetStore {
-	return &AssetStore{db: d, company: d.Companies()}
+	return &AssetStore{db: d, company: d.Companies(), ctx: context.Background()}
+}
+
+func (s *AssetStore) withContext(ctx context.Context) *AssetStore {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	copy := *s
+	copy.ctx = ctx
+	return &copy
 }
 
 // Companies returns the company store associated with this asset store.
@@ -102,10 +113,13 @@ func (s *AssetStore) Companies() *CompanyStore { return s.company }
 // that consumes its result in one transaction. Nested asset side effects reuse
 // the same transaction through the scoped store.
 func (s *AssetStore) withCompanyScopeMutation(fn func(*AssetStore) (int64, error)) (int64, error) {
+	if s.ctx == nil {
+		s.ctx = context.Background()
+	}
 	if s.tx != nil {
 		return fn(s)
 	}
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(s.ctx, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -113,7 +127,7 @@ func (s *AssetStore) withCompanyScopeMutation(fn func(*AssetStore) (int64, error
 	if err := lockCompanyScopeMutation(tx); err != nil {
 		return 0, err
 	}
-	scoped := &AssetStore{db: s.db, company: s.company, tx: tx}
+	scoped := &AssetStore{db: s.db, company: s.company, tx: tx, ctx: s.ctx}
 	id, err := fn(scoped)
 	if err != nil {
 		return 0, err
@@ -122,6 +136,28 @@ func (s *AssetStore) withCompanyScopeMutation(fn func(*AssetStore) (int64, error
 		return 0, err
 	}
 	return id, nil
+}
+
+func (s *AssetStore) UpsertRootDomainCtx(ctx context.Context, req UpsertRootDomainReq) (int64, error) {
+	return s.withContext(ctx).UpsertRootDomain(req)
+}
+func (s *AssetStore) UpsertIPCtx(ctx context.Context, req UpsertIPReq) (int64, error) {
+	return s.withContext(ctx).UpsertIP(req)
+}
+func (s *AssetStore) UpsertSubdomainCtx(ctx context.Context, req UpsertSubdomainReq) (int64, error) {
+	return s.withContext(ctx).UpsertSubdomain(req)
+}
+func (s *AssetStore) UpsertAppCtx(ctx context.Context, req UpsertAppReq) (int64, error) {
+	return s.withContext(ctx).UpsertApp(req)
+}
+func (s *AssetStore) UpsertHTTPServiceCtx(ctx context.Context, req UpsertHTTPServiceReq) (int64, error) {
+	return s.withContext(ctx).UpsertHTTPService(req)
+}
+func (s *AssetStore) UpsertOtherServiceCtx(ctx context.Context, req UpsertOtherServiceReq) (int64, error) {
+	return s.withContext(ctx).UpsertOtherService(req)
+}
+func (s *AssetStore) UpsertEndpointCtx(ctx context.Context, req UpsertEndpointReq) (int64, error) {
+	return s.withContext(ctx).UpsertEndpoint(req)
 }
 
 func (s *AssetStore) resolveCompanyWithICP(rootDomain, ipStr, icp string) (*int64, error) {
@@ -280,7 +316,7 @@ func (s *AssetStore) UpsertRootDomain(req UpsertRootDomainReq) (int64, error) {
 	}
 
 	var id int64
-	err = s.tx.QueryRow(`
+	err = s.tx.QueryRowContext(s.ctx, `
 INSERT INTO assets(type, domain, root_domain, icp, company_id, company_source, task_ids)
 VALUES ('root_domain', $1, $1, $2, $3, 'scope', $4::bigint[])
 ON CONFLICT (domain) WHERE type = 'root_domain' DO UPDATE SET
@@ -372,7 +408,7 @@ func (s *AssetStore) UpsertIP(req UpsertIPReq) (int64, error) {
 	}
 
 	var id int64
-	err = s.tx.QueryRow(`
+	err = s.tx.QueryRowContext(s.ctx, `
 INSERT INTO assets(type, ip, c_segment, bound_domains, open_ports, company_id, company_source, task_ids)
 VALUES ('ip', $1, $2::cidr, $3::text[], $4::jsonb[], $5, 'scope', $6::bigint[])
 ON CONFLICT (ip) WHERE type = 'ip' DO UPDATE SET
@@ -407,7 +443,7 @@ func (s *AssetStore) AppendIPPort(ipStr string, port int, serviceName string) er
 		return nil
 	}
 	entry, _ := json.Marshal(map[string]any{"port": port, "service": serviceName})
-	_, err := s.db.Exec(`
+	_, err := s.db.ExecContext(s.ctx, `
 UPDATE assets SET
     open_ports = (
         SELECT ARRAY(
@@ -427,7 +463,7 @@ func (s *AssetStore) AppendIPBoundDomain(ipStr, domain string) error {
 	if ipStr == "" || domain == "" {
 		return nil
 	}
-	_, err := s.db.Exec(`
+	_, err := s.db.ExecContext(s.ctx, `
 UPDATE assets SET
     bound_domains = (SELECT ARRAY(SELECT DISTINCT unnest(bound_domains || ARRAY[$1::text]))),
     last_seen = now()
@@ -525,7 +561,7 @@ func (s *AssetStore) UpsertSubdomain(req UpsertSubdomainReq) (id int64, err erro
 	recordType := req.RecordType
 	recordValueArr := marshalStringArray(req.RecordValue)
 
-	err = s.tx.QueryRow(`
+	err = s.tx.QueryRowContext(s.ctx, `
 INSERT INTO assets(type, domain, root_domain, record_type, record_value, ip, c_segment, icp, company_id, company_source, task_ids)
 VALUES ('subdomain', $1, $2, $3, $4::text[], $5, $6::cidr, $7, $8, 'scope', $9::bigint[])
 ON CONFLICT (domain, COALESCE(record_type,'')) WHERE type = 'subdomain' DO UPDATE SET
@@ -613,7 +649,7 @@ func (s *AssetStore) UpsertApp(req UpsertAppReq) (int64, error) {
 	var err error
 
 	if req.BundleID != "" {
-		err = s.tx.QueryRow(`
+		err = s.tx.QueryRowContext(s.ctx, `
 INSERT INTO assets(type, bundle_id, app_name, category, app_description, app_icp, company_id, company_source, task_ids)
 VALUES ('app', $1, $2, $3, $4, $5, $6, $7, $8::bigint[])
 ON CONFLICT (bundle_id) WHERE type = 'app' AND bundle_id IS NOT NULL DO UPDATE SET
@@ -636,7 +672,7 @@ ON CONFLICT (bundle_id) WHERE type = 'app' AND bundle_id IS NOT NULL DO UPDATE S
     last_seen       = now()
 RETURNING id`, bundleVal, req.Name, catVal, descVal, icpVal, companyIDVal, companySource, taskIDs).Scan(&id)
 	} else {
-		err = s.tx.QueryRow(`
+		err = s.tx.QueryRowContext(s.ctx, `
 INSERT INTO assets(type, bundle_id, app_name, category, app_description, app_icp, company_id, company_source, task_ids)
 VALUES ('app', NULL, $1, $2, $3, $4, $5, $6, $7::bigint[])
 ON CONFLICT (app_name) WHERE type = 'app' AND bundle_id IS NULL DO UPDATE SET
@@ -736,7 +772,7 @@ func (s *AssetStore) UpsertHTTPService(req UpsertHTTPServiceReq) (int64, error) 
 	}
 
 	var id int64
-	err = s.tx.QueryRow(`
+	err = s.tx.QueryRowContext(s.ctx, `
 INSERT INTO assets(
     type, url, service_type, service_name, domain, ip, port, root_domain,
     c_segment, favicon_mmh3, technologies, status_code, content_length, page_title,
@@ -881,7 +917,7 @@ func (s *AssetStore) UpsertOtherService(req UpsertOtherServiceReq) (int64, error
 	}
 
 	var id int64
-	err = s.tx.QueryRow(`
+	err = s.tx.QueryRowContext(s.ctx, `
 INSERT INTO assets(
     type, service_type, service_name, domain, ip, port, root_domain,
     c_segment, auth, company_id, company_source, task_ids
@@ -1016,7 +1052,7 @@ func (s *AssetStore) UpsertEndpoint(req UpsertEndpointReq) (int64, error) {
 	}
 
 	var id int64
-	err = s.tx.QueryRow(`
+	err = s.tx.QueryRowContext(s.ctx, `
 INSERT INTO assets(
     type, url, method, domain, ip, port, root_domain,
     params, company_id, company_source, task_ids, c_segment
@@ -1096,7 +1132,7 @@ LIMIT $2 OFFSET $3`, typ, limit, offset)
 // CountByType returns the total number of assets of a type (for server-side pagination).
 func (s *AssetStore) CountByType(typ string) (int, error) {
 	var n int
-	err := s.db.QueryRow(`SELECT count(*) FROM assets WHERE type = $1`, typ).Scan(&n)
+	err := s.db.QueryRowContext(s.ctx, `SELECT count(*) FROM assets WHERE type = $1`, typ).Scan(&n)
 	return n, err
 }
 
@@ -1136,7 +1172,7 @@ func (s *AssetStore) CountByCompany(companyID int64, typ string) (int, error) {
 		q += fmt.Sprintf(` AND type = $%d`, len(args))
 	}
 	var n int
-	err := s.db.QueryRow(q, args...).Scan(&n)
+	err := s.db.QueryRowContext(s.ctx, q, args...).Scan(&n)
 	return n, err
 }
 
@@ -1195,7 +1231,7 @@ func (s *AssetStore) CountByTask(taskID int64, typ string) (int, error) {
 		q += fmt.Sprintf(` AND type = $%d`, len(args))
 	}
 	var n int
-	err := s.db.QueryRow(q, args...).Scan(&n)
+	err := s.db.QueryRowContext(s.ctx, q, args...).Scan(&n)
 	return n, err
 }
 
@@ -1213,12 +1249,12 @@ func (s *AssetStore) CountsByTypeForTask(taskID int64) (map[string]int, error) {
 // transaction in DeleteTaskCascadePrepared; this method remains for callers
 // that explicitly manage only asset associations.
 func (s *AssetStore) DeleteByTaskID(taskID int64) (int64, error) {
-	res, err := s.db.Exec(`DELETE FROM assets WHERE task_ids = ARRAY[$1]::bigint[]`, taskID)
+	res, err := s.db.ExecContext(s.ctx, `DELETE FROM assets WHERE task_ids = ARRAY[$1]::bigint[]`, taskID)
 	if err != nil {
 		return 0, err
 	}
 	deleted, _ := res.RowsAffected()
-	if _, err := s.db.Exec(`UPDATE assets SET task_ids = array_remove(task_ids, $1) WHERE $1 = ANY(task_ids)`, taskID); err != nil {
+	if _, err := s.db.ExecContext(s.ctx, `UPDATE assets SET task_ids = array_remove(task_ids, $1) WHERE $1 = ANY(task_ids)`, taskID); err != nil {
 		return deleted, err
 	}
 	return deleted, nil
@@ -1387,7 +1423,7 @@ func (s *AssetStore) GetByIDs(ids []int64) ([]*Asset, error) {
 
 // DeleteByCompanyID hard-deletes all assets belonging to a company. Returns rows deleted.
 func (s *AssetStore) DeleteByCompanyID(companyID int64) (int64, error) {
-	res, err := s.db.Exec(`DELETE FROM assets WHERE company_id = $1`, companyID)
+	res, err := s.db.ExecContext(s.ctx, `DELETE FROM assets WHERE company_id = $1`, companyID)
 	if err != nil {
 		return 0, err
 	}
@@ -1437,7 +1473,7 @@ func (s *AssetStore) DeleteByIDs(ids []int64) (int64, error) {
 		placeholders[i] = fmt.Sprintf("$%d", i+1)
 		args[i] = id
 	}
-	res, err := s.db.Exec("DELETE FROM assets WHERE id IN ("+strings.Join(placeholders, ",")+")", args...)
+	res, err := s.db.ExecContext(s.ctx, "DELETE FROM assets WHERE id IN ("+strings.Join(placeholders, ",")+")", args...)
 	if err != nil {
 		return 0, err
 	}

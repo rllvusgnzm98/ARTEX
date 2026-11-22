@@ -497,7 +497,9 @@ func (e *Engine) releaseWorkControl(intentID int64, run *workExecution, action s
 }
 
 func transitionIntentState(store *db.ExplorationStore, intentID int64, expected, state string) error {
-	changed, err := store.CompareAndSetIntentState(intentID, expected, state)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), 3*time.Second)
+	defer cancel()
+	changed, err := store.CompareAndSetIntentStateCtx(ctx, intentID, expected, state)
 	if err != nil {
 		return err
 	}
@@ -707,10 +709,16 @@ func (e *Engine) emitActivity(t *Task, r db.Activity) db.Activity {
 // failure is now LOGGED (it used to be swallowed by an `if err == nil`), so the
 // underlying DB error is finally visible for diagnosis.
 func (e *Engine) appendActivity(t *Task, r db.Activity) (int64, error) {
+	return e.appendActivityCtx(context.Background(), t, r)
+}
+
+func (e *Engine) appendActivityCtx(ctx context.Context, t *Task, r db.Activity) (int64, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
 	var id int64
 	var err error
 	for attempt := 1; attempt <= 3; attempt++ {
-		if id, err = t.Store.AppendActivity(r); err == nil {
+		if id, err = t.Store.AppendActivityCtx(ctx, r); err == nil {
 			if attempt > 1 {
 				log.Printf("[activity] task %s 写入第 %d 次重试成功 (worker=%s kind=%s tool=%s)",
 					t.ID, attempt, r.Worker, r.Kind, r.Tool)
@@ -719,7 +727,15 @@ func (e *Engine) appendActivity(t *Task, r db.Activity) (int64, error) {
 		}
 		log.Printf("[activity] task %s 写入失败 (第 %d/3 次, worker=%s kind=%s tool=%s expID=%d): %v",
 			t.ID, attempt, r.Worker, r.Kind, r.Tool, t.Store.ID(), err)
-		time.Sleep(time.Duration(attempt) * 25 * time.Millisecond)
+		timer := time.NewTimer(time.Duration(attempt) * 25 * time.Millisecond)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return 0, ctx.Err()
+		}
 	}
 	return 0, err
 }
@@ -1016,7 +1032,7 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 // runIntent. Returns false when nothing was claimable. The pool worker loop is its
 // only caller.
 func (e *Engine) runWorkerStep(ctx context.Context, t *Task, name string, worker *agent.Worker) bool {
-	intent := e.claimNext(t, name)
+	intent := e.claimNext(ctx, t, name)
 	if intent == nil {
 		return false
 	}
@@ -1307,8 +1323,8 @@ func sleepCtx(ctx context.Context, d time.Duration) (done bool) {
 	}
 }
 
-func (e *Engine) claimNext(t *Task, name string) *db.Node {
-	fr, err := t.Store.Frontier(20)
+func (e *Engine) claimNext(ctx context.Context, t *Task, name string) *db.Node {
+	fr, err := t.Store.FrontierCtx(ctx, 20)
 	if err != nil || len(fr) == 0 {
 		return nil
 	}
@@ -1323,7 +1339,7 @@ func (e *Engine) claimNext(t *Task, name string) *db.Node {
 		if in == nil {
 			continue
 		}
-		if ok, _ := t.Store.ClaimIntent(in.ID, name); ok {
+		if ok, _ := t.Store.ClaimIntentCtx(ctx, in.ID, name); ok {
 			return in
 		}
 	}
