@@ -56,11 +56,30 @@ type CallTimeoutError struct {
 	Model    string        // 模型 id
 	Timeout  time.Duration // 墙钟上限
 	Elapsed  time.Duration // 触发时已耗时(≈ Timeout,保留实测值便于核对)
+	// Stream phases are sampled at terminal-error handoff, before its consumer runs.
+	Streaming           bool
+	TimeToFirstEvent    time.Duration // 0 = no event received
+	ProviderWait        time.Duration
+	DownstreamYield     time.Duration
+	DeadlineReturnDelay time.Duration
 }
 
 func (e *CallTimeoutError) Error() string {
-	return fmt.Sprintf("llm call_timeout: %s/%s 整体墙钟超时(已耗时 %s,上限 %s),判定连接挂死,按瞬时失败处理",
-		e.Provider, e.Model, e.Elapsed.Round(time.Millisecond), e.Timeout)
+	return fmt.Sprintf("llm call_timeout: %s/%s 整体墙钟超时(已耗时 %s,上限 %s,%s),判定连接挂死,按瞬时失败处理",
+		e.Provider, e.Model, e.Elapsed.Round(time.Millisecond), e.Timeout, e.phaseText())
+}
+
+func (e *CallTimeoutError) phaseText() string {
+	delay := fmt.Sprintf("超时后返回延迟=%s", e.DeadlineReturnDelay.Round(time.Millisecond))
+	if !e.Streaming {
+		return delay
+	}
+	first := "未收到"
+	if e.TimeToFirstEvent > 0 {
+		first = e.TimeToFirstEvent.Round(time.Millisecond).String()
+	}
+	return fmt.Sprintf("首包=%s 等待provider=%s 下游yield=%s %s", first,
+		e.ProviderWait.Round(time.Millisecond), e.DownstreamYield.Round(time.Millisecond), delay)
 }
 
 // Unwrap 暴露 context.DeadlineExceeded:下游所有 errors.Is 截止判定继续成立。
@@ -88,7 +107,10 @@ func normalizeDeadline(ctx, callCtx context.Context, err error, provider, model 
 	if ctx.Err() != nil || callCtx.Err() == nil {
 		return err
 	}
-	return &CallTimeoutError{Provider: provider, Model: model, Timeout: timeout, Elapsed: time.Since(start)}
+	now := time.Now()
+	deadline, _ := callCtx.Deadline()
+	return &CallTimeoutError{Provider: provider, Model: model, Timeout: timeout, Elapsed: now.Sub(start),
+		DeadlineReturnDelay: max(0, now.Sub(deadline))}
 }
 
 // callTimeoutProvider 在单次调用外包一层整体墙钟。包在 recorder(llmrec.Wrap)之下,
@@ -112,11 +134,11 @@ func wrapCallTimeout(inner llm.Provider, c Config) llm.Provider {
 	return &callTimeoutProvider{inner: inner, timeout: timeout, provider: c.Provider(), model: c.Model}
 }
 
-func (p *callTimeoutProvider) warnTimeout(elapsed time.Duration) {
+func (p *callTimeoutProvider) warnTimeout(err *CallTimeoutError) {
 	// 注意:provider 组装层拿不到 profile 名(Config 里没有);profile 名由外层
 	// llmpool 故障转移日志与 llm_usage 记录(recorder 按 profile 名打标)补全。
-	log.Printf("[llm-call] WARN 整体墙钟超时(call_timeout):provider=%s model=%s 已耗时=%s 上限=%s — 判定连接挂死,归一化为瞬时失败交上层重试/故障转移",
-		p.provider, p.model, elapsed.Round(time.Millisecond), p.timeout)
+	log.Printf("[llm-call] WARN 整体墙钟超时(call_timeout):provider=%s model=%s 已耗时=%s 上限=%s %s — 判定连接挂死,归一化为瞬时失败交上层重试/故障转移",
+		p.provider, p.model, err.Elapsed.Round(time.Millisecond), p.timeout, err.phaseText())
 }
 
 // Stream 从发起计时,覆盖整个流式生命周期;墙钟到点即 cancel 并把错误归一化为
@@ -127,15 +149,29 @@ func (p *callTimeoutProvider) Stream(ctx context.Context, req llm.CompletionRequ
 		start := time.Now()
 		callCtx, cancel := context.WithTimeout(ctx, p.timeout)
 		defer cancel()
+		var firstEvent, providerWait, downstreamYield time.Duration
+		waitingSince := start
 		for ev, err := range p.inner.Stream(callCtx, req) {
+			now := time.Now()
+			providerWait += now.Sub(waitingSince)
+			if err == nil && firstEvent == 0 {
+				firstEvent = now.Sub(start)
+			}
 			if err != nil {
 				if nerr := normalizeDeadline(ctx, callCtx, err, p.provider, p.model, p.timeout, start); nerr != err {
-					p.warnTimeout(time.Since(start))
+					cto := nerr.(*CallTimeoutError)
+					cto.Streaming = true
+					cto.TimeToFirstEvent, cto.ProviderWait, cto.DownstreamYield = firstEvent, providerWait, downstreamYield
+					p.warnTimeout(cto)
 					yield(llm.StreamEvent{}, nerr)
 					return
 				}
 			}
-			if !yield(ev, err) {
+			yieldStart := time.Now()
+			more := yield(ev, err)
+			waitingSince = time.Now()
+			downstreamYield += waitingSince.Sub(yieldStart)
+			if !more {
 				return
 			}
 			if err != nil {
@@ -153,7 +189,7 @@ func (p *callTimeoutProvider) Complete(ctx context.Context, req llm.CompletionRe
 	msg, stop, usage, err := p.inner.Complete(callCtx, req)
 	if err != nil {
 		if nerr := normalizeDeadline(ctx, callCtx, err, p.provider, p.model, p.timeout, start); nerr != err {
-			p.warnTimeout(time.Since(start))
+			p.warnTimeout(nerr.(*CallTimeoutError))
 			return llm.Message{}, "", llm.Usage{}, nerr
 		}
 	}

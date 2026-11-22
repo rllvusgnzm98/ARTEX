@@ -285,6 +285,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	s.wireInterceptReviewer()      // LLM 兜底审批:未命中拦截规则的命令交给模型判定
 	s.bootJWTKeyRing(keyDir)       // 签名钥匙环；按龄轮换，并启动可停止的 6h 检查
 	s.registerEgressFingerprints() // 出口敏感指纹(只存哈希);profile/jwt/钥匙环已就绪后注册
+	go s.engine.processHeartbeat(s.ctx)
+	startPprof(s.ctx, os.Getenv("ARTEX_PPROF_ADDR"))
 	return s
 }
 

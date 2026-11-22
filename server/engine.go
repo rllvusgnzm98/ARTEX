@@ -104,6 +104,9 @@ type Engine struct {
 	deleting sync.Map // taskID -> bool, delete barrier (no new task-owned writes)
 	dropCnt  sync.Map // taskID -> *int64, running count of dropped (unpersistable) activity records
 
+	lastLLMStart  atomic.Int64
+	lastLLMFinish atomic.Int64
+
 	// deleteMu makes installing the delete barrier atomic with registering a new
 	// task operation. Once BeginDelete returns, every admitted writer is reflected
 	// in inflight and every later writer is rejected.
@@ -372,11 +375,13 @@ func (e *Engine) LastActivity(taskID string) int64 {
 // scheduler's task-operation counter. A task can have live loops while all of
 // them are waiting for a trigger; that state must remain idle in the UI.
 func (e *Engine) BeginLLMCall(taskID string) {
+	e.lastLLMStart.Store(time.Now().UnixNano())
 	v, _ := e.llmCalls.LoadOrStore(taskID, new(int64))
 	atomic.AddInt64(v.(*int64), 1)
 }
 
 func (e *Engine) EndLLMCall(taskID string) {
+	e.lastLLMFinish.Store(time.Now().UnixNano())
 	if v, ok := e.llmCalls.Load(taskID); ok {
 		p := v.(*int64)
 		if atomic.AddInt64(p, -1) <= 0 {
