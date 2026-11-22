@@ -454,11 +454,26 @@ func renderIntentTask(intent *db.Node) string {
 // must NOT widen the worker's job — it still does only its assigned intent. Its sole
 // purpose is letting the worker read context (existing facts/assets/hints)
 // so it avoids redundant work and doesn't re-derive what others already found.
-func renderWorkerGraphOverview(data map[string]any) string {
+func renderWorkerGraphOverview(data map[string]any, seedFactIDs map[int64]bool) string {
 	// coverage 是给规划者判断「哪类测得少 / 要不要扩范围」的信号，与 worker「只做领到的
 	// 那条意图、别追未覆盖的点」的职责边界相悖 → 从 worker 视图里剔除。data 是本次 worker
-	// 专属的新 map，删键不影响 planner。
+	// 专属的新 map(graphOverviewDataFrom 每次新建，键值切片也都是新的)，改它不影响 planner。
 	delete(data, "coverage")
+	// 阶段三去重：进场预塞(system prompt)已按本意图带上相关已确认事实(含 evidence_ids)。
+	// 概览里的 recent_facts 不再重复这些——它们完整在 seed 里，重复只会每轮多下发一遍；
+	// 未被选中的事实仍可用 list_facts / node_detail 回查。
+	if len(seedFactIDs) > 0 {
+		if rf, ok := data["recent_facts"].([]map[string]any); ok && len(rf) > 0 {
+			kept := make([]map[string]any, 0, len(rf))
+			for _, m := range rf {
+				if id, ok := m["id"].(int64); ok && seedFactIDs[id] {
+					continue // 已在进场预塞里，省去重复
+				}
+				kept = append(kept, m)
+			}
+			data["recent_facts"] = kept
+		}
+	}
 	b, err := json.Marshal(data)
 	if err != nil {
 		return "" // fall back silently: the worker just won't have the global context
@@ -525,7 +540,10 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
 	snap := newGraphSnapshot(ts) // overview + entry seed share one graph read
-	overview := renderWorkerGraphOverview(tsx.graphOverviewDataFrom(snap))
+	// 进场预塞先算(只读)：worker 的全局态势 overview 用它已带的事实 id 集合去重，
+	// 不把 seed 已含的相关事实在概览里再下发一遍(阶段三：减少每轮重复发送)。
+	entrySeed := loadWorkerEntrySeedFrom(ts, snap, as, intent)
+	overview := renderWorkerGraphOverview(tsx.graphOverviewDataFrom(snap), entrySeedFactIDSet(entrySeed))
 	proxyAddr, proxyCA := w.proxyForTask(taskID)
 	sysBody := workerSystem(proxyAddr, proxyCA, w.workDir, runDir, w.intranetForTask(taskID), w.footprintForTask(taskID))
 	if w.wantConstraints() {
@@ -554,7 +572,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	}
 	// 进场预塞：与本意图相关的已确认事实 + 已确认可达但未兑现的下一跳。
 	// 压缩/预取失败只打「图谱不完整」标记，fail-soft，不阻断进场、不写目标失败。
-	seedBlock := RenderWorkerEntrySeed(loadWorkerEntrySeedFrom(ts, snap, as, intent))
+	seedBlock := RenderWorkerEntrySeed(entrySeed)
 	sysBody += seedBlock
 	sysBody += w.credentialSeedBlock(ctx, taskID) // 无继承凭据或查询失败时为空串
 	sysBody += "\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。"
