@@ -638,8 +638,7 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 		case allowed := <-ch:
 			return allowed
 		case <-ctx.Done():
-			_, _ = i.db.ResolveInterceptCtx(ctx, pendingID, "denied", "deny", "工作已取消")
-			_ = i.db.CompleteInterceptCtx(ctx, pendingID, audit.RunID, audit.ToolUseID, "not_executed", "执行前工作已取消", false)
+			i.cancelPendingAsk(ctx, pendingID, audit)
 			return false
 		}
 	}
@@ -669,10 +668,16 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 		}
 		return allowed
 	case <-ctx.Done():
-		_, _ = i.db.ResolveInterceptCtx(ctx, pendingID, "denied", "deny", "工作已取消")
-		_ = i.db.CompleteInterceptCtx(ctx, pendingID, audit.RunID, audit.ToolUseID, "not_executed", "执行前工作已取消", false)
+		i.cancelPendingAsk(ctx, pendingID, audit)
 		return false
 	}
+}
+
+func (i *Interceptor) cancelPendingAsk(ctx context.Context, pendingID int64, audit *db.InterceptAudit) {
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	_, _ = i.db.ResolveInterceptCtx(writeCtx, pendingID, "denied", "deny", "工作已取消")
+	_ = i.db.CompleteInterceptCtx(writeCtx, pendingID, audit.RunID, audit.ToolUseID, "not_executed", "执行前工作已取消", false)
 }
 
 var ErrAlreadyDecided = errors.New("审批已处理或不存在，请刷新记录")
