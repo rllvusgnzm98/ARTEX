@@ -351,6 +351,15 @@ func (s *Server) agentRunSeconds(key string) int {
 	return a.RunSecs
 }
 
+func (s *Server) agentSettleSeconds(key string) int {
+	if s.m.pg != nil {
+		if a, err := s.m.pg.GetAgentByKey(key); err == nil && a != nil {
+			return a.SettleSecs
+		}
+	}
+	return 120
+}
+
 // loadLLMConfig reads the active LLM profile from PG (llm_profiles).
 func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	p, err := s.m.pg.ActiveProfile()

@@ -359,6 +359,7 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		MaxTurns         *int  `json:"max_turns"`
 		RunSeconds       *int  `json:"run_seconds"`
+		SettleSeconds    *int  `json:"settle_seconds"`
 		WebSearch        *bool `json:"web_search"`
 		InteractiveShell *bool `json:"interactive_shell"`
 		// llm_profile_id 三态:字段缺省=不动;显式 null=解绑(跟随任务/全局);数字=绑定该 profile。
@@ -407,6 +408,12 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 			rs = 0
 		}
 		if err := pg.SetAgentRunSeconds(a.Key, rs); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.SettleSeconds != nil {
+		if err := pg.SetAgentSettleSeconds(a.Key, *req.SettleSeconds); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
@@ -462,6 +469,9 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.RunSeconds != nil {
 		resp["run_seconds"] = *req.RunSeconds
+	}
+	if req.SettleSeconds != nil {
+		resp["settle_seconds"] = max(0, *req.SettleSeconds)
 	}
 	writeJSON(w, 200, resp)
 }

@@ -579,6 +579,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetTaskProxyResolver(s.m.TaskProxyForTask) // 每任务 MITM；空结果回落全局 SetProxy
 	wk.SetNoaEnabled(s.m.NoaCompactionEnabled)    // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	wk.SetRunTimeout(time.Duration(s.agentRunSeconds("worker")) * time.Second)
+	wk.SetSettleTimeout(time.Duration(s.agentSettleSeconds("worker")) * time.Second)
 	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)

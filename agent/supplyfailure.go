@@ -118,6 +118,9 @@ type RunSettlement struct {
 // A supply interrupt never settles as blocked, done, or a target failure, and
 // it never shares TerminalKind with an empty successful completion.
 func SettleWorkerRun(reason harness.TerminalReason, err error) RunSettlement {
+	if isRunBudgetError(err) {
+		return RunSettlement{IntentState: "exhausted", TerminalKind: TerminalBudgetExhausted, AllowRedispatch: true}
+	}
 	if class, ok := ClassifySupplyFailure(err); ok {
 		return RunSettlement{
 			IntentState:         SupplyIntentParkState,
