@@ -365,7 +365,9 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 const (
 	entrySeedFactCap    = 60
 	entrySeedKeyFactCap = 40
-	entrySeedDetailCap  = 600
+	// 阶段三(上下文控制)：关键事实(否定结果/范围限制/清理状态/带证据)保留内联细节但裁剪；
+	// 普通事实只给摘要，完整细节改为按需 node_detail 回查，不再每轮随 system prompt 重复下发。
+	entrySeedKeyDetailCap = 300
 )
 
 func clipRunes(s string, n int) string {
@@ -405,6 +407,7 @@ func RenderWorkerEntrySeed(seed WorkerEntrySeed) string {
 
 	b.WriteString("\n\n【进场预塞：相关事实与任务关键限制/证据】\n")
 	fmt.Fprintf(&b, "关键事实优先（最多 %d 条，保留最早记录）；其余位置补最新相关普通事实，总计最多 %d 条。\n", entrySeedKeyFactCap, entrySeedFactCap)
+	b.WriteString("普通事实只列摘要（含 evidence_ids、资产、来源意图），完整细节用 node_detail 查；关键事实保留裁剪后的细节。\n")
 	var keys, general []EntryFact
 	for _, fact := range seed.ConfirmedFacts {
 		if isKeyFact(fact.Category, fact.EvidenceIDs) {
@@ -449,8 +452,10 @@ func RenderWorkerEntrySeed(seed WorkerEntrySeed) string {
 			fmt.Fprintf(&b, "［来自意图 #%d］", f.FromIntent)
 		}
 		b.WriteByte('\n')
-		if d := strings.TrimSpace(f.Detail); d != "" {
-			fmt.Fprintf(&b, "  细节：%s\n", clipRunes(d, entrySeedDetailCap))
+		// 阶段三：只对关键事实内联(裁剪后的)细节；普通事实的细节改走按需 node_detail 回查，
+		// 不再每轮随 system prompt 重复下发(摘要+evidence_ids 已足以感知与去重)。
+		if d := strings.TrimSpace(f.Detail); d != "" && isKeyFact(f.Category, f.EvidenceIDs) {
+			fmt.Fprintf(&b, "  细节：%s\n", clipRunes(d, entrySeedKeyDetailCap))
 		}
 	}
 
@@ -688,4 +693,19 @@ func overlapsSet(ids []int64, set map[int64]bool) bool {
 		}
 	}
 	return false
+}
+
+// entrySeedFactIDSet is the set of fact ids the entry seed already carries, used
+// to drop them from the worker's situational overview so the same facts are not
+// re-sent every turn in both the system prompt (seed) and the launch user message
+// (overview). Non-selected facts stay retrievable via list_facts / node_detail.
+func entrySeedFactIDSet(seed WorkerEntrySeed) map[int64]bool {
+	if len(seed.ConfirmedFacts) == 0 {
+		return nil
+	}
+	m := make(map[int64]bool, len(seed.ConfirmedFacts))
+	for _, f := range seed.ConfirmedFacts {
+		m[f.ID] = true
+	}
+	return m
 }

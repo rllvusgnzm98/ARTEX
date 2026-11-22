@@ -140,8 +140,14 @@ func TestRenderTmplCachesParsedTemplate(t *testing.T) {
 func TestRenderWorkerEntrySeedCapsFactsAndDetail(t *testing.T) {
 	var seed WorkerEntrySeed
 	seed.Prefetched = true
+	// 关键事实(带 category)保留内联细节 → 验证裁剪；普通事实(无 category/证据)不内联细节
+	// → 验证其长 detail 不再随每轮下发(阶段三)。混入两类，保留最新、丢最旧。
 	for i := 1; i <= entrySeedFactCap+5; i++ {
-		seed.ConfirmedFacts = append(seed.ConfirmedFacts, EntryFact{ID: int64(i), Summary: "s", Detail: strings.Repeat("长", entrySeedDetailCap+50)})
+		f := EntryFact{ID: int64(i), Summary: "s", Detail: strings.Repeat("长", entrySeedKeyDetailCap+50)}
+		if i%2 == 0 {
+			f.Category = "scope_limit" // key fact
+		}
+		seed.ConfirmedFacts = append(seed.ConfirmedFacts, f)
 	}
 	out := RenderWorkerEntrySeed(seed)
 	if strings.Contains(out, "fact #5 ") || !strings.Contains(out, "fact #6 ") || !strings.Contains(out, fmt.Sprintf("fact #%d ", entrySeedFactCap+5)) {
@@ -150,8 +156,23 @@ func TestRenderWorkerEntrySeedCapsFactsAndDetail(t *testing.T) {
 	if !strings.Contains(out, "另有 5 条") {
 		t.Fatal("must state how many facts were omitted")
 	}
-	if strings.Contains(out, strings.Repeat("长", entrySeedDetailCap+1)) || !strings.Contains(out, "已截断") {
-		t.Fatal("detail must be clipped")
+	// 关键事实的细节内联并裁剪到 entrySeedKeyDetailCap，未裁剪原文(+1 长)不应出现。
+	if strings.Contains(out, strings.Repeat("长", entrySeedKeyDetailCap+1)) || !strings.Contains(out, "已截断") {
+		t.Fatal("key-fact detail must be clipped")
+	}
+	// 普通事实的细节不再内联：全文里内联细节行(“  细节：”)只应来自渲染出的关键事实。
+	// 关键事实按类上限 entrySeedKeyFactCap 截断(本例 32 < 40，全部保留)。
+	keyFacts := 0
+	for _, f := range seed.ConfirmedFacts {
+		if isKeyFact(f.Category, f.EvidenceIDs) {
+			keyFacts++
+		}
+	}
+	if keyFacts > entrySeedKeyFactCap {
+		keyFacts = entrySeedKeyFactCap
+	}
+	if got := strings.Count(out, "  细节："); got != keyFacts {
+		t.Fatalf("only key facts may inline details: 细节 lines=%d key facts=%d", got, keyFacts)
 	}
 	if !utf8.ValidString(out) {
 		t.Fatal("clipping must be UTF-8 safe")
