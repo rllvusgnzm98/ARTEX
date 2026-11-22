@@ -64,6 +64,8 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 
 逐条细节和状态见 [docs/待办任务.md](docs/待办任务.md)。
 
+运行优化的**阶段 1–3 已合并**：补齐调用归因和规划轮次观测、给 worker 预留有界收尾预算，并减少重复下发的事实细节。配置见下方「运行预算与诊断」，实现边界见「运行观测、预算与上下文控制」。
+
 ## 审批记录详情
 
 全局「审批记录」、任务内「拦截审批」及对话中的审批卡片均支持展开查看详情。展示结构参考
@@ -281,6 +283,25 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 
 **常用参数**：`./start.sh -addr :8787 -proxy 127.0.0.1:8788`（`-addr` 前端+API，`-proxy` 流量录制代理）。启动脚本会把参数原样透传给 `artex`。
 
+### 运行预算与诊断
+
+- **worker 收尾预留**：配置保存在数据库 `agents.settle_seconds`，默认 **120 秒**；可通过需认证的 `PATCH /api/agents/worker` 提交 `{"settle_seconds":120}` 修改。它不是 `config.json` 项，也不是环境变量。`run_seconds` 仍是单次运行的总墙钟上限，预留时间包含在总预算内，不额外延长运行；实际预留夹在 `[0, 总预算/4]`，负值保存为 0，设为 0 不启用这段预留与恢复收尾。任务剩余时间还会夹逼总预算。
+- **进程心跳**：每 **60 秒**输出一次 `[heartbeat]`，包括运行任务数、engine/LLM 在途数、距最近 LLM 开始/结束的秒数、数据库连接池使用/空闲数与等待增量、goroutine 数。它用于发现时间空档，单凭心跳不能区分宿主机挂起与进程停顿；不要与任务的 planner 心跳配置混淆。
+- **本机性能诊断**：`ARTEX_PPROF_ADDR` 默认不设（不启动）。例如 `ARTEX_PPROF_ADDR=127.0.0.1:6060`，通过独立 HTTP 服务访问 `/debug/pprof/`；只允许 loopback IP 或 `localhost`（也支持 `[::1]:6060`），不接受空 host 或 `0.0.0.0`。该服务不走业务 JWT 鉴权，请勿通过反向代理公开。
+
+### 任务统计 API
+
+`GET /api/tasks/{id}/stats` **需要 JWT 认证**，返回三组统计（不是逐意图/逐轮次明细）：
+
+| 返回字段 | 内容 |
+| --- | --- |
+| `intent_counts` | 按意图状态计数的对象；没有记录的状态不会补零 |
+| `plan_rounds` | `count`、`duration_ms_sum`、`duration_ms_avg`、`llm_calls`，以及 `outcomes`（`ok` / `error` / `met` 各自计数） |
+| `llm_usage.by_worker` | 按 agent 通道 `worker` 分组的数组；每项含 `worker`、`calls`、`errors`、`input_tokens`、`output_tokens`、`cache_read_tokens`、`cache_write_tokens`、`latency_p50_ms`、`latency_p95_ms` |
+| `llm_usage.worker_calls_with_intent_id` / `worker_calls_without_intent_id` | 仅 worker 通道中带 / 不带意图归因的调用数，用来检查归因覆盖情况 |
+
+无调用时 `by_worker` 为 `[]`、计数为 0；无规划轮次时轮次计数、耗时与各 outcome 为 0。任务不存在返回 404，统计查询失败返回 500。逐意图和逐轮次的调用量、token 开销核对使用下文的数据库归因记录；接口不返回金额。
+
 ### 安全相关的几个开关
 
 都有默认值，不改也能跑；改的时候知道自己在改什么就行。
@@ -479,6 +500,39 @@ sequenceDiagram
   DB-->>EV: 图变更
   EV-->>P: 再次唤醒(闭环)
 ```
+
+### 运行观测、预算与上下文控制
+
+#### 阶段 1：调用归因与规划轮次
+
+- `llm_usage` 新增可空的 `intent_id`、`worker_instance`、`plan_round`，并增加 `(task_id, intent_id)` 索引。池内和独立 worker 执行时绑定意图/实例归因，常规和最终 planner 轮次绑定轮次归因，`Stream` / `Complete` 都计数。历史或非该路径调用可能没有归因，不能把缺失值当成某条意图的开销。
+- `plan_rounds` 按 `(task_id, round)` 记录 `started_at`、`duration_ms`、`trigger_src`、`trigger_count`、`llm_calls`、`intents_added`、`intents_cancelled`、`outcome`（`ok` / `error` / `met`）。新增意图按成功落库逐条计数，取消在 worker 持久化 `stopped` 后计数，迟到的取消会更新发起轮次。重启后从该表和 `llm_usage.plan_round` 的最大值恢复轮号，避免复用中断轮次。
+- 核对开销时，以 `task_id` 限定任务：worker 按 `intent_id` 聚合 `llm_usage` 的调用数、错误数、输入/输出及缓存 token，再用 `worker_instance` 区分实例；planner 按 `plan_round` 聚合并与 `plan_rounds.round` 的 `llm_calls` 对照。任务统计 API 提供汇总，原始表保留逐调用与逐轮次信息。
+- 单次调用超时仍以 `CallTimeoutError` 表示；超时 WARN 增加分阶段耗时：流式调用的首包时间、等待 provider、下游 `yield` 内耗时、超时到返回的延迟；非流式 `Complete` 记录总耗时与超时后返回延迟。分阶段日志用于定位等待位置，不代表这些阶段各有独立超时配置。
+
+#### 阶段 2：有界运行与恢复收尾
+
+worker 以任务时间夹逼后的单次总预算为 `total`，运行开始为 `start`，收尾预留为 `settle`：
+
+```text
+workDeadline = start + total - settle
+hardDeadline = start + total
+SDK MaxDuration = total - settle
+```
+
+`agent/runbudget.go` 的 provider 包装同时约束 `Stream` 和 `Complete`：工作截止前开始的调用不超过 `workDeadline`，工作截止后开始的收尾调用不超过 `hardDeadline`；原有单次调用 timeout 更早时仍优先生效。运行预算到期返回 typed `RunBudgetError`（可解包为 `context.DeadlineExceeded`），与 `CallTimeoutError` 区分。
+
+因这两类错误退出时，`agent/worker_settlement.go` 的 `recoverSettlement` 最多恢复同一会话一次，沿用收尾提示词和轮数上限、移除 `Bash`，不再递归触发 SDK 收尾。运行预算错误的恢复只用到 `hardDeadline`；单次调用超时的恢复最多使用 `min(settle, 剩余总预算)`。未启用预留、上下文已取消或剩余不足 5 秒时跳过。恢复写回计入本次 `tsx.Writes()`，每次恢复输出一条 `[worker settlement]` 日志。运行预算耗尽映射为意图 `exhausted`，单次调用超时仍为可恢复的 `open`，不把供应侧超时当作目标测试失败。
+
+热路径的图节点/链接/状态、约束、资产与任务范围、漏洞/证据事务写入，以及 frontier/claim 读取使用 caller/tool context，取消会中止等待；计量与终态写入（LLM 使用/记录、工具/技能使用、activity、意图终态/blocked）则使用 `context.WithoutCancel` 并加 **3 秒**超时，避免运行取消吞掉最终记账与状态，也避免无限等待数据库。审批创建/处理传递 hook context，取消后的审批收尾同样有界。
+
+#### 阶段 3：可回查事实不再反复内联
+
+- `agent/worker_entry.go` 的 `entry_seed` 普通事实保留摘要、`evidence_ids`、资产和来源意图，不再内联长 `detail`，完整细节按需用 `node_detail` 回查。关键事实仍内联细节，裁剪上限从 **600 降为 300 个 rune**；判定为非空且非 `general` 的类别（如否定结果、范围限制、清理状态），或带证据的事实。事实选择逻辑不变：总计最多 60 条，其中关键事实最多 40 条。
+- `agent/worker.go` 的 `renderWorkerGraphOverview` 仅从 worker 的 `recent_facts` 中移除 seed **实际渲染过**的事实；因上限被裁掉的事实不会被误去重。planner 的 `graph_overview` 不受影响，worker 的 `cold_digests` 折叠正文仍保留。所有事实/漏洞仍完整留在图谱，可通过 `list_facts` / `node_detail` 回查。
+- [PR #43](https://github.com/rllvusgnzm98/ARTEX/pull/43) 的 `agent/context_budget_test.go` 用代表性成熟图谱（10 条关键事实、50 条带长细节的普通事实、20 条与 seed 重叠的 recent_facts、10 条带正文的 cold_digest）比较 **rune 数**：entry_seed `42142 → 10062`，overview `4939 → 2860`，静态 system `2222 → 2222`。可回查的重复上下文（seed + overview）减少约 **72.6%**；含静态 system 的整轮固定上下文减少约 **69.3%**。这是固定测试样例的字符口径，不是线上 token、费用或任务耗时的实测降幅。
+
+以上仅为已落地的阶段 1–3；阶段 4 的 replan 冷却**未实现**。
 
 ### worker 间的过程级信息交换
 
