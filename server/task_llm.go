@@ -588,7 +588,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetNonStreaming(plannerRuntime.nonStreaming)
 	pl.SetMaxTokens(plannerRuntime.maxTokens)
 	pl.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
-	pl.SetKillWork(s.engine.KillWork)
+	pl.SetKillWork(s.engine.killWorkAttributed)
 	pl.SetSteerWork(s.engine.SteerWork)
 	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	pl.SetUAResolver(s.uaForTask) // WebFetch 与 worker 共用按任务稳定 UA

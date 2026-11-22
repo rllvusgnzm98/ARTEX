@@ -29,7 +29,7 @@ type Planner struct {
 	window            int                                    // context window in tokens (for compaction)
 	windowFn          func() int                             // optional dynamic task-chain minimum
 	maxTurns          int                                    // max agent turns per run (0 = unlimited)
-	killWork          func(intentID int64) error             // engine callback to terminate a running work (nil = off)
+	killWork          func(context.Context, int64) error     // engine callback to terminate a running work (nil = off)
 	steerWork         func(intentID int64, msg string) error // engine callback to steer a running work mid-run (nil = off)
 	proxyAddr         string                                 // recording proxy for WebFetch (empty = direct)
 	proxyCACert       string                                 // recording proxy's CA cert path (HTTPS verify)
@@ -130,7 +130,7 @@ func (p *Planner) todoFor(expID int64) *actool.TodoStore {
 
 // SetKillWork wires the engine's per-work terminate callback so the planner's
 // kill_work tool can stop a single running worker.
-func (p *Planner) SetKillWork(fn func(intentID int64) error) { p.killWork = fn }
+func (p *Planner) SetKillWork(fn func(context.Context, int64) error) { p.killWork = fn }
 
 // SetSteerWork wires the engine's per-work steering callback so the planner's
 // steer_work tool can inject a mid-run course-correction into a running worker.

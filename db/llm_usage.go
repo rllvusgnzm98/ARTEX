@@ -13,17 +13,20 @@ import (
 // only the dimensions needed to slice token spend (model / profile / task / agent),
 // never any prompt or response content.
 type LLMUsage struct {
-	TaskID        string `json:"task_id"`        // task registry id (matches llm_records.task_id)
-	ExplorationID int64  `json:"exploration_id"` // exploration id parsed from the session (0 = unknown/non-task)
-	Worker        string `json:"worker"`         // agent lane: worker / planner / mainagent / goals
-	Model         string `json:"model"`
-	ProfileName   string `json:"profile_name"`
-	LatencyMs     int    `json:"latency_ms"`
-	InputTokens   int    `json:"input_tokens"`
-	OutputTokens  int    `json:"output_tokens"`
-	CacheRead     int    `json:"cache_read"`
-	CacheWrite    int    `json:"cache_write"`
-	Status        string `json:"status"` // ok | error
+	TaskID         string `json:"task_id"`        // task registry id (matches llm_records.task_id)
+	ExplorationID  int64  `json:"exploration_id"` // exploration id parsed from the session (0 = unknown/non-task)
+	Worker         string `json:"worker"`         // agent lane: worker / planner / mainagent / goals
+	IntentID       int64  `json:"intent_id"`
+	WorkerInstance string `json:"worker_instance"`
+	PlanRound      int64  `json:"plan_round"`
+	Model          string `json:"model"`
+	ProfileName    string `json:"profile_name"`
+	LatencyMs      int    `json:"latency_ms"`
+	InputTokens    int    `json:"input_tokens"`
+	OutputTokens   int    `json:"output_tokens"`
+	CacheRead      int    `json:"cache_read"`
+	CacheWrite     int    `json:"cache_write"`
+	Status         string `json:"status"` // ok | error
 }
 
 const llmUsageSchema = `
@@ -45,9 +48,26 @@ CREATE TABLE IF NOT EXISTS llm_usage (
 CREATE INDEX IF NOT EXISTS idx_llm_usage_task  ON llm_usage(task_id);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_model ON llm_usage(task_id, model);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_exp   ON llm_usage(exploration_id);
+ALTER TABLE llm_usage ADD COLUMN IF NOT EXISTS intent_id BIGINT;
+ALTER TABLE llm_usage ADD COLUMN IF NOT EXISTS worker_instance TEXT;
+ALTER TABLE llm_usage ADD COLUMN IF NOT EXISTS plan_round BIGINT;
+CREATE INDEX IF NOT EXISTS idx_llm_usage_task_intent ON llm_usage(task_id, intent_id);
+CREATE TABLE IF NOT EXISTS plan_rounds (
+    task_id TEXT NOT NULL,
+    round BIGINT NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL,
+    duration_ms BIGINT NOT NULL,
+    trigger_src TEXT NOT NULL,
+    trigger_count INTEGER NOT NULL,
+    llm_calls INTEGER NOT NULL,
+    intents_added INTEGER NOT NULL,
+    intents_cancelled INTEGER NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('ok', 'error', 'met')),
+    PRIMARY KEY (task_id, round)
+);
 `
 
-// EnsureLLMUsageTable creates the llm_usage metering table if it does not exist.
+// EnsureLLMUsageTable ensures the per-call and per-round metering schema.
 func (d *DB) EnsureLLMUsageTable() error {
 	tx, err := d.Begin()
 	if err != nil {
@@ -71,10 +91,11 @@ func (d *DB) InsertLLMUsage(u *LLMUsage) error {
 		expID = u.ExplorationID
 	}
 	_, err := d.Exec(`
-INSERT INTO llm_usage(task_id, exploration_id, worker, model, profile_name, latency_ms, input_tokens, output_tokens, cache_read, cache_write, status)
-VALUES (NULLIF($1,''),$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),$6,$7,$8,$9,$10,$11)`,
+INSERT INTO llm_usage(task_id, exploration_id, worker, model, profile_name, latency_ms, input_tokens, output_tokens, cache_read, cache_write, status, intent_id, worker_instance, plan_round)
+VALUES (NULLIF($1,''),$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),$6,$7,$8,$9,$10,$11,NULLIF($12::bigint,0),NULLIF($13,''),NULLIF($14::bigint,0))`,
 		u.TaskID, expID, u.Worker, u.Model, u.ProfileName,
-		u.LatencyMs, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.Status)
+		u.LatencyMs, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.Status,
+		u.IntentID, u.WorkerInstance, u.PlanRound)
 	return err
 }
 

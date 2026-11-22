@@ -14,6 +14,7 @@ import (
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -103,6 +104,9 @@ type Engine struct {
 	deleting sync.Map // taskID -> bool, delete barrier (no new task-owned writes)
 	dropCnt  sync.Map // taskID -> *int64, running count of dropped (unpersistable) activity records
 
+	lastLLMStart  atomic.Int64
+	lastLLMFinish atomic.Int64
+
 	// deleteMu makes installing the delete barrier atomic with registering a new
 	// task operation. Once BeginDelete returns, every admitted writer is reflected
 	// in inflight and every later writer is rejected.
@@ -160,9 +164,10 @@ type taskRuntime struct {
 }
 
 type workExecution struct {
-	cancel context.CancelCauseFunc
-	done   chan error
-	action string // user action: pause | cancel
+	cancel     context.CancelCauseFunc
+	done       chan error
+	action     string // user action: pause | cancel
+	plannerCtx context.Context
 }
 
 // nextPlannerRound returns the next planner round number for a task (1-based).
@@ -371,11 +376,13 @@ func (e *Engine) LastActivity(taskID string) int64 {
 // scheduler's task-operation counter. A task can have live loops while all of
 // them are waiting for a trigger; that state must remain idle in the UI.
 func (e *Engine) BeginLLMCall(taskID string) {
+	e.lastLLMStart.Store(time.Now().UnixNano())
 	v, _ := e.llmCalls.LoadOrStore(taskID, new(int64))
 	atomic.AddInt64(v.(*int64), 1)
 }
 
 func (e *Engine) EndLLMCall(taskID string) {
+	e.lastLLMFinish.Store(time.Now().UnixNano())
 	if v, ok := e.llmCalls.Load(taskID); ok {
 		p := v.(*int64)
 		if atomic.AddInt64(p, -1) <= 0 {
@@ -411,11 +418,17 @@ func (e *Engine) registerWork(intentID int64, cancel context.CancelCauseFunc) {
 // must be called after the final intent state write so a waiting cancel handler can
 // safely delete the worker's blackboard output without racing a late write.
 func (e *Engine) detachWork(intentID int64) (action string, complete func(error)) {
+	action, complete, _ = e.detachWorkAttributed(intentID)
+	return
+}
+
+func (e *Engine) detachWorkAttributed(intentID int64) (action string, complete func(error), plannerCtx context.Context) {
 	e.workMu.Lock()
 	run := e.work[intentID]
 	if run != nil {
 		delete(e.work, intentID)
 		action = run.action
+		plannerCtx = run.plannerCtx
 		run.cancel(agent.AbortWorkFinished) // release resources (no-op if already cancelled)
 	}
 	e.workMu.Unlock()
@@ -423,9 +436,9 @@ func (e *Engine) detachWork(intentID int64) (action string, complete func(error)
 	delete(e.steerBox, intentID) // drop any undelivered steering for a finished work
 	e.steerMu.Unlock()
 	if run == nil {
-		return action, func(error) {}
+		return action, func(error) {}, plannerCtx
 	}
-	return action, func(err error) { run.done <- err }
+	return action, func(err error) { run.done <- err }, plannerCtx
 }
 
 // ControlWork requests a user-visible pause or cancellation and waits until the
@@ -629,12 +642,20 @@ func (h steerHooks) Stop(ctx context.Context, messages []llm.Message) (bool, []s
 // KillWork cancels the in-flight work running intentID (planner's kill_work tool).
 // The work's agent-core session honors ctx cancellation and aborts promptly.
 func (e *Engine) KillWork(intentID int64) error {
+	return e.killWorkAttributed(context.Background(), intentID)
+}
+
+func (e *Engine) killWorkAttributed(ctx context.Context, intentID int64) error {
 	e.workMu.Lock()
 	run := e.work[intentID]
-	e.workMu.Unlock()
 	if run == nil {
+		e.workMu.Unlock()
 		return fmt.Errorf("意图 %d 当前没有运行中的 work（可能已结束或未被领取）", intentID)
 	}
+	if run.plannerCtx == nil && run.action == "" {
+		run.plannerCtx = ctx
+	}
+	e.workMu.Unlock()
 	run.cancel(agent.AbortKilledByPlanner)
 	return nil
 }
@@ -811,6 +832,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	// 触发第一轮规划。之后每次唤醒(边沿/心跳)都重臂 = 距上次任意规划触发的时长。
 	heartbeat := time.NewTimer(interval)
 	defer heartbeat.Stop()
+	e.restorePlanRoundCounter(ctx, t)
 
 	// runRound 跑一轮规划(含 debounce 合并 + 各 guard)。src 仅用于日志区分触发来源。
 	runRound := func(src string) {
@@ -881,15 +903,26 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		log.Printf("[planner] task %s 规划中…(%s 触发)", t.ID, src)
 		// round marker: each Plan() is one planner round; emit a boundary so the
 		// UI can separate rounds in the transcript (kind='round').
+		round := e.nextPlannerRound(t.ID)
 		e.emitActivity(t, db.Activity{Worker: "planner", Kind: "round",
-			Summary: fmt.Sprintf("第 %d 轮规划", e.nextPlannerRound(t.ID))})
+			Summary: fmt.Sprintf("第 %d 轮规划", round)})
 		// what fired this round (worker done / finding; may be several — debounce
 		// coalesces a burst; empty for time/heartbeat wakes).
 		triggers := t.drainTriggers()
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
+		ectx = llmrec.WithAttribution(ectx, 0, "planner", int64(round))
 		e.BeginLLMCall(t.ID)
+		started := time.Now()
 		met, reason, err := planner.Plan(ectx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit)
+		duration := time.Since(started)
 		e.EndLLMCall(t.ID)
+		outcome := "ok"
+		if err != nil {
+			outcome = "error"
+		} else if met {
+			outcome = "met"
+		}
+		calls := llmrec.CallCount(ectx)
 		switch {
 		case err != nil && ectx.Err() == nil:
 			log.Printf("[planner] task %s 规划出错: %v", t.ID, err)
@@ -907,6 +940,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			log.Printf("[planner] task %s 规划完成", t.ID)
 		}
 		e.touch(t.ID)
+		e.recordPlanRound(ectx, t, db.PlanRound{TaskID: t.ID, Round: int64(round), StartedAt: started,
+			DurationMS: duration.Milliseconds(), TriggerSrc: src, TriggerCount: len(triggers),
+			LLMCalls: calls, Outcome: outcome})
 	}
 
 	for {
@@ -1010,6 +1046,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	// per-work child context so the planner's kill_work can stop just this work.
 	workCtx, workCancel := context.WithCancelCause(ectx)
+	workCtx = llmrec.WithAttribution(workCtx, intent.ID, name, 0)
 	e.registerWork(intent.ID, workCancel)
 	// wrap the guard hooks so steer_work can inject a mid-run course-correction
 	// for THIS intent (drained before the worker's next tool call).
@@ -1069,7 +1106,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// work would be wrongly marked stopped.
 	workCause := context.Cause(workCtx)
 	killed := workCtx.Err() != nil && ectx.Err() == nil
-	action, completeWork := e.detachWork(intent.ID)
+	action, completeWork, plannerCtx := e.detachWorkAttributed(intent.ID)
 	// A caller may stop waiting and release its in-memory reservation before the
 	// agent honors cancellation. The named context cause remains authoritative and
 	// still settles the stopped run into a recoverable state.
@@ -1139,6 +1176,8 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	if killed {
 		if err := transitionIntentState(t.Store, intent.ID, "running", "stopped"); err != nil {
 			log.Printf("[worker %s] task %s 意图 #%d planner 停止落库失败: %v", name, t.ID, intent.ID, err)
+		} else {
+			llmrec.RecordIntentCancelled(plannerCtx)
 		}
 		log.Printf("[worker %s] task %s 意图 #%d 被终止(stopped)", name, t.ID, intent.ID)
 		e.touch(t.ID)

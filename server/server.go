@@ -285,6 +285,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	s.wireInterceptReviewer()      // LLM 兜底审批:未命中拦截规则的命令交给模型判定
 	s.bootJWTKeyRing(keyDir)       // 签名钥匙环；按龄轮换，并启动可停止的 6h 检查
 	s.registerEgressFingerprints() // 出口敏感指纹(只存哈希);profile/jwt/钥匙环已就绪后注册
+	go s.engine.processHeartbeat(s.ctx)
+	startPprof(s.ctx, os.Getenv("ARTEX_PPROF_ADDR"))
 	return s
 }
 
@@ -716,6 +718,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/task-templates/{id}", s.pgUpdateTaskTemplate)
 	mux.HandleFunc("DELETE /api/task-templates/{id}", s.pgDeleteTaskTemplate)
 	mux.HandleFunc("GET /api/tasks/{id}", s.getTask)
+	mux.HandleFunc("GET /api/tasks/{id}/stats", s.taskStats)
 	mux.HandleFunc("PATCH /api/tasks/{id}", s.updateTaskMetadata)
 	mux.HandleFunc("PATCH /api/tasks/{id}/category", s.updateTaskCategory)
 	// 任务级资产拦截/允许规则
