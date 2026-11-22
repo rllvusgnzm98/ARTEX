@@ -1,9 +1,39 @@
 package traffic
 
 import (
+	"sort"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestPacerConcurrentReservationsStaySpaced(t *testing.T) {
+	const requests = 64
+	base := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	interval := 25 * time.Millisecond
+	p := newPacerInterval(interval, 1)
+	p.now = func() time.Time { return base }
+	start := make(chan struct{})
+	slots := make(chan time.Time, requests)
+	var wg sync.WaitGroup
+	for range requests {
+		wg.Go(func() { <-start; slots <- p.reserve("same.example") })
+	}
+	close(start)
+	wg.Wait()
+	close(slots)
+	var ordered []time.Time
+	for slot := range slots {
+		ordered = append(ordered, slot)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Before(ordered[j]) })
+	for i, slot := range ordered {
+		want := base.Add(time.Duration(i) * interval)
+		if !slot.Equal(want) {
+			t.Fatalf("concurrent reservation %d: %v want %v", i, slot, want)
+		}
+	}
+}
 
 func TestPacerReserve(t *testing.T) {
 	base := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
