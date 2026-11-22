@@ -474,14 +474,6 @@ func renderWorkerGraphOverview(data map[string]any, seedFactIDs map[int64]bool) 
 			data["recent_facts"] = kept
 		}
 	}
-	// cold_digests：worker 视图只需知道冷区折叠了哪些(id/成员数)，折叠正文用 expand_digest
-	// 回查即可，不必每轮把正文重复下发。
-	if cds, ok := data["cold_digests"].([]map[string]any); ok && len(cds) > 0 {
-		for _, m := range cds {
-			delete(m, "body")
-		}
-		data["cold_digests_note"] = "折叠正文已省略，用 expand_digest(id) 查某个冷区的成员。"
-	}
 	b, err := json.Marshal(data)
 	if err != nil {
 		return "" // fall back silently: the worker just won't have the global context
