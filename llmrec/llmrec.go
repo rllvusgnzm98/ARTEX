@@ -171,7 +171,7 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 			r.recordUsage(ctx, session, taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), status)
 			// Heavy trace row — only when body recording is on.
 			if recordBodies {
-				r.record(req, session, taskID, worker, reqBody, capt, start, textBuf.String(), thinkingBuf.String(), usage, stopReason, err)
+				r.record(ctx, req, session, taskID, worker, reqBody, capt, start, textBuf.String(), thinkingBuf.String(), usage, stopReason, err)
 			}
 		}
 		defer func() { finish(ctx.Err()) }()
@@ -249,7 +249,7 @@ func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 	}
 	r.recordUsage(ctx, session, taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), status)
 	if recordBodies {
-		r.record(req, session, taskID, worker, reqBody, capt, start, msg.Text(), thinkingText(msg), usage, stopReason, err)
+		r.record(ctx, req, session, taskID, worker, reqBody, capt, start, msg.Text(), thinkingText(msg), usage, stopReason, err)
 	}
 	return msg, stopReason, usage, err
 }
@@ -275,7 +275,9 @@ func (r *Recorder) recordUsage(ctx context.Context, session, taskID string, expI
 		return
 	}
 	intentID, instance, planRound := attributionFrom(ctx, session)
-	err := r.pg.InsertLLMUsage(&db.LLMUsage{
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	err := r.pg.InsertLLMUsageCtx(writeCtx, &db.LLMUsage{
 		TaskID:         taskID,
 		ExplorationID:  expID,
 		Worker:         worker,
@@ -299,7 +301,7 @@ func (r *Recorder) recordUsage(ctx context.Context, session, taskID string, expI
 // record persists one LLM call to PostgreSQL before the provider stream returns.
 // Keeping the write inside the owning task operation means task deletion can
 // drain calls and then remove records without a late async insert recreating one.
-func (r *Recorder) record(req llm.CompletionRequest, session, taskID, worker, reqBody string, capt *Capture, start time.Time, text, thinking string, usage llm.Usage, stopReason string, streamErr error) {
+func (r *Recorder) record(ctx context.Context, req llm.CompletionRequest, session, taskID, worker, reqBody string, capt *Capture, start time.Time, text, thinking string, usage llm.Usage, stopReason string, streamErr error) {
 	latency := int(time.Since(start).Milliseconds())
 	status := "ok"
 	errMsg := ""
@@ -352,7 +354,9 @@ func (r *Recorder) record(req llm.CompletionRequest, session, taskID, worker, re
 		RawResponse: capt.RawResponse(),
 	}
 
-	if err := r.pg.InsertLLMRecord(rec); err != nil {
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if err := r.pg.InsertLLMRecordCtx(writeCtx, rec); err != nil {
 		log.Printf("[llmrec] insert: %v", err)
 	}
 }

@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -110,6 +111,10 @@ func (d *DB) ToggleInterceptRule(id int64, enabled bool) error {
 // convID == 0 → conversation_id stored as NULL (background task).
 // taskID == "" → task_id stored as NULL.
 func (d *DB) CreateInterceptPending(ruleID, convID int64, taskID, agentName, toolName string, input []byte, reason string, audits ...*InterceptAudit) (int64, error) {
+	return d.CreateInterceptPendingCtx(context.Background(), ruleID, convID, taskID, agentName, toolName, input, reason, audits...)
+}
+
+func (d *DB) CreateInterceptPendingCtx(ctx context.Context, ruleID, convID int64, taskID, agentName, toolName string, input []byte, reason string, audits ...*InterceptAudit) (int64, error) {
 	raw := json.RawMessage(input)
 	if len(raw) == 0 {
 		raw = json.RawMessage("{}")
@@ -128,7 +133,7 @@ func (d *DB) CreateInterceptPending(ruleID, convID int64, taskID, agentName, too
 		ruleIDPtr = &ruleID
 	}
 	var id int64
-	err := d.QueryRow(`
+	err := d.QueryRowContext(ctx, `
 INSERT INTO intercept_pending(rule_id, conversation_id, task_id, agent_name, tool_name, tool_input, reason, decision_source, audit)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
 		ruleIDPtr, convIDPtr, taskIDPtr, agentName, toolName, raw, reason, interceptSource(ruleID, reason), firstAudit(audits)).Scan(&id)
@@ -146,6 +151,10 @@ func (d *DB) DecideInterceptPending(id int64, status string) error {
 // rule matches for observability — they don't block and need no user action, so unlike
 // CreateInterceptPending (which starts 'pending') this records the outcome directly.
 func (d *DB) CreateDecidedIntercept(ruleID, convID int64, taskID, agentName, toolName string, input []byte, status, reason string, audits ...*InterceptAudit) (int64, error) {
+	return d.CreateDecidedInterceptCtx(context.Background(), ruleID, convID, taskID, agentName, toolName, input, status, reason, audits...)
+}
+
+func (d *DB) CreateDecidedInterceptCtx(ctx context.Context, ruleID, convID int64, taskID, agentName, toolName string, input []byte, status, reason string, audits ...*InterceptAudit) (int64, error) {
 	raw := json.RawMessage(input)
 	if len(raw) == 0 {
 		raw = json.RawMessage("{}")
@@ -164,7 +173,7 @@ func (d *DB) CreateDecidedIntercept(ruleID, convID int64, taskID, agentName, too
 		ruleIDPtr = &ruleID
 	}
 	var id int64
-	err := d.QueryRow(`
+	err := d.QueryRowContext(ctx, `
 INSERT INTO intercept_pending(rule_id, conversation_id, task_id, agent_name, tool_name, tool_input, status, reason, decided_at, decision_source, audit)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), $9, $10) RETURNING id`,
 		ruleIDPtr, convIDPtr, taskIDPtr, agentName, toolName, raw, status, reason, interceptSource(ruleID, reason), firstAudit(audits)).Scan(&id)

@@ -571,7 +571,7 @@ func (i *Interceptor) Log(ctx context.Context, convID int64, dec Decision, toolN
 	taskID, agentName := taskInfoFromCtx(ctx)
 	audit := auditFor(ctx, dec, input, status)
 	stored := RedactStoredToolInput(toolName, input)
-	id, err := i.db.CreateDecidedIntercept(dec.RuleID, convID, taskID, agentName, toolName, stored, status, dec.Message, audit)
+	id, err := i.db.CreateDecidedInterceptCtx(ctx, dec.RuleID, convID, taskID, agentName, toolName, stored, status, dec.Message, audit)
 	if err == nil {
 		i.bindResult(ctx, id, audit)
 	}
@@ -597,7 +597,7 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 
 	audit := auditFor(ctx, dec, input, "pending")
 	stored := RedactStoredToolInput(toolName, input)
-	pendingID, err := i.db.CreateInterceptPending(ruleID, convID, taskID, agentName, toolName, stored, dec.Message, audit)
+	pendingID, err := i.db.CreateInterceptPendingCtx(ctx, ruleID, convID, taskID, agentName, toolName, stored, dec.Message, audit)
 	if err != nil {
 		return false
 	}
@@ -638,8 +638,7 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 		case allowed := <-ch:
 			return allowed
 		case <-ctx.Done():
-			_, _ = i.db.ResolveIntercept(pendingID, "denied", "deny", "工作已取消")
-			_ = i.db.CompleteIntercept(pendingID, audit.RunID, audit.ToolUseID, "not_executed", "执行前工作已取消", false)
+			i.cancelPendingAsk(ctx, pendingID, audit)
 			return false
 		}
 	}
@@ -659,7 +658,7 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 		if allowed {
 			action = "allow"
 		}
-		resolved, err := i.db.ResolveIntercept(pendingID, "timeout", action, "审批超时，按超时策略处理")
+		resolved, err := i.db.ResolveInterceptCtx(ctx, pendingID, "timeout", action, "审批超时，按超时策略处理")
 		if err != nil {
 			return false
 		}
@@ -669,10 +668,16 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 		}
 		return allowed
 	case <-ctx.Done():
-		_, _ = i.db.ResolveIntercept(pendingID, "denied", "deny", "工作已取消")
-		_ = i.db.CompleteIntercept(pendingID, audit.RunID, audit.ToolUseID, "not_executed", "执行前工作已取消", false)
+		i.cancelPendingAsk(ctx, pendingID, audit)
 		return false
 	}
+}
+
+func (i *Interceptor) cancelPendingAsk(ctx context.Context, pendingID int64, audit *db.InterceptAudit) {
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	_, _ = i.db.ResolveInterceptCtx(writeCtx, pendingID, "denied", "deny", "工作已取消")
+	_ = i.db.CompleteInterceptCtx(writeCtx, pendingID, audit.RunID, audit.ToolUseID, "not_executed", "执行前工作已取消", false)
 }
 
 var ErrAlreadyDecided = errors.New("审批已处理或不存在，请刷新记录")

@@ -233,7 +233,7 @@ func (t *ToolSet) SetOwnerNode(id int64) { t.ownerNode = id }
 // this no longer affects which assets a task can read.
 func (t *ToolSet) anchorOwner(assetID int64) {
 	if t.ts != nil && t.ownerNode > 0 && assetID > 0 {
-		_ = t.ts.Anchor(t.ownerNode, assetID)
+		_ = t.ts.AnchorCtx(context.Background(), t.ownerNode, assetID)
 	}
 }
 
@@ -981,7 +981,7 @@ func (t *ToolSet) listFacts() actool.CoreTool {
 			"before": intp("分页游标：只返回 id 小于该值的更旧事实；省略或 0 = 最新一页"),
 			"q":      str("按事实摘要关键词过滤（不区分大小写）；省略 = 不过滤"),
 		}),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				Limit  int    `json:"limit"`
 				Before int64  `json:"before"`
@@ -1030,7 +1030,7 @@ func compactFact(n *db.Node) map[string]any {
 func (t *ToolSet) nodeDetail() actool.CoreTool {
 	return t.readExpTool("node_detail", "按 id 取本任务或直接关联任务的【探索图节点】完整内容。继承节点带 source_task_id/inherited=true 且只读。仅限 list_facts/list_findings/graph_overview 返回的探索节点 id；资产请用 list_assets/asset_neighbors。",
 		obj(map[string]any{"id": idp("探索图节点 id(非资产 id)")}, "id"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				ID json.RawMessage `json:"id"`
 			}
@@ -1069,6 +1069,10 @@ type intentItem struct {
 // 节点（不能挂在别的意图/目标/提示上）。顶层全新方向留空 parent_ids，兜底连 origin fact。
 // 这样"每个意图都连到 fact 节点、且是发现驱动而非凭空规划"从创建路径上被强制。
 func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
+	return t.addOneIntentCtx(context.Background(), it)
+}
+
+func (t *ToolSet) addOneIntentCtx(ctx context.Context, it intentItem) (int64, error) {
 	if strings.TrimSpace(it.Summary) == "" {
 		return 0, fmt.Errorf("summary 不能为空")
 	}
@@ -1116,21 +1120,21 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	if len(tags) > 0 {
 		payload["chain_tags"] = tags
 	}
-	id, err := t.ts.AddIntent(payload, priority, anchors, "planner")
+	id, err := t.ts.AddIntentCtx(ctx, payload, priority, anchors, "planner")
 	if err != nil {
 		return 0, err
 	}
 	// upstream lineage: link each (validated) fact/finding parent → this intent, so
 	// "multiple facts combine into one new intent" is expressible.
 	for _, parent := range parents {
-		_ = t.ts.Link(parent, db.RelDerivedFrom, id)
+		_ = t.ts.LinkCtx(ctx, parent, db.RelDerivedFrom, id)
 	}
 	// a top-level intent (no explicit parent) connects to the origin fact, so every
 	// intent still traces back to a fact node — at task start the only fact is the
 	// origin, and the first intents derive from it.
 	if len(parents) == 0 {
 		if origin, _ := t.ts.OriginFactID(); origin > 0 {
-			_ = t.ts.Link(origin, db.RelDerivedFrom, id)
+			_ = t.ts.LinkCtx(ctx, origin, db.RelDerivedFrom, id)
 		}
 	}
 	return id, nil
@@ -1163,7 +1167,7 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 			errs := map[string]string{}
 			createdAny := false
 			for i, it := range items {
-				id, err := t.addOneIntent(it)
+				id, err := t.addOneIntentCtx(ctx, it)
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
 					continue
@@ -1211,7 +1215,7 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			"evidence_id": idp("证明它的发现/事实节点 id"),
 			"reason":      str("为什么这个证据满足该目标"),
 		}, "goal_id", "evidence_id"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				GoalID     json.RawMessage `json:"goal_id"`
 				EvidenceID json.RawMessage `json:"evidence_id"`
@@ -1230,8 +1234,8 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			if err != nil || evidenceNode == nil || (evidenceNode.Kind != db.KindFact && evidenceNode.Kind != db.KindFinding) {
 				return actool.Errorf("evidence_id 必须是本任务或直接关联任务的事实/漏洞节点"), nil
 			}
-			_ = t.ts.Link(ev, db.RelProves, goal)
-			_ = t.ts.SetNodeState(goal, "met")
+			_ = t.ts.LinkCtx(ctx, ev, db.RelProves, goal)
+			_ = t.ts.SetNodeStateCtx(ctx, goal, "met")
 			// 每标记一个目标 met，就检查本任务是否【所有目标】都已 met；若是，自动判定
 			// 任务完成（置 GoalMet），无需再依赖模型显式调 goal_met。
 			if goals, err := t.ts.ListByKind(db.KindGoal, 1000); err == nil && len(goals) > 0 {
@@ -1255,7 +1259,7 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 func (t *ToolSet) goalMet() actool.CoreTool {
 	return writeTool("goal_met", "【立即结束整个任务】——仅当你确认任务的【全部目标都已真正达成、整体收官】时才调（注意是任务【整体】完成；仅仅达成了其中某一个目标/某一个 flag/某一个漏洞【不算】——那种情况用 prove_goal 标记该目标即可）。⚠️它不是用来“结束本轮规划”的：本轮没有新意图要派、或在等 worker 产出，都【直接结束本轮即可，不要调本工具】（0 个意图是完全正常的）。正常判定优先用 prove_goal 逐个证明目标；goal_met 只是绕过逐个证明、直接从全局收官的手段。",
 		obj(map[string]any{"reason": str("达成理由（必须是目标真正达成的证据，不能是“本轮无新方向”这类结束本轮的理由）")}, "reason"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct{ Reason string }
 			_ = json.Unmarshal(in, &a)
 			t.GoalMet = true
@@ -1367,6 +1371,10 @@ type factItem struct {
 // recordOneFact 写一条 fact 节点并连到意图（intent→yields→fact）。defaultIntent 为
 // 批量时的默认意图（本条未给 intent_id 时用）。
 func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error) {
+	return t.recordOneFactCtx(context.Background(), it, defaultIntent)
+}
+
+func (t *ToolSet) recordOneFactCtx(ctx context.Context, it factItem, defaultIntent int64) (int64, error) {
 	if strings.TrimSpace(it.Summary) == "" {
 		return 0, fmt.Errorf("summary 不能为空")
 	}
@@ -1402,12 +1410,12 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 		}
 	}
 	// a fact is its OWN node kind (distinct from a vuln finding).
-	id, err := t.ts.AddNode(db.KindFact, payload, 5, "confirmed", t.worker, pidList(it.AssetIDs))
+	id, err := t.ts.AddNodeCtx(ctx, db.KindFact, payload, 5, "confirmed", t.worker, pidList(it.AssetIDs))
 	if err != nil {
 		return 0, err
 	}
 	if intent > 0 {
-		_ = t.ts.Link(intent, db.RelYields, id) // chain: intent -> fact
+		_ = t.ts.LinkCtx(ctx, intent, db.RelYields, id) // chain: intent -> fact
 	}
 	t.writes.Facts++
 	return id, nil
@@ -1438,7 +1446,7 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 		"  · confidence=observed（输出里直接看到）| inferred（据现象推断）。\n"+
 		"  · **否定类结论**（不可注入/端口关闭/未发现入口等）只写\"观察 + 试探性读法\"——陈述你实际看到什么，方向是否放弃由规划者综合全局定；务必给 evidence，手段没穷尽或证据弱（含只探一次、看起来像）标 inferred，确已穷尽且直接看到才标 observed。",
 		obj(props),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				Facts    []factItem `json:"facts"`
 				factItem            // 单条模式 + 批量默认 intent_id
@@ -1456,7 +1464,7 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 			ids := make([]int64, len(items))
 			errs := map[string]string{}
 			for i, it := range items {
-				id, err := t.recordOneFact(it, defaultIntent)
+				id, err := t.recordOneFactCtx(ctx, it, defaultIntent)
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
 					continue
@@ -1485,7 +1493,7 @@ type hintItem struct {
 }
 
 // addOneHint 挂一条 hint 节点(active/human)到探索图,可锚定资产,返回 id。
-func (t *ToolSet) addOneHint(it hintItem) (int64, error) {
+func (t *ToolSet) addOneHint(ctx context.Context, it hintItem) (int64, error) {
 	if len(it.TrafficRefs) > 0 && !findingTrafficBindingEnabled() {
 		return 0, fmt.Errorf("Agent 自动绑定流量已关闭，未保存携带 traffic_refs 的提示；可在系统设置开启，或仅交接文字")
 	}
@@ -1508,7 +1516,7 @@ func (t *ToolSet) addOneHint(it hintItem) (int64, error) {
 	}
 	// 唤醒 planner 不在此处逐条做——由 addHint 在整批写完后统一触发一次（带上提示文本），
 	// 避免一次 add_hint 多条提示逐条刷屏 planner 的触发行。
-	return t.ts.AddNode(db.KindHint, payload, 0, "active", "human", anchors)
+	return t.ts.AddNodeCtx(ctx, db.KindHint, payload, 0, "active", "human", anchors)
 }
 
 type goalItem struct {
@@ -1519,7 +1527,7 @@ type goalItem struct {
 // addOneGoal 挂一条 goal 节点(open)到探索图:连到任务根(origin fact,rel spawns)。
 // origin 取 t.worker(缺省 system):goals 拆解器写入的记 "goals"、主 agent 运行时记
 // "human"。唤醒 planner 由 setGoals 在整批写完后统一做(见下),这里只负责落库。
-func (t *ToolSet) addOneGoal(it goalItem) (int64, error) {
+func (t *ToolSet) addOneGoal(ctx context.Context, it goalItem) (int64, error) {
 	text := strings.TrimSpace(it.Text)
 	if text == "" {
 		return 0, fmt.Errorf("text 不能为空")
@@ -1532,12 +1540,12 @@ func (t *ToolSet) addOneGoal(it goalItem) (int64, error) {
 	if origin == "" {
 		origin = "system"
 	}
-	id, err := t.ts.AddNode(db.KindGoal, payload, 0, "open", origin, nil)
+	id, err := t.ts.AddNodeCtx(ctx, db.KindGoal, payload, 0, "open", origin, nil)
 	if err != nil {
 		return 0, err
 	}
 	if of, _ := t.ts.OriginFactID(); of > 0 && id > 0 {
-		_ = t.ts.Link(of, db.RelSpawns, id) // goals descend from the task root (origin fact)
+		_ = t.ts.LinkCtx(ctx, of, db.RelSpawns, id) // goals descend from the task root (origin fact)
 	}
 	return id, nil
 }
@@ -1554,7 +1562,7 @@ func (t *ToolSet) setGoals() actool.CoreTool {
 			"text":      str("[单条] 一个独立可验证的最终目标"),
 			"vulnclass": str("[单条] 对应漏洞类(若明确),如 SQLi/IDOR;业务逻辑目标可留空"),
 		}),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.ts == nil {
 				return actool.Errorf("set_goals 未启用: ExplorationStore 未初始化"), nil
 			}
@@ -1573,7 +1581,7 @@ func (t *ToolSet) setGoals() actool.CoreTool {
 			errs := map[string]string{}
 			var addedTexts []string
 			for i, it := range items {
-				id, err := t.addOneGoal(it)
+				id, err := t.addOneGoal(ctx, it)
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
 					continue
@@ -1619,7 +1627,7 @@ type constraintItem struct {
 
 // addOneConstraint 落一条操作约束到 task_constraints。origin 取 t.worker(缺省 system):
 // 拆解器写 "goals"、主 agent 写 "human"。
-func (t *ToolSet) addOneConstraint(it constraintItem) (int64, error) {
+func (t *ToolSet) addOneConstraint(ctx context.Context, it constraintItem) (int64, error) {
 	text := strings.TrimSpace(it.Text)
 	if text == "" {
 		return 0, fmt.Errorf("text 不能为空")
@@ -1631,7 +1639,7 @@ func (t *ToolSet) addOneConstraint(it constraintItem) (int64, error) {
 	if kind != "allow" && kind != "deny" {
 		return 0, fmt.Errorf("type 必须是 allow 或 deny")
 	}
-	return t.ts.AddConstraint(kind, text, t.worker)
+	return t.ts.AddConstraintCtx(ctx, kind, text, t.worker)
 }
 
 // setConstraints 给【本任务】新增操作约束(allow=允许做什么 / deny=禁止做什么)。既是目标
@@ -1648,7 +1656,7 @@ func (t *ToolSet) setConstraints() actool.CoreTool {
 			"text":        str("[单条] 一条操作约束的内容"),
 			"type":        str("[单条] allow(允许)或 deny(禁止);缺省按 deny 处理"),
 		}),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.ts == nil {
 				return actool.Errorf("set_constraints 未启用: ExplorationStore 未初始化"), nil
 			}
@@ -1665,7 +1673,7 @@ func (t *ToolSet) setConstraints() actool.CoreTool {
 			ids := make([]int64, len(items))
 			errs := map[string]string{}
 			for i, it := range items {
-				id, err := t.addOneConstraint(it)
+				id, err := t.addOneConstraint(ctx, it)
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
 					continue
@@ -1695,7 +1703,7 @@ func (t *ToolSet) addHint() actool.CoreTool {
 			"traffic_refs": HintTrafficSchema(),
 			"asset_ids":    map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "锚定的资产 id（可选，0/1/多个）"},
 		}),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				Hints    []hintItem `json:"hints"`
 				hintItem            // 单条模式：顶层 text/asset_ids
@@ -1711,7 +1719,7 @@ func (t *ToolSet) addHint() actool.CoreTool {
 			errs := map[string]string{}
 			var addedTexts []string
 			for i, it := range items {
-				id, err := t.addOneHint(it)
+				id, err := t.addOneHint(ctx, it)
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
 					continue

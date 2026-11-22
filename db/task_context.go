@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -560,7 +561,11 @@ func truncateUTF8(value string, maxBytes int) string {
 }
 
 func (s *ExplorationStore) SetIntentBlockedReason(id int64, reason string) error {
-	_, err := s.db.Exec(`UPDATE exploration_nodes
+	return s.SetIntentBlockedReasonCtx(context.Background(), id, reason)
+}
+
+func (s *ExplorationStore) SetIntentBlockedReasonCtx(ctx context.Context, id int64, reason string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE exploration_nodes
 SET state='blocked', blocked_reason=NULLIF($1,''), completed_at=now()
 WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, reason, id, s.expID)
 	return err

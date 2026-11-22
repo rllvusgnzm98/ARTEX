@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -91,6 +92,11 @@ func normalizeTaskAssetSource(source, summary string) (string, string, error) {
 // SetTaskAssetSource improves the generic trigger-created provenance for one
 // existing task association. It never creates or deletes an asset.
 func (s *AssetStore) SetTaskAssetSource(taskID, assetID int64, source, summary string, sourceNodeID *int64) error {
+	return s.SetTaskAssetSourceCtx(context.Background(), taskID, assetID, source, summary, sourceNodeID)
+}
+
+func (s *AssetStore) SetTaskAssetSourceCtx(ctx context.Context, taskID, assetID int64, source, summary string, sourceNodeID *int64) error {
+	s = s.withContext(ctx)
 	if taskID <= 0 || assetID <= 0 {
 		return fmt.Errorf("%w: task and asset ids must be positive", ErrTaskAssetInvalid)
 	}
@@ -110,9 +116,9 @@ SET source=EXCLUDED.source,
     source_node_id=COALESCE(EXCLUDED.source_node_id, task_asset_links.source_node_id)`
 	var result sql.Result
 	if s.tx != nil {
-		result, err = s.tx.Exec(query, taskID, assetID, source, summary, sourceNodeID)
+		result, err = s.tx.ExecContext(s.ctx, query, taskID, assetID, source, summary, sourceNodeID)
 	} else {
-		result, err = s.db.Exec(query, taskID, assetID, source, summary, sourceNodeID)
+		result, err = s.db.ExecContext(s.ctx, query, taskID, assetID, source, summary, sourceNodeID)
 	}
 	if err != nil {
 		return err
@@ -153,7 +159,10 @@ func (s *AssetStore) RegisterTaskAssetScopes(taskID int64, inputs []ScopeInput) 
 		return mutation, fmt.Errorf("%w: %v", ErrTaskAssetInvalid, err)
 	}
 
-	tx, err := s.db.Begin()
+	if s.ctx == nil {
+		s.ctx = context.Background()
+	}
+	tx, err := s.db.BeginTx(s.ctx, nil)
 	if err != nil {
 		return mutation, err
 	}
@@ -162,14 +171,14 @@ func (s *AssetStore) RegisterTaskAssetScopes(taskID int64, inputs []ScopeInput) 
 		return mutation, err
 	}
 	var taskExists bool
-	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM tasks WHERE id=$1 AND deleted_at IS NULL)`, taskID).Scan(&taskExists); err != nil {
+	if err := tx.QueryRowContext(s.ctx, `SELECT EXISTS(SELECT 1 FROM tasks WHERE id=$1 AND deleted_at IS NULL)`, taskID).Scan(&taskExists); err != nil {
 		return mutation, err
 	}
 	if !taskExists {
 		return mutation, ErrTaskAssetTaskNotFound
 	}
 
-	scoped := &AssetStore{db: s.db, company: s.company, tx: tx}
+	scoped := &AssetStore{db: s.db, company: s.company, tx: tx, ctx: s.ctx}
 	for _, rule := range parsed {
 		taskScope := TaskScope{
 			TaskID: taskID,

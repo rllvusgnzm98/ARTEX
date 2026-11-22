@@ -2,6 +2,7 @@ package db
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -195,21 +196,25 @@ func (s *ExplorationStore) Root() (description, goal string, err error) {
 
 // AddNode writes a typed reasoning node with optional anchors to asset ids.
 func (s *ExplorationStore) AddNode(kind string, payload map[string]any, priority int, state, origin string, anchors []int64) (int64, error) {
+	return s.AddNodeCtx(context.Background(), kind, payload, priority, state, origin, anchors)
+}
+
+func (s *ExplorationStore) AddNodeCtx(ctx context.Context, kind string, payload map[string]any, priority int, state, origin string, anchors []int64) (int64, error) {
 	raw, _ := json.Marshal(payload)
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
 	var id int64
-	if err := tx.QueryRow(`
+	if err := tx.QueryRowContext(ctx, `
 INSERT INTO exploration_nodes(exploration_id, kind, payload, priority, state, origin)
 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
 		s.expID, kind, string(raw), priority, state, origin).Scan(&id); err != nil {
 		return 0, err
 	}
 	for _, a := range anchors {
-		if _, err := tx.Exec(`INSERT INTO exploration_anchors(node_id, asset_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, id, a); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_anchors(node_id, asset_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, id, a); err != nil {
 			return 0, err
 		}
 	}
@@ -218,15 +223,23 @@ VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
 
 // AddIntent is a convenience: an open intent.
 func (s *ExplorationStore) AddIntent(payload map[string]any, priority int, anchors []int64, origin string) (int64, error) {
+	return s.AddIntentCtx(context.Background(), payload, priority, anchors, origin)
+}
+
+func (s *ExplorationStore) AddIntentCtx(ctx context.Context, payload map[string]any, priority int, anchors []int64, origin string) (int64, error) {
 	if origin == "" {
 		origin = "planner"
 	}
-	return s.AddNode("intent", payload, priority, "open", origin, anchors)
+	return s.AddNodeCtx(ctx, "intent", payload, priority, "open", origin, anchors)
 }
 
 // AddGoal writes a goal node (state open).
 func (s *ExplorationStore) AddGoal(payload map[string]any, origin string) (int64, error) {
-	return s.AddNode("goal", payload, 0, "open", origin, nil)
+	return s.AddGoalCtx(context.Background(), payload, origin)
+}
+
+func (s *ExplorationStore) AddGoalCtx(ctx context.Context, payload map[string]any, origin string) (int64, error) {
+	return s.AddNodeCtx(ctx, "goal", payload, 0, "open", origin, nil)
 }
 
 // OriginFactID returns this exploration's root fact id — the KindFact node with
@@ -248,16 +261,24 @@ func (s *ExplorationStore) OriginFactID() (int64, error) {
 // task may read any asset via search); it only preserves the reasoning trail.
 // Idempotent.
 func (s *ExplorationStore) Anchor(nodeID, assetID int64) error {
+	return s.AnchorCtx(context.Background(), nodeID, assetID)
+}
+
+func (s *ExplorationStore) AnchorCtx(ctx context.Context, nodeID, assetID int64) error {
 	if nodeID <= 0 || assetID <= 0 {
 		return nil
 	}
-	_, err := s.db.Exec(`INSERT INTO exploration_anchors(node_id, asset_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, nodeID, assetID)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO exploration_anchors(node_id, asset_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, nodeID, assetID)
 	return err
 }
 
 // Link adds a typed exploration edge (idempotent).
 func (s *ExplorationStore) Link(from int64, rel string, to int64) error {
-	_, err := s.db.Exec(`
+	return s.LinkCtx(context.Background(), from, rel, to)
+}
+
+func (s *ExplorationStore) LinkCtx(ctx context.Context, from int64, rel string, to int64) error {
+	_, err := s.db.ExecContext(ctx, `
 INSERT INTO exploration_edges(exploration_id, src_id, rel, dst_id) VALUES ($1,$2,$3,$4)
 ON CONFLICT (exploration_id, src_id, rel, dst_id) DO NOTHING`, s.expID, from, rel, to)
 	return err
@@ -266,7 +287,11 @@ ON CONFLICT (exploration_id, src_id, rel, dst_id) DO NOTHING`, s.expID, from, re
 // SetNodeState updates any node's state (never deletes). content_version bumps
 // so a folded member's state flip invalidates its digest's cached body (§5.3).
 func (s *ExplorationStore) SetNodeState(id int64, state string) error {
-	_, err := s.db.Exec(`UPDATE exploration_nodes SET state=$1, blocked_reason=NULL, content_version=content_version+1 WHERE id=$2 AND exploration_id=$3`, state, id, s.expID)
+	return s.SetNodeStateCtx(context.Background(), id, state)
+}
+
+func (s *ExplorationStore) SetNodeStateCtx(ctx context.Context, id int64, state string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE exploration_nodes SET state=$1, blocked_reason=NULL, content_version=content_version+1 WHERE id=$2 AND exploration_id=$3`, state, id, s.expID)
 	return err
 }
 
@@ -349,9 +374,13 @@ WHERE exploration_id=$1 AND kind='intent' AND state='blocked'`, s.expID)
 }
 
 func (s *ExplorationStore) SetIntentState(id int64, state string) error {
+	return s.SetIntentStateCtx(context.Background(), id, state)
+}
+
+func (s *ExplorationStore) SetIntentStateCtx(ctx context.Context, id int64, state string) error {
 	// terminal states stamp completed_at; reopening (back to open/running) clears it.
 	terminal := state == "done" || state == "blocked" || state == "exhausted" || state == "stopped"
-	_, err := s.db.Exec(`UPDATE exploration_nodes
+	_, err := s.db.ExecContext(ctx, `UPDATE exploration_nodes
 SET state=$1, blocked_reason=NULL, content_version=content_version+1, completed_at = CASE WHEN $4 THEN now() ELSE NULL END
 WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, state, id, s.expID, terminal)
 	return err
@@ -361,8 +390,12 @@ WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, state, id, s.expID, termin
 // state still matches expected. It is the state boundary used by pause/resume and
 // worker settlement, so a stale API read cannot overwrite a concurrent finish.
 func (s *ExplorationStore) CompareAndSetIntentState(id int64, expected, state string) (bool, error) {
+	return s.CompareAndSetIntentStateCtx(context.Background(), id, expected, state)
+}
+
+func (s *ExplorationStore) CompareAndSetIntentStateCtx(ctx context.Context, id int64, expected, state string) (bool, error) {
 	terminal := state == "done" || state == "blocked" || state == "exhausted" || state == "stopped"
-	res, err := s.db.Exec(`UPDATE exploration_nodes
+	res, err := s.db.ExecContext(ctx, `UPDATE exploration_nodes
 SET state=$1, blocked_reason=NULL, content_version=content_version+1, completed_at = CASE WHEN $5 THEN now() ELSE NULL END
 WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state=$4`, state, id, s.expID, expected, terminal)
 	if err != nil {
@@ -1164,10 +1197,14 @@ func (s *ExplorationStore) FindingIntentsTerminal() (map[int64]int64, error) {
 
 // Frontier returns open intents ordered by priority desc then id (FIFO tiebreak).
 func (s *ExplorationStore) Frontier(limit int) ([]*Node, error) {
+	return s.FrontierCtx(context.Background(), limit)
+}
+
+func (s *ExplorationStore) FrontierCtx(ctx context.Context, limit int) ([]*Node, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	rows, err := s.db.Query(`SELECT `+nodeCols+` FROM exploration_nodes
+	rows, err := s.db.QueryContext(ctx, `SELECT `+nodeCols+` FROM exploration_nodes
 WHERE exploration_id=$1 AND kind='intent' AND state='open'
 ORDER BY priority DESC, id ASC LIMIT $2`, s.expID, limit)
 	if err != nil {
@@ -1201,7 +1238,11 @@ WHERE exploration_id=$1 AND kind='goal' AND state='open')`, s.expID).Scan(&exist
 
 // ClaimIntent atomically moves an open intent to running. Returns true if claimed.
 func (s *ExplorationStore) ClaimIntent(id int64, owner string) (bool, error) {
-	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='running', owner=$1
+	return s.ClaimIntentCtx(context.Background(), id, owner)
+}
+
+func (s *ExplorationStore) ClaimIntentCtx(ctx context.Context, id int64, owner string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE exploration_nodes SET state='running', owner=$1
 WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state='open'`, owner, id, s.expID)
 	if err != nil {
 		return false, err
@@ -1233,12 +1274,16 @@ func (s *ExplorationStore) Stats() (map[string]int, error) {
 
 // AppendActivity records one worker step and returns its id.
 func (s *ExplorationStore) AppendActivity(a Activity) (int64, error) {
+	return s.AppendActivityCtx(context.Background(), a)
+}
+
+func (s *ExplorationStore) AppendActivityCtx(ctx context.Context, a Activity) (int64, error) {
 	metadata := a.Metadata
 	if len(metadata) == 0 {
 		metadata = json.RawMessage(`{}`)
 	}
 	var id int64
-	err := s.db.QueryRow(`
+	err := s.db.QueryRowContext(ctx, `
 INSERT INTO activity(exploration_id, node_id, worker, kind, tool, tool_use_id, is_error, summary, detail, metadata, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, main_seg)
 VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),$7,NULLIF($8,''),NULLIF($9,''),$10,$11,$12,$13,$14,$15)
 RETURNING id`, s.expID, a.NodeID, utf8Clean(a.Worker), utf8Clean(a.Kind), utf8Clean(a.Tool), utf8Clean(a.ToolUseID), a.IsError, utf8Clean(a.Summary), utf8Clean(a.Detail),

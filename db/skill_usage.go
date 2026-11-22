@@ -1,5 +1,7 @@
 package db
 
+import "context"
+
 import (
 	"database/sql"
 	"strings"
@@ -28,7 +30,11 @@ type SkillUsage struct {
 // InsertSkillUsage appends one ledger row. Best-effort: callers log and continue on
 // error (a lost metering row must never break a skill invocation).
 func (d *DB) InsertSkillUsage(u *SkillUsage) error {
-	_, err := d.Exec(`
+	return d.InsertSkillUsageCtx(context.Background(), u)
+}
+
+func (d *DB) InsertSkillUsageCtx(ctx context.Context, u *SkillUsage) error {
+	_, err := d.ExecContext(ctx, `
 INSERT INTO skill_usage(skill, agent_key, task_id, exploration_id, intent_id, session_id, args_len, found)
 VALUES ($1, NULLIF($2,''), $3, $4, $5, NULLIF($6,''), $7, $8)`,
 		u.Skill, u.AgentKey, nullIfZero(u.TaskID), nullIfZero(u.ExplorationID),

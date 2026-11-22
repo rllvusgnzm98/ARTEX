@@ -164,6 +164,8 @@ func EvaluateStopLoss(p StopLossPolicy, sig ProgressSignals) StopLossVerdict {
 // never as a target/goal failure, and never as a successful done.
 func IntentStateAfterRun(reason harness.TerminalReason, runErr error, loss StopLossVerdict) string {
 	switch {
+	case isRunBudgetError(runErr):
+		return "exhausted"
 	case IsCallTimeout(runErr):
 		return "open" // 墙钟超时 ≠ 目标失败,也不标 blocked;用户取消不走这条
 	case runErr != nil:

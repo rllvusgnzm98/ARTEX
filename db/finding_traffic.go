@@ -139,18 +139,22 @@ func TrafficSnapshotID(snapshot TrafficEvidenceSnapshot) string {
 // LockTaskEvidenceTx serializes writes with archive queueing (which locks the
 // same task row). Once queued, its snapshot must not acquire new evidence.
 func LockTaskEvidenceTx(tx *sql.Tx, taskID int64) error {
+	return LockTaskEvidenceTxCtx(context.Background(), tx, taskID)
+}
+
+func LockTaskEvidenceTxCtx(ctx context.Context, tx *sql.Tx, taskID int64) error {
 	if taskID == 0 {
 		return nil
 	}
 	var deleted sql.NullTime
-	if err := tx.QueryRow(`SELECT deleted_at FROM tasks WHERE id=$1 FOR UPDATE`, taskID).Scan(&deleted); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT deleted_at FROM tasks WHERE id=$1 FOR UPDATE`, taskID).Scan(&deleted); err != nil {
 		return err
 	}
 	if deleted.Valid {
 		return ErrTaskArchiveState
 	}
 	var state string
-	err := tx.QueryRow(`SELECT state FROM task_archives WHERE task_id=$1`, taskID).Scan(&state)
+	err := tx.QueryRowContext(ctx, `SELECT state FROM task_archives WHERE task_id=$1`, taskID).Scan(&state)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
@@ -185,6 +189,10 @@ func LockFindingEvidenceTx(tx *sql.Tx, findingID int64, version *int64) error {
 }
 
 func InsertEvidenceSnapshotTx(tx *sql.Tx, s TrafficEvidenceSnapshot) error {
+	return InsertEvidenceSnapshotTxCtx(context.Background(), tx, s)
+}
+
+func InsertEvidenceSnapshotTxCtx(ctx context.Context, tx *sql.Tx, s TrafficEvidenceSnapshot) error {
 	if s.ID != TrafficSnapshotID(s) {
 		return errors.New("证据快照元数据哈希不匹配")
 	}
@@ -195,7 +203,7 @@ func InsertEvidenceSnapshotTx(tx *sql.Tx, s TrafficEvidenceSnapshot) error {
 	if s.CreatedAt.IsZero() {
 		s.CreatedAt = time.Now().UTC()
 	}
-	_, err := tx.Exec(`INSERT INTO traffic_evidence_snapshots
+	_, err := tx.ExecContext(ctx, `INSERT INTO traffic_evidence_snapshots
 (id,source_traffic_id,captured_at,url,method,status,content_type,req_head,resp_head,req_hash,resp_hash,req_len,resp_len,created_at)
 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT(id) DO NOTHING`,
 		s.ID, s.SourceTrafficID, s.CapturedAt, s.URL, s.Method, s.Status, s.ContentType, s.ReqHead, s.RespHead, s.ReqHash, s.RespHash, s.ReqLen, s.RespLen, s.CreatedAt)
@@ -203,19 +211,23 @@ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT(id) DO NOTHIN
 }
 
 func AddFindingTrafficTx(tx *sql.Tx, findingID int64, prepared []PreparedTrafficEvidence) error {
+	return AddFindingTrafficTxCtx(context.Background(), tx, findingID, prepared)
+}
+
+func AddFindingTrafficTxCtx(ctx context.Context, tx *sql.Tx, findingID int64, prepared []PreparedTrafficEvidence) error {
 	var position int
-	if err := tx.QueryRow(`SELECT COALESCE(MAX(position)+1,0) FROM finding_traffic_bindings WHERE finding_id=$1`, findingID).Scan(&position); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(position)+1,0) FROM finding_traffic_bindings WHERE finding_id=$1`, findingID).Scan(&position); err != nil {
 		return err
 	}
 	changed := false
 	for _, item := range prepared {
-		if err := InsertEvidenceSnapshotTx(tx, item.Snapshot); err != nil {
+		if err := InsertEvidenceSnapshotTxCtx(ctx, tx, item.Snapshot); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`UPDATE traffic_evidence_snapshots SET unreferenced_at=NULL WHERE id=$1`, item.Snapshot.ID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE traffic_evidence_snapshots SET unreferenced_at=NULL WHERE id=$1`, item.Snapshot.ID); err != nil {
 			return err
 		}
-		res, err := tx.Exec(`INSERT INTO finding_traffic_bindings(finding_id,snapshot_id,role,note,position)
+		res, err := tx.ExecContext(ctx, `INSERT INTO finding_traffic_bindings(finding_id,snapshot_id,role,note,position)
 VALUES($1,$2,$3,$4,$5) ON CONFLICT(finding_id,snapshot_id) DO NOTHING`, findingID, item.Snapshot.ID, item.Ref.Role, item.Ref.Note, position)
 		if err != nil {
 			return err
@@ -340,12 +352,12 @@ type RecordedFinding struct {
 // ctx 由调用方传入本次事务所用的上下文（而非在内部取 context.Background）：
 // 事务内新加的推送事件写入同样应受调用方的取消与超时约束。
 func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, prepared []PreparedTrafficEvidence) (*RecordedFinding, error) {
-	if err := LockTaskEvidenceTx(tx, in.TaskID); err != nil {
+	if err := LockTaskEvidenceTxCtx(ctx, tx, in.TaskID); err != nil {
 		return nil, err
 	}
 	if in.TaskID > 0 {
 		var expID int64
-		if err := tx.QueryRow(`SELECT exploration_id FROM tasks WHERE id=$1`, in.TaskID).Scan(&expID); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT exploration_id FROM tasks WHERE id=$1`, in.TaskID).Scan(&expID); err != nil {
 			return nil, err
 		}
 		if expID != in.ExplorationID {
@@ -354,7 +366,7 @@ func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, pre
 	}
 	if in.IntentID > 0 {
 		var ok bool
-		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM exploration_nodes WHERE id=$1 AND exploration_id=$2 AND kind='intent')`, in.IntentID, in.ExplorationID).Scan(&ok); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM exploration_nodes WHERE id=$1 AND exploration_id=$2 AND kind='intent')`, in.IntentID, in.ExplorationID).Scan(&ok); err != nil {
 			return nil, err
 		}
 		if !ok {
@@ -363,17 +375,17 @@ func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, pre
 	}
 	payload, _ := json.Marshal(map[string]any{"vulnclass": in.VulnClass, "name": in.Name, "severity": in.Severity, "summary": in.Summary, "evidence": map[string]any{"by": in.Worker, "poc": in.Evidence}})
 	out := &RecordedFinding{}
-	if err := tx.QueryRow(`INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
+	if err := tx.QueryRowContext(ctx, `INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
 VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string(payload), in.Worker).Scan(&out.NodeID); err != nil {
 		return nil, err
 	}
 	for _, asset := range in.AssetIDs {
-		if _, err := tx.Exec(`INSERT INTO exploration_anchors(node_id,asset_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, out.NodeID, asset); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_anchors(node_id,asset_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, out.NodeID, asset); err != nil {
 			return nil, err
 		}
 	}
 	if in.IntentID > 0 {
-		if _, err := tx.Exec(`INSERT INTO exploration_edges(exploration_id,src_id,rel,dst_id) VALUES($1,$2,$3,$4)`, in.ExplorationID, in.IntentID, RelYields, out.NodeID); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_edges(exploration_id,src_id,rel,dst_id) VALUES($1,$2,$3,$4)`, in.ExplorationID, in.IntentID, RelYields, out.NodeID); err != nil {
 			return nil, err
 		}
 	}
@@ -382,7 +394,7 @@ VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string
 		assets = []int64{}
 	}
 	raw, _ := json.Marshal(assets)
-	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids)
+	if err := tx.QueryRowContext(ctx, `INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids)
 VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw)).Scan(&out.FindingID); err != nil {
 		return nil, err
 	}
@@ -399,7 +411,7 @@ VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, in.TaskID, out.NodeI
 		Summary:   in.Summary,
 		AssetIDs:  assets,
 	})
-	if err := AddFindingTrafficTx(tx, out.FindingID, prepared); err != nil {
+	if err := AddFindingTrafficTxCtx(ctx, tx, out.FindingID, prepared); err != nil {
 		return nil, err
 	}
 	var err error
