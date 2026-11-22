@@ -31,6 +31,9 @@ AND indexname='idx_llm_usage_task_intent' AND indexdef LIKE '%(task_id, intent_i
 		_, _ = d.Exec(`DELETE FROM plan_rounds WHERE task_id=$1`, taskID)
 	})
 	u := &LLMUsage{TaskID: taskID, IntentID: 4294967296, WorkerInstance: "work#2", PlanRound: 4, Status: "ok"}
+	if got, err := d.LatestPlanRound(t.Context(), taskID); err != nil || got != 0 {
+		t.Fatalf("empty latest=%d err=%v", got, err)
+	}
 	if err := d.InsertLLMUsage(u); err != nil {
 		t.Fatal(err)
 	}
@@ -51,8 +54,8 @@ AND indexname='idx_llm_usage_task_intent' AND indexdef LIKE '%(task_id, intent_i
 AND worker_instance IS NULL AND plan_round IS NULL`, taskID).Scan(&empty); err != nil || empty != 1 {
 		t.Fatalf("unattributed rows=%d err=%v", empty, err)
 	}
-	if got, err := d.LatestPlanRound(t.Context(), taskID); err != nil || got != 0 {
-		t.Fatalf("empty latest=%d err=%v", got, err)
+	if got, err := d.LatestPlanRound(t.Context(), taskID); err != nil || got != 4 {
+		t.Fatalf("usage-only latest=%d err=%v", got, err)
 	}
 	for i, outcome := range []string{"ok", "error", "met"} {
 		want := PlanRound{TaskID: taskID, Round: int64(i + 1), StartedAt: time.Now().UTC().Truncate(time.Microsecond),
@@ -75,7 +78,7 @@ intents_added,intents_cancelled,outcome FROM plan_rounds WHERE task_id=$1 AND ro
 			t.Fatal("duplicate primary key accepted")
 		}
 	}
-	if got, err := d.LatestPlanRound(t.Context(), taskID); err != nil || got != 3 {
+	if got, err := d.LatestPlanRound(t.Context(), taskID); err != nil || got != 4 {
 		t.Fatalf("latest=%d err=%v", got, err)
 	}
 	if err := d.InsertPlanRound(t.Context(), PlanRound{TaskID: taskID, Round: 4, StartedAt: time.Now(), Outcome: "invalid"}); err == nil {
