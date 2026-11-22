@@ -28,7 +28,9 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, r.TaskID, r.Round, r.StartedAt, r.Dura
 
 func (d *DB) LatestPlanRound(ctx context.Context, taskID string) (int64, error) {
 	var round int64
-	err := d.QueryRowContext(ctx, `SELECT COALESCE(max(round),0) FROM plan_rounds WHERE task_id=$1`, taskID).Scan(&round)
+	err := d.QueryRowContext(ctx, `SELECT GREATEST(
+(SELECT COALESCE(max(round),0) FROM plan_rounds WHERE task_id=$1),
+(SELECT COALESCE(max(plan_round),0) FROM llm_usage WHERE task_id=$1))`, taskID).Scan(&round)
 	return round, err
 }
 
