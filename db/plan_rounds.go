@@ -2,8 +2,22 @@ package db
 
 import (
 	"context"
+	"database/sql"
+	"strconv"
 	"time"
 )
+
+func deletePlanRoundsTx(tx *sql.Tx, taskID int64) error {
+	var exists bool
+	if err := tx.QueryRow(`SELECT to_regclass('plan_rounds') IS NOT NULL`).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	_, err := tx.Exec(`DELETE FROM plan_rounds WHERE task_id=$1`, strconv.FormatInt(taskID, 10))
+	return err
+}
 
 type PlanRound struct {
 	TaskID           string
