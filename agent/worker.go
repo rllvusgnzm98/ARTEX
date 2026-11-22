@@ -236,7 +236,7 @@ func defaultToolsExcept(exclude ...string) []actool.CoreTool {
 	out := make([]actool.CoreTool, 0, len(all))
 	for _, t := range all {
 		if !drop[t.Name()] {
-			out = append(out, t)
+			out = append(out, wrapConcurrentBash(t))
 		}
 	}
 	return out
