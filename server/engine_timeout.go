@@ -10,6 +10,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/llmrec"
 )
 
 // 任务级超时协调器(见 docs/任务级超时与收尾设计.md §4/§8.5)。
@@ -296,12 +297,27 @@ func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task) (met bool) {
 	}
 	defer e.decInflight(t.ID)
 	emit := func(r db.Activity) { e.emitActivity(t, r) }
+	e.restorePlanRoundCounter(fctx, t)
+	round := e.nextPlannerRound(t.ID)
+	fctx = llmrec.WithAttribution(fctx, 0, "planner", int64(round))
 	e.emitActivity(t, db.Activity{Worker: "planner", Kind: "round",
-		Summary: fmt.Sprintf("任务超时收尾·终局判定(第 %d 轮)", e.nextPlannerRound(t.ID))})
+		Summary: fmt.Sprintf("任务超时收尾·终局判定(第 %d 轮)", round)})
 	tTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
+	triggers := t.drainTriggers()
 	e.BeginLLMCall(t.ID)
-	met, reason, err := planner.Plan(fctx, tTaskID, e.m.assets, t.Store, t.Goal, t.drainTriggers(), emit)
+	started := time.Now()
+	met, reason, err := planner.Plan(fctx, tTaskID, e.m.assets, t.Store, t.Goal, triggers, emit)
+	duration := time.Since(started)
 	e.EndLLMCall(t.ID)
+	outcome := "ok"
+	if err != nil {
+		outcome = "error"
+	} else if met {
+		outcome = "met"
+	}
+	e.recordPlanRound(fctx, t, db.PlanRound{TaskID: t.ID, Round: int64(round), StartedAt: started,
+		DurationMS: duration.Milliseconds(), TriggerSrc: "final", TriggerCount: len(triggers),
+		LLMCalls: llmrec.CallCount(fctx), Outcome: outcome})
 	if err != nil {
 		log.Printf("[deadline] task %s 终局规划出错: %v", t.ID, err)
 	} else if met {
