@@ -75,22 +75,4 @@ func PivotHintsForIntent(payload json.RawMessage, max int) string {
 	return PivotHints(p.ChainTags, p.Summary, max)
 }
 
-// RefsGuideForIntent 在意图命中类别时返回 L4 原文指引行(追加在 L3 骨架注入块
-// 之后):告诉 worker 完整反问决策链原文的可 Read 路径。类别解析与 ForIntent
-// 完全一致(同一 intentCats),匹配不中返回 ""(与骨架一样静默不注入)。
-// 文本静态、只随 chain_tags 变化,不破坏 prompt 缓存粒度。
-func RefsGuideForIntent(payload json.RawMessage) string {
-	cats := intentCats(payload)
-	if len(cats) == 0 {
-		return ""
-	}
-	if distilledCategories[cats[0]] {
-		return "" // 蒸馏类别无随包 L4 refs 目录,静默不给原文指引
-	}
-	paths := make([]string, len(cats))
-	for i, c := range cats {
-		paths[i] = "skills/chains-" + c + "/refs/"
-	}
-	return "\n【L4 原文指引】该领域的反问决策链原文在 " + strings.Join(paths, "、") +
-		"(精确篇目见对应 SKILL.md),卡住或需要完整判据时 Read 对应文件。"
-}
+func RefsGuideForIntent(_ json.RawMessage) string { return "" }

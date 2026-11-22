@@ -1,4 +1,4 @@
-# chains-rev L3 决策骨架(场景→判据→转向;蒸馏自 chains 语料,完整 Q&A 见 skills/chains-rev/refs/)
+# chains-rev L3 决策骨架(场景→判据→转向;蒸馏自 chains 语料)
 - 场景:拿到陌生 ELF/PE 第一分钟|判据:三连 file(架构/strip)→checksec→strings,30 秒定路线|转向:strings 无可读串→测熵,熵>7.2 大段+UPX0/UPX1 节名=加壳,先脱壳再回静态
 - 场景:stripped 找 main|判据:__libc_start_main 第一参数(rdi)即 main;静态链接时 _start 首个被当参数传的地址即 main|转向:失效→xref read/scanf 倒推业务核心
 - 场景:分诊标准壳 vs 定制混淆|判据:标准壳(UPX)入口为小 stub、节名带特征,秒脱;定制混淆入口即正常代码但满花指令|转向:upx -d 报错→修 UPX! 魔数,或 ESP 定律到 OEP,dump+Scylla 修 IAT

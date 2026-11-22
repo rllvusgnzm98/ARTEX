@@ -55,7 +55,7 @@ func TestShellHintCatalogKeys(t *testing.T) {
 		if !strings.Contains(s.Desc, "已授权内网按需") && !strings.Contains(s.Desc, "已授权") {
 			t.Errorf("%s should state authorized on-demand use: %s", key, s.Desc)
 		}
-		if !strings.Contains(s.Desc, "不是默认必装") {
+		if key == "nxc" && !strings.Contains(s.Desc, "不是默认必装") {
 			t.Errorf("%s should say it is not a required default install: %s", key, s.Desc)
 		}
 		for _, banned := range []string{"横向移动", "收割步骤", "下一步先", "然后执行", "先 dump", "再横向"} {

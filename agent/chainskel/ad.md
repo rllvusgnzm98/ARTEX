@@ -1,4 +1,4 @@
-# chains-ad L3 决策骨架(场景→判据→转向;蒸馏自 chains 语料,完整 Q&A 见 skills/chains-ad/refs/)
+# chains-ad L3 决策骨架(场景→判据→转向;蒸馏自 chains 语料)
 - 场景:域内新立足点起手|判据:零主动流量自省(whoami /all、arp、netstat),答出域名/DC/网段/有无域凭据四问再动手;有凭据先LDAP不先扫|转向:被动枯竭转凭据测绘(LSASS/DPAPI)让LDAP合法化
 - 场景:无凭据仅网络可达|判据:先吃广播自曝(LLMNR/NBT-NS)与匿名口子(null session/RID/AXFR),30~60分钟无果再低速主动|转向:Responder毒化收NetNTLMv2,不可PtH只relay/爆破
 - 场景:开喷口令前|判据:先摸lockoutThreshold与观察窗口,每账号每窗口≤threshold−2发、按密码分批;threshold=0可放喷但4771≤10次/分|转向:摸不到策略按threshold=3、每天1~2发

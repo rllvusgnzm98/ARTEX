@@ -10,7 +10,7 @@ import (
 )
 
 // 本文件的测试锁住 chainskel 与 agent 的接线:chain_tags 落进意图 payload、
-// 非法标签在写库前被拒、worker 领到意图时的首条消息带上 L3 骨架与 L4 指引、
+// 非法标签在写库前被拒、worker 领到意图时的首条消息带上 L3 骨架、
 // planner/worker system 固定尾带 L2 meta 铁律。
 
 func TestAddIntentPersistsChainTags(t *testing.T) {
@@ -117,14 +117,27 @@ func TestRenderIntentTaskInjectsSkeleton(t *testing.T) {
 	if !strings.Contains(msg, `<chains-skeleton source="chains-skeleton" category="web">`) {
 		t.Fatalf("worker 首条消息应注入 web 骨架:\n%s", msg)
 	}
-	if !strings.Contains(msg, "skills/chains-web/refs/") {
-		t.Fatalf("worker 首条消息应带 L4 原文指引:\n%s", msg)
+	if strings.Contains(msg, "/refs") {
+		t.Fatalf("worker guidance advertises unavailable refs: %s", msg)
 	}
 	// 意图正文仍在最前面(worker 先读任务再读骨架):骨架块必须排在意图正文之后。
 	intentIdx := strings.Index(msg, "【你领到的意图")
 	skelIdx := strings.Index(msg, "<chains-skeleton")
 	if intentIdx < 0 || skelIdx < 0 || skelIdx < intentIdx {
 		t.Fatalf("骨架块应在意图正文之后, intentIdx=%d skelIdx=%d", intentIdx, skelIdx)
+	}
+}
+
+func TestWorkerGuidanceHasNoUnavailableRefs(t *testing.T) {
+	for _, category := range chainskel.Categories {
+		payload, err := json.Marshal(map[string]any{"summary": "guidance check", "chain_tags": []string{category}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		guidance := renderIntentTask(&db.Node{ID: 1, Payload: payload})
+		if strings.Contains(guidance, "/refs/") {
+			t.Fatalf("%s advertises an unavailable refs path: %s", category, guidance)
+		}
 	}
 }
 

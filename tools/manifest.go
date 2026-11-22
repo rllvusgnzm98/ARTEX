@@ -25,7 +25,7 @@ import (
 
 // Entry 是清单里一个外部工具的记录。
 type Entry struct {
-	Name     string `json:"name"`               // 工具名（唯一）
+	Name     string `json:"name"`               // 工具名，与 platform 联合唯一
 	Purpose  string `json:"purpose"`            // 用途（一行话）
 	Version  string `json:"version"`            // 钉的版本；空 = 未钉
 	Platform string `json:"platform"`           // linux/amd64；空或 any = 不限
@@ -107,11 +107,21 @@ func Check(m *Manifest, dataDir string) []CheckResult {
 func CheckEntry(e Entry, dataDir string) CheckResult {
 	r := CheckResult{Entry: e, Status: StatusMissing}
 	p := ""
+	overridden := false
 	if e.Env != "" {
 		p = strings.TrimSpace(os.Getenv(e.Env))
+		overridden = p != ""
 	}
 	if p == "" {
 		p = filepath.Join(dataDir, filepath.FromSlash(e.Path))
+	}
+	if !overridden && filepath.ToSlash(e.Path) == "tools/"+e.Name {
+		if _, err := os.Stat(p); os.IsNotExist(err) {
+			image := filepath.Join(ImageToolsDir, e.Name)
+			if _, err := os.Stat(image); err == nil {
+				p = image
+			}
+		}
 	}
 	r.Path = p
 	if !platformApplies(e.Platform) {

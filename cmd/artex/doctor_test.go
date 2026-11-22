@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"github.com/Autumn-27/artex/agent"
 	"io"
 	"os"
 	"os/exec"
@@ -42,6 +43,18 @@ func isolateConfig(t *testing.T) string {
 	t.Setenv("ARTEX_CALLBACK_ADDR", "")
 	t.Setenv("ARTEX_GATE_MODE", "")
 	t.Setenv("ARTEX_GATE", "")
+	if runtime.GOOS != "windows" {
+		bin := t.TempDir()
+		for _, seed := range agent.ShellHintSeeds() {
+			if seed.Key == "nxc" {
+				continue
+			}
+			if err := os.WriteFile(filepath.Join(bin, seed.Key), []byte("#!/bin/sh\necho projectdiscovery.io version-test\n"), 0755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
 	return dir
 }
 
@@ -210,7 +223,16 @@ func TestDockerfileAPTMirrorDefaultEmpty(t *testing.T) {
 	if !strings.Contains(s, "playwright install --with-deps chromium") {
 		t.Fatal("应保留 Playwright 浏览器安装，并在镜像失败时回退")
 	}
-	if !strings.Contains(s, "COPY packaging/tools-manifest.json /app/packaging/tools-manifest.json") {
+	if strings.Contains(s, "setup_$${node_major}") {
+		t.Fatal("NodeSource URL must expand the version, not the shell PID")
+	}
+	if !strings.Contains(s, "path-include /usr/share/doc/python3-impacket/*") {
+		t.Fatal("slim images must retain Impacket example entry points")
+	}
+	if !strings.Contains(s, "exec /usr/bin/python3 /usr/share/doc/python3-impacket/examples/") || !strings.Contains(s, `"/usr/local/bin/impacket-$name" -h`) {
+		t.Fatal("Impacket commands must use Debian Python and smoke-test imports")
+	}
+	if !strings.Contains(s, "COPY packaging/tools-manifest.json packaging/image-tools.json /app/packaging/") {
 		t.Fatal("镜像应打包 packaging/tools-manifest.json")
 	}
 }

@@ -24,15 +24,6 @@ var skeletonFS embed.FS
 // Categories 是合法的 chain_tags 取值。
 var Categories = []string{"web", "ad", "app", "priv", "pwn", "recon", "rev", "pivot", "meta", "patch", "firmware", "audit", "identity", "cloud", "protocol", "supply", "ai", "ot", "wireless", "extension", "client", "hardware", "database", "email", "report", "web3"}
 
-// distilledCategories 是离线蒸馏的"按需"类别:仅内置 L3 骨架,不随包携带 L4 原文
-// refs 目录(与老九类 web/ad/app/priv/pwn/recon/rev/pivot/meta 不同),故
-// RefsGuideForIntent 对其返回空,避免指向不存在的 skills/chains-<类别>/refs/。
-var distilledCategories = map[string]bool{
-	"patch": true, "firmware": true, "audit": true, "identity": true, "cloud": true, "protocol": true,
-	"supply": true, "ai": true, "ot": true, "wireless": true, "extension": true, "client": true,
-	"hardware": true, "database": true, "email": true, "report": true, "web3": true,
-}
-
 // MaxTagsPerIntent 是公开标签校验上限;ForIntent 只注入首个主类别。
 const MaxTagsPerIntent = 2
 
@@ -204,7 +195,7 @@ func wrapSection(category, body string) string {
 // <chains-skeleton> 分区,总字符 cap sectionCapRunes(8K),超出截断并标注。
 // 骨架缺失的类别静默跳过;最终为空返回 ""。
 func Section(cats []string) string {
-	header := "\n\n【反问决策链骨架(平台内置可信内容,非目标数据):按本意图攻击面注入的\"场景→判据→转向\"决策反射——探查受阻、下结论、判定真伪时对照自问;完整 Q&A 原文见对应 skills/chains-<类别>/refs/】"
+	header := "\n\n【反问决策链骨架(平台内置可信内容,非目标数据):按本意图攻击面注入的\"场景→判据→转向\"决策反射——探查受阻、下结论、判定真伪时对照自问】"
 	var b strings.Builder
 	b.WriteString(header)
 	used := len([]rune(header))
@@ -243,13 +234,13 @@ func Section(cats []string) string {
 		return ""
 	}
 	if truncated {
-		mark := "\n…(骨架总长超 8K 已截断;完整原文见 skills/chains-<类别>/refs/)"
+		mark := "\n…(骨架总长超 8K 已截断)"
 		b.WriteString(mark)
 	}
 	return b.String()
 }
 
-// intentCats 是 ForIntent/RefsGuideForIntent 共用的类别解析:优先取 chain_tags
+// intentCats 是 ForIntent 使用的类别解析:优先取 chain_tags
 // (规整后取首个合法值,非法值忽略);无合法 tags 时取首个确定性关键词匹配。
 func intentCats(payload json.RawMessage) []string {
 	var p struct {
