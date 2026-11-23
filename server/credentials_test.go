@@ -11,11 +11,31 @@ import (
 	"strings"
 	"testing"
 
+	"sync"
+
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/session"
 	actool "github.com/Autumn-27/norma/tool"
 )
+
+// lockedBuf 串行化 log.SetOutput 捕获：Server 的后台 worker 可能与断言并发写。
+type lockedBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuf) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuf) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
 
 const credFixturePass = "fixture-pass"
 
@@ -164,7 +184,7 @@ func TestCredentialToolsListRedactsReuseIncludesSecret(t *testing.T) {
 		t.Fatalf("list_credentials 不得回显明文: %s", listRaw)
 	}
 
-	var buf bytes.Buffer
+	var buf lockedBuf
 	prev := log.Writer()
 	log.SetOutput(&buf)
 	defer log.SetOutput(prev)
@@ -221,7 +241,7 @@ func TestIntranetListCredentialsSkipsUndecryptable(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = other.Delete(context.Background(), bid) })
 
-	var logBuf bytes.Buffer
+	var logBuf lockedBuf
 	prev := log.Writer()
 	log.SetOutput(&logBuf)
 	defer log.SetOutput(prev)
@@ -309,7 +329,7 @@ func TestCredentialReusePlanEmptyVsUndecryptable(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = other.Delete(context.Background(), bid) })
 
-	var logBuf bytes.Buffer
+	var logBuf lockedBuf
 	prev := log.Writer()
 	log.SetOutput(&logBuf)
 	defer log.SetOutput(prev)

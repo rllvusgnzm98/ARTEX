@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 // Database is the PostgreSQL connection config. Either set DSN directly, or set
@@ -61,6 +63,11 @@ type Emp3r0r struct {
 	AgentBinary       string `json:"agent_binary"`          // deploy_emp3r0r 投递的 agent 二进制路径
 	PollIntervalSec   int    `json:"poll_interval_seconds"` // agent 上线轮询间隔；0=15
 	AgentWaitSec      int    `json:"agent_wait_seconds"`    // deploy 等回连上限；0=120
+	// WGConfigPath 是 cc 端 wg_config.json 的挂载路径（compose 挂
+	// /emp3r0r-workspace）。wg_* 凭据缺省时从中自动 provisioning：
+	// server_ip / server_private_key（推导公钥）与 operators.<OperatorName>。
+	WGConfigPath string `json:"wg_config_path"` // 默认 /emp3r0r-workspace/wg_config.json
+	OperatorName string `json:"operator_name"`  // wg_config.json 中本平台 operator 名；默认 artex，空=第一条
 }
 
 // BaseDir is the directory that anchors all runtime artifacts (config.json and
@@ -316,6 +323,12 @@ func Emp3r0rConfig() Emp3r0r {
 			c.AgentWaitSec = n
 		}
 	}
+	if v := strings.TrimSpace(os.Getenv("ARTEX_EMP3R0R_WG_CONFIG")); v != "" {
+		c.WGConfigPath = v
+	}
+	if v := strings.TrimSpace(os.Getenv("ARTEX_EMP3R0R_OPERATOR_NAME")); v != "" {
+		c.OperatorName = v
+	}
 	if v := strings.TrimSpace(os.Getenv("ARTEX_EMP3R0R")); v != "" {
 		switch strings.ToLower(v) {
 		case "on", "1", "true", "enabled":
@@ -324,7 +337,66 @@ func Emp3r0rConfig() Emp3r0r {
 			c.Enabled = false
 		}
 	}
+	// wg_config.json provisioning 兜底：wg_* 缺项时从 cc 挂载文件补齐
+	// （显式 env / 配置文件优先，文件只填空位）。
+	c.fillFromWgConfig()
 	return c
+}
+
+// empWgConfigFile 对应 cc 端 wg_config.json（emp3r0r SavedWgConfig）。
+type empWgConfigFile struct {
+	ServerIP         string `json:"server_ip"`
+	ServerPrivateKey string `json:"server_private_key"`
+	Operators        []struct {
+		Name       string `json:"name"`
+		IP         string `json:"ip"`
+		PrivateKey string `json:"private_key"`
+		PublicKey  string `json:"public_key"`
+	} `json:"operators"`
+}
+
+// fillFromWgConfig 从 cc provisioning 的 wg_config.json 补齐缺失的 wg_* 字段。
+// server_private_key 推导 server 公钥；operator 按 OperatorName 匹配
+// （空 = 第一条）。文件缺失/损坏静默跳过——配置不全由启动检查诚实报错。
+func (c *Emp3r0r) fillFromWgConfig() {
+	path := strings.TrimSpace(c.WGConfigPath)
+	if path == "" {
+		path = "/emp3r0r-workspace/wg_config.json"
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var wc empWgConfigFile
+	if err := json.Unmarshal(data, &wc); err != nil {
+		return
+	}
+	if c.WGServerIP == "" {
+		c.WGServerIP = strings.TrimSpace(wc.ServerIP)
+	}
+	if c.WGServerPublicKey == "" && strings.TrimSpace(wc.ServerPrivateKey) != "" {
+		if priv, kerr := wgtypes.ParseKey(strings.TrimSpace(wc.ServerPrivateKey)); kerr == nil {
+			c.WGServerPublicKey = priv.PublicKey().String()
+		}
+	}
+	if c.WGOperatorIP == "" || c.WGOperatorKey == "" {
+		name := strings.TrimSpace(c.OperatorName)
+		for i, op := range wc.Operators {
+			if name != "" && op.Name != name {
+				continue
+			}
+			if name == "" && i != 0 {
+				continue
+			}
+			if c.WGOperatorIP == "" {
+				c.WGOperatorIP = strings.TrimSpace(op.IP)
+			}
+			if c.WGOperatorKey == "" {
+				c.WGOperatorKey = strings.TrimSpace(op.PrivateKey)
+			}
+			break
+		}
+	}
 }
 
 // Emp3r0rPollInterval 是 agent 上线轮询间隔（默认 15s）。

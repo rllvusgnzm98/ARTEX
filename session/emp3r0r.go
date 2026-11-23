@@ -19,7 +19,9 @@ package session
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -114,8 +116,9 @@ type CCClient struct {
 	wsDial  *websocket.Dialer
 	wgClose func() error // WG device 回收；注入拨号时为 nil
 
-	wgOnce sync.Once
-	wgErr  error
+	wgOnce   sync.Once
+	wgErr    error
+	wgDialer ccDialFunc // wgOnce 完成后写入；Do 的 happens-before 保证读安全
 
 	tunMu    sync.Mutex
 	tunConn  *websocket.Conn
@@ -196,7 +199,9 @@ func (c *CCClient) sessionID() string {
 	return c.cfg.OperatorIP
 }
 
-// wgDial 惰性拉起 userspace WG peer 并经它拨号。
+// wgDial 惰性拉起 userspace WG peer 并经它拨号。c.dial 恒指向本函数，
+// wgOnce.Do 只写 wgDialer 字段——不改写 hc/wsDial 正在共享使用的拨号器
+// （DialContext 每次拨号读取，改写是数据竞态）。
 func (c *CCClient) wgDial(ctx context.Context, network, addr string) (net.Conn, error) {
 	c.wgOnce.Do(func() {
 		dial, closeFn, err := wgPeerDialer(c.cfg)
@@ -204,15 +209,13 @@ func (c *CCClient) wgDial(ctx context.Context, network, addr string) (net.Conn, 
 			c.wgErr = err
 			return
 		}
-		c.dial = dial // 后续调用直接走已起设备
+		c.wgDialer = dial
 		c.wgClose = closeFn
-		c.hc.Transport.(*http.Transport).DialContext = dial
-		c.wsDial.NetDialContext = dial
 	})
 	if c.wgErr != nil {
 		return nil, c.wgErr
 	}
-	return c.dial(ctx, network, addr)
+	return c.wgDialer(ctx, network, addr)
 }
 
 // post 发一条 CBOR POST；out 非 nil 时解码响应体。
@@ -302,11 +305,36 @@ func (c *CCClient) ensureTunnel(ctx context.Context) error {
 // tunReadLoop 持续读 msg_tunnel：每条 ws message 内可有多个 CBOR 帧
 // （emp3r0r 侧按 NetConn 流写），逐帧解码分发。JobID 帧进 job 队列；其余进
 // OnNotify。读死即标记 tunnel 断线，滞留 job 全部判超时。
+//
+// 代际防护：清理只在 tunConn 仍是本连接时发生。旧连接读循环退出晚于新连接
+// 安装时，不得标断新连接、也不得清掉新连接上的 job（其结果并未丢失）；
+// 遗留旧 job 由各自超时兜底上报。
 func (c *CCClient) tunReadLoop(conn *websocket.Conn) {
+	defer func() {
+		c.tunMu.Lock()
+		defer c.tunMu.Unlock()
+		if c.tunConn != conn {
+			return // 已被重连替换：新连接与它的 job 不动
+		}
+		c.tunAlive = false
+		c.tunConn = nil
+		c.tunErr = errors.New("msg_tunnel 断线")
+		// 滞留 job 判死：结果随本连接丢了，等待方收到超时语义。
+		c.jobs.Range(func(k, v any) bool {
+			c.jobs.Delete(k)
+			if ch, ok := v.(chan CCOperatorMsg); ok {
+				select {
+				case ch <- CCOperatorMsg{Tag: "_tunnel_dead"}:
+				default:
+				}
+			}
+			return true
+		})
+	}()
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			break
+			return
 		}
 		dec := cbor.NewDecoder(strings.NewReader(string(data)))
 		for {
@@ -317,21 +345,6 @@ func (c *CCClient) tunReadLoop(conn *websocket.Conn) {
 			c.dispatch(&msg)
 		}
 	}
-	c.tunMu.Lock()
-	c.tunAlive = false
-	c.tunErr = errors.New("msg_tunnel 断线")
-	c.tunMu.Unlock()
-	// 滞留 job 判死：结果随旧连接丢了，等待方收到超时语义。
-	c.jobs.Range(func(k, v any) bool {
-		c.jobs.Delete(k)
-		if ch, ok := v.(chan CCOperatorMsg); ok {
-			select {
-			case ch <- CCOperatorMsg{Tag: "_tunnel_dead"}:
-			default:
-			}
-		}
-		return true
-	})
 }
 
 func (c *CCClient) dispatch(msg *CCOperatorMsg) {
@@ -515,7 +528,10 @@ func (e *Emp3r0r) ReadFile(ctx context.Context, path string) ([]byte, error) {
 	return out, nil
 }
 
-// WriteFile 分块 base64 写目标文件。先探测目标 base64 可用性；写完 wc -c 校验大小。
+// WriteFile 分块 base64 写目标文件。先探测目标 base64 可用性；每块写入附
+// 回显哨兵确认退出状态（命令失败时哨兵缺失→诚实报错），写完校验大小并按
+// 目标侧哈希工具（sha256sum/md5sum，自动探测）核对内容——失败但旧文件等长
+// 不能报成功。
 func (e *Emp3r0r) WriteFile(ctx context.Context, path string, data []byte) error {
 	p := shQuote(path)
 	probe, err := e.cc.SendCommand(ctx, e.agentTag, "command -v base64", 15*time.Second)
@@ -535,9 +551,17 @@ func (e *Emp3r0r) WriteFile(ctx context.Context, path string, data []byte) error
 		if off == 0 {
 			redir = ">"
 		}
-		cmd := fmt.Sprintf("printf '%%s' '%s' | base64 -d %s %s", b64, redir, p)
-		if _, err := e.cc.SendCommand(ctx, e.agentTag, cmd, 60*time.Second); err != nil {
+		sent := "ARTEX_W_" + hexToken(4)
+		cmd := fmt.Sprintf("printf '%%s' '%s' | base64 -d %s %s && echo %s",
+			b64, redir, p, sent)
+		out, err := e.cc.SendCommand(ctx, e.agentTag, cmd, 60*time.Second)
+		if err != nil {
 			return opError("write", "%s", err)
+		}
+		if !strings.Contains(out, sent) {
+			return opError("write",
+				"块 [%d,%d) 写入未确认（远端命令失败，哨兵未回显）。目标侧输出：%s",
+				off, end, strings.TrimSpace(out))
 		}
 		off = end
 		if len(data) == 0 {
@@ -552,6 +576,28 @@ func (e *Emp3r0r) WriteFile(ctx context.Context, path string, data []byte) error
 	var size int64
 	if n, perr := fmt.Sscanf(strings.TrimSpace(sizeOut), "%d", &size); n != 1 || perr != nil || size != int64(len(data)) {
 		return opError("write", "文件 %s 写入校验失败（应 %d 实 %s 字节）", path, len(data), strings.TrimSpace(sizeOut))
+	}
+	// 内容校验：等长不代表同内容。sha256sum 优先，md5sum 兜底（busybox 均有）；
+	// 两者皆缺时块级哨兵+大小已是最强可用校验。
+	hashOut, herr := e.cc.SendCommand(ctx, e.agentTag,
+		fmt.Sprintf("sha256sum %s 2>/dev/null || md5sum %s 2>/dev/null", p, p), 15*time.Second)
+	if herr == nil {
+		fields := strings.Fields(strings.TrimSpace(hashOut))
+		got := ""
+		if len(fields) > 0 {
+			got = strings.ToLower(fields[0])
+		}
+		if len(got) == 64 {
+			want := sha256.Sum256(data)
+			if got != hex.EncodeToString(want[:]) {
+				return opError("write", "文件 %s sha256 校验不匹配（内容与待写不一致）", path)
+			}
+		} else if len(got) == 32 {
+			want := md5.Sum(data)
+			if got != hex.EncodeToString(want[:]) {
+				return opError("write", "文件 %s md5 校验不匹配（内容与待写不一致）", path)
+			}
+		}
 	}
 	return nil
 }
