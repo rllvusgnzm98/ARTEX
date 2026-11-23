@@ -8,12 +8,14 @@ import (
 
 // 凭据既会藏在 URL 的 userinfo 里，也常被网关要求塞进查询串（Google AI 的 ?key=、
 // 各家的 ?access_token= 等）。打码两处都要管。
-var urlSecretQueryKeys = map[string]struct{}{
-	"key": {}, "api_key": {}, "apikey": {}, "api-key": {},
-	"access_token": {}, "token": {}, "auth": {}, "authorization": {},
-	"password": {}, "passwd": {}, "pwd": {}, "secret": {},
-	"sig": {}, "signature": {}, "sslpassword": {},
-}
+// 凭据既会藏在 URL 的 userinfo 里，也常被网关要求塞进查询串（Google AI 的 ?key=、
+// 各家的 ?access_token= 等）。打码两处都要管。
+//
+// 查询串一律按**文本**打码，不走 url.Query()：那条路要求整条 URL 解析成功，而且
+// Go 的 ParseQuery 会把含分号的键值对静默丢掉，于是「解析失败」和「分号分隔」两种
+// 形态都会原样漏出去。值的字符类特意包含单引号——URL 在错误文本里被单引号截断时，
+// 按 URL 逐条打码会把引号后的半截凭据留下。
+var queryCredential = regexp.MustCompile(`(?i)([?&;](?:key|api[-_]?key|access[-_]?token|token|auth|authorization|password|passwd|pwd|secret|sig|signature|sslpassword)=)[^&;#\s"` + "`" + `<>]*`)
 
 // urlInText 粗略框出文本里的 URL。第三方错误信息常把请求 URL 原样嵌进 message
 // （net/url.Error 就是这么拼的），所以要能在任意文本里找到它们再打码。
@@ -31,35 +33,20 @@ func RedactURL(raw string) string {
 	if trimmed == "" {
 		return raw
 	}
-	u, err := url.Parse(trimmed)
+	masked := queryCredential.ReplaceAllString(raw, "${1}****")
+	u, err := url.Parse(strings.TrimSpace(masked))
 	if err != nil || u.Scheme == "" {
-		return userinfoInText.ReplaceAllString(raw, "${1}****@")
+		// 解析失败时至少把 scheme 与 @ 之间的 userinfo 抹掉；查询串已在上面按文本打过码。
+		return userinfoInText.ReplaceAllString(masked, "${1}****@")
 	}
-	if u.User != nil {
-		// 只有用户名的 userinfo 也常就是令牌本身（https://TOKEN@host），整段盖掉。
-		if _, hasPw := u.User.Password(); hasPw {
-			u.User = url.UserPassword(u.User.Username(), "****")
-		} else if u.User.Username() != "" {
-			u.User = url.User("****")
-		}
+	if u.User == nil {
+		return masked
 	}
-	if q := u.Query(); len(q) > 0 {
-		masked := false
-		for k, vs := range q {
-			if _, secret := urlSecretQueryKeys[strings.ToLower(k)]; !secret {
-				continue
-			}
-			for i := range vs {
-				if vs[i] != "" {
-					vs[i] = "****"
-					masked = true
-				}
-			}
-			q[k] = vs
-		}
-		if masked {
-			u.RawQuery = q.Encode()
-		}
+	// 只有用户名的 userinfo 也常就是令牌本身（https://TOKEN@host），整段盖掉。
+	if _, hasPw := u.User.Password(); hasPw {
+		u.User = url.UserPassword(u.User.Username(), "****")
+	} else if u.User.Username() != "" {
+		u.User = url.User("****")
 	}
 	return u.String()
 }
@@ -70,6 +57,9 @@ func RedactURLsInText(s string) string {
 	if s == "" {
 		return s
 	}
+	// 查询串凭据先按整段文本打码：URL 的边界（引号、单引号）判断不可靠，漏框一个字符
+	// 就会留下半截凭据。
+	s = queryCredential.ReplaceAllString(s, "${1}****")
 	return urlInText.ReplaceAllStringFunc(s, func(raw string) string {
 		// URL 常被引号或标点收尾（`Post "https://...": dial tcp`），尾随符号不该进 URL。
 		trailing := ""

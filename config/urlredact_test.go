@@ -64,3 +64,36 @@ func TestRedactURLsInTextScrubsEmbeddedURLs(t *testing.T) {
 		t.Errorf("RedactURLsInText changed URL-free text: %q", got)
 	}
 }
+
+// Devin Review 查到的三种漏法：都源于「先解析再打码」——解析失败、分号分隔、
+// URL 在文本里被单引号截断时，查询串凭据会原样（或半截）漏出去。
+func TestRedactURLMasksQueryCredentialsWithoutParsing(t *testing.T) {
+	cases := []struct{ name, in, mustKeep string }{
+		{"semicolon separated", "https://api.example.com/v1?key=SECRETKEY;alt=sse", "api.example.com/v1"},
+		{"unparseable port", "http://h:notaport/v1?key=SECRETKEY", "/v1"},
+		{"keyword style", "https://api.example.com/v1?api-key=SECRETKEY", "api.example.com/v1"},
+	}
+	for _, c := range cases {
+		got := RedactURL(c.in)
+		if strings.Contains(got, "SECRETKEY") {
+			t.Errorf("%s: RedactURL(%q) = %q, leaks credential", c.name, c.in, got)
+		}
+		if !strings.Contains(got, c.mustKeep) {
+			t.Errorf("%s: RedactURL(%q) = %q, lost endpoint", c.name, c.in, got)
+		}
+	}
+}
+
+func TestRedactURLsInTextMasksCredentialSplitByQuote(t *testing.T) {
+	// 单引号是 URL 里合法的 sub-delim，按 URL 逐条打码会在引号处断开并留下后半截。
+	in := `Post "https://api.example.com/v1?key=SEC'RETKEY": dial tcp: connection refused`
+	got := RedactURLsInText(in)
+	for _, leak := range []string{"SEC", "RETKEY"} {
+		if strings.Contains(got, leak) {
+			t.Fatalf("leaks %q: %q", leak, got)
+		}
+	}
+	if !strings.Contains(got, "connection refused") || strings.Contains(got, "%2A") {
+		t.Fatalf("lost context or re-encoded URL: %q", got)
+	}
+}
