@@ -29,6 +29,7 @@ import type {
   ConvTokenSummary,
   CoverageAssetRefs,
   CoverageGraphData,
+  CredentialList,
   DailyTokenBucket,
   DeleteTaskOptions,
   DeleteTaskResult,
@@ -54,7 +55,6 @@ import type {
   InterceptPending,
   InterceptRule,
   IntranetTopology,
-  PendingScopeRow,
   JudgeConfig,
   JudgeUsage,
   LLMPoolStatus,
@@ -72,16 +72,15 @@ import type {
   NotificationDelivery,
   NotificationFilter,
   NotificationMeta,
+  PendingScopeRow,
   PromptVar,
   PromptVersion,
-  SessionTokenUsage,
   SessionFsEntry,
   SessionReadResult,
+  SessionTokenUsage,
   Settings,
   Severity,
   ShellSession,
-  TunnelRecord,
-  CredentialList,
   SkillCall,
   SkillItem,
   SSProject,
@@ -108,6 +107,8 @@ import type {
   TrafficEvidenceRole,
   TrafficHost,
   TrafficResp,
+  TTPEntry,
+  TunnelRecord,
   UpdateCheck,
   UsageStats,
   WorkspaceFile,
@@ -510,6 +511,15 @@ export const api = {
     ).then((r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 })),
   assetCounts: (taskId = "") =>
     get<Record<string, number>>(`/assets/counts${taskId ? `?task_id=${encodeURIComponent(taskId)}` : ""}`),
+  // ---- 结构化复盘 / TTP 沉淀 ----
+  ttpEntries: (status?: string) =>
+    get<{ entries: TTPEntry[] }>(`/ttp/entries${status ? `?status=${encodeURIComponent(status)}` : ""}`).then((r) => ({
+      entries: arr(r.entries),
+    })),
+  approveTTP: (id: number) => post<{ ok: boolean; entry?: TTPEntry }>(`/ttp/entries/${id}/approve`),
+  rejectTTP: (id: number) => post<{ ok: boolean; entry?: TTPEntry }>(`/ttp/entries/${id}/reject`),
+  importWriteup: (text: string, originRef?: string) =>
+    post<{ ok: boolean; queued: number }>("/ttp/writeups", { text, origin_ref: originRef ?? "" }),
   deleteAssets: (ids: number[]) =>
     http<{ deleted: number }>("/assets", { method: "DELETE", body: JSON.stringify({ ids }) }),
   // task-scoped view of the same endpoint — server-side paginated like `assets`
@@ -850,8 +860,7 @@ export const api = {
   // 渠道是多实例资源（同一类型可配多个机器人、各有过滤规则），因此独立成组，
   // 不塞进扁平的 settings 键值里。
   notifyMeta: () => get<NotificationMeta>(`/notify/meta`),
-  notifyChannels: () =>
-    get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
+  notifyChannels: () => get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
   notifyCreateChannel: (payload: {
     name: string;
     kind: string;
@@ -1340,9 +1349,9 @@ export const api = {
   rollbackUpdate: () => post<{ ok: boolean }>(`/update/rollback`),
 
   pendingScope: (taskId: string, all = false) =>
-    get<{ items: PendingScopeRow[] }>(
-      `/tasks/${encodeURIComponent(taskId)}/pending-scope${all ? "?all=1" : ""}`,
-    ).then((r) => arr(r.items)),
+    get<{ items: PendingScopeRow[] }>(`/tasks/${encodeURIComponent(taskId)}/pending-scope${all ? "?all=1" : ""}`).then(
+      (r) => arr(r.items),
+    ),
   decidePendingScope: (id: number, action: "approve" | "dismiss") =>
     post<PendingScopeRow>(`/pending-scope/${id}/decide`, { action }),
 

@@ -1515,3 +1515,29 @@ CREATE INDEX IF NOT EXISTS idx_credential_inheritances_child_active
     ON credential_inheritances(child_task_id) WHERE state = 'active';
 CREATE INDEX IF NOT EXISTS idx_credential_inheritances_credential
     ON credential_inheritances(credential_id);
+
+-- =====================================================================
+-- 结构化复盘与 TTP 沉淀（人工审核流水线，只追加 IF NOT EXISTS）
+-- =====================================================================
+-- ttp_entries: 待人工审核的"场景→判据→转向"决策骨架条目,与 agent/chainskel/*.md
+-- 同构。source 区分来源(retro=任务收官自动复盘;writeup=外部 writeup 导入),避免低质量
+-- 外部内容污染决策语料:审核通过(status=approved)前只存库,不进决策语料;approved 后
+-- 由运行时 overlay 并入 chainskel 并追加落盘到 agent/chainskel/<category>.md。
+-- confidence 仅对 writeup 有意义(0-1);retro 恒为 0。task_id 记复盘来源任务(provenance)。
+CREATE TABLE IF NOT EXISTS ttp_entries (
+    id          BIGSERIAL PRIMARY KEY,
+    source      TEXT NOT NULL CHECK (source IN ('retro','writeup')),
+    category    TEXT NOT NULL,
+    scene       TEXT NOT NULL,
+    criteria    TEXT NOT NULL,
+    pivot       TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+    confidence  REAL NOT NULL DEFAULT 0,
+    task_id     BIGINT,
+    origin_ref  TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    reviewed_at TIMESTAMPTZ,
+    reviewer    TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_ttp_entries_status ON ttp_entries(status);
+CREATE INDEX IF NOT EXISTS idx_ttp_entries_approved_cat ON ttp_entries(category) WHERE status='approved';
