@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -71,7 +72,9 @@ func (s *Server) addGoal(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, aid := range body.AssetIDs { // anchor the goal to its target asset(s)
 		if aid > 0 {
-			_ = t.Store.Anchor(id, aid)
+			if err := t.Store.Anchor(id, aid); err != nil {
+				log.Printf("[goals] task %s: 目标 #%d 锚定资产 #%d 失败: %v", t.ID, id, aid, err)
+			}
 		}
 	}
 	t.NotifyGoal([]string{text}) // 记「人新增了目标:…」触发并唤醒 planner

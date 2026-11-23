@@ -228,7 +228,7 @@ VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
 	}
 	for _, a := range anchors {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_anchors(node_id, asset_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, id, a); err != nil {
-			return 0, anchorWriteErr(err, s.db.Health(), s.expID, []int64{a})
+			return 0, anchorWriteErr(err, s.db.Health(), s.expID, id, []int64{a})
 		}
 	}
 	if intentID > 0 {
@@ -295,7 +295,7 @@ func (s *ExplorationStore) AnchorCtx(ctx context.Context, nodeID, assetID int64)
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_anchors(node_id, asset_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, nodeID, assetID); err != nil {
-		return anchorWriteErr(err, s.db.Health(), s.expID, []int64{assetID})
+		return anchorWriteErr(err, s.db.Health(), s.expID, nodeID, []int64{assetID})
 	}
 	return tx.Commit()
 }
@@ -2182,6 +2182,22 @@ func (e *DanglingAnchorError) Error() string {
 
 func (e *DanglingAnchorError) Unwrap() error { return ErrDanglingAnchor }
 
+// ErrMissingAnchorOwner 与悬空锚点相对：不见的是锚点挂靠的那个节点，不是 asset。
+// exploration_anchors 两列都有外键，只看 SQLSTATE 会把「owner 节点没了」误报成
+// 「asset 没了」，排查时指向错误的对象。
+var ErrMissingAnchorOwner = errors.New("锚点挂靠的节点不存在")
+
+type MissingAnchorOwnerError struct {
+	ExplorationID int64
+	NodeID        int64
+}
+
+func (e *MissingAnchorOwnerError) Error() string {
+	return fmt.Sprintf("锚点挂靠的节点不存在: #%d (exploration %d)", e.NodeID, e.ExplorationID)
+}
+
+func (e *MissingAnchorOwnerError) Unwrap() error { return ErrMissingAnchorOwner }
+
 // anchorQuerier 覆盖 *sql.Tx 与 *DB，让校验既能在事务内做，也能独立做。
 type anchorQuerier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
@@ -2239,18 +2255,29 @@ func checkAnchorAssets(ctx context.Context, q anchorQuerier, health *Persistence
 	return err
 }
 
-// anchorWriteErr 把锚点写入撞上的外键冲突翻译成明确的一致性错误。
+// anchorWriteErr 把锚点写入撞上的外键冲突翻译成明确的一致性错误，并按**约束名**区分
+// 到底是 asset 不在还是 owner 节点不在（两列都有外键，只看 SQLSTATE 会张冠李戴）。
 //
 // 校验（只读）到写入之间仍可能被并发的资产清理插空；此时外键会拒绝并回滚整笔事务，
 // 半成品不会落库，这里只负责让调用方看到 DanglingAnchorError 而不是裸驱动错误，并把
 // 事件同样记进落库健康表。
-func anchorWriteErr(err error, health *PersistenceHealth, expID int64, assets []int64) error {
+func anchorWriteErr(err error, health *PersistenceHealth, expID, nodeID int64, assets []int64) error {
 	if err == nil || !isFKViolation(err) {
 		return err
 	}
-	out := &DanglingAnchorError{ExplorationID: expID, Missing: dedupePositive(assets)}
-	health.RecordDanglingAnchors(expID, out.Missing, out.Error())
-	return out
+	switch constraintName(err) {
+	case anchorAssetFK:
+		out := &DanglingAnchorError{ExplorationID: expID, Missing: dedupePositive(assets)}
+		health.RecordDanglingAnchors(expID, out.Missing, out.Error())
+		return out
+	case anchorOwnerFK:
+		out := &MissingAnchorOwnerError{ExplorationID: expID, NodeID: nodeID}
+		health.RecordWriteFailure(expID, out.Error())
+		return out
+	}
+	// 约束名拿不到时不猜：错报成「asset 不存在」会把排查引向错误的对象。
+	health.RecordWriteFailure(expID, "anchor fk violation: "+err.Error())
+	return err
 }
 
 // dedupePositive 返回升序去重后的正数 id。

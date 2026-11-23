@@ -386,7 +386,7 @@ VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string
 	}
 	for _, asset := range in.AssetIDs {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_anchors(node_id,asset_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, out.NodeID, asset); err != nil {
-			return nil, anchorWriteErr(err, health, in.ExplorationID, []int64{asset})
+			return nil, anchorWriteErr(err, health, in.ExplorationID, out.NodeID, []int64{asset})
 		}
 	}
 	if in.IntentID > 0 {

@@ -433,7 +433,9 @@ func (s *ExplorationStore) AddFindingFollowUpIntent(findingID, findingNodeID int
 	if _, err := tx.Exec(`INSERT INTO exploration_anchors(node_id,asset_id)
 		SELECT $1, asset_id FROM exploration_anchors WHERE node_id=$2
 		ON CONFLICT DO NOTHING`, intentID, liveNodeID); err != nil {
-		return 0, Activity{}, err
+		// 复制来源节点的锚点：asset 理应都还在，但并发清理可能正好插空，这里同样走
+		// 统一翻译（按约束名区分 asset 与 owner 节点），不把裸外键错误抛给调用方。
+		return 0, Activity{}, anchorWriteErr(err, s.db.Health(), s.expID, intentID, nil)
 	}
 	if _, err := tx.Exec(`INSERT INTO exploration_edges(exploration_id,src_id,rel,dst_id)
 		VALUES ($1,$2,$3,$4)`, s.expID, liveNodeID, RelDerivedFrom, intentID); err != nil {

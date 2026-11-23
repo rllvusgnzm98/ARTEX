@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/url"
 	"strconv"
@@ -356,7 +357,12 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 					t.evaluateHoneypot(id, serviceViewFromItem(item, item.URL != ""))
 				}
 				if t.ts != nil && t.ownerNode > 0 && id > 0 {
-					_ = t.ts.AnchorCtx(ctx, t.ownerNode, id)
+					// 资产本身已经写成功，不能因为锚点失败把它当作整条失败丢掉；但锚点
+					// 失败也不能咽下去——否则「资产已登记却没挂到意图上」只剩沉默。
+					if err := t.ts.AnchorCtx(ctx, t.ownerNode, id); err != nil {
+						t.countWrites(WriteCounts{Failures: 1})
+						log.Printf("[insert_assets] 资产 #%d 已登记，但锚定到节点 #%d 失败: %v", id, t.ownerNode, err)
+					}
 				}
 				if taskID > 0 {
 					var sourceNodeID *int64

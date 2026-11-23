@@ -1820,7 +1820,9 @@ func (s *Server) seed(t *Task, text string) {
 	// (the asset graph is global and shared; anchoring no longer gates reads).
 	if rootID > 0 {
 		if begin, _ := t.Store.OriginFactID(); begin > 0 {
-			_ = t.Store.Anchor(begin, rootID)
+			if err := t.Store.Anchor(begin, rootID); err != nil {
+				log.Printf("[seed] task %s: 根资产 #%d 锚定到起点事实 #%d 失败: %v", t.ID, rootID, begin, err)
+			}
 		}
 	}
 	log.Printf("[seed] task %s: 目标站点 %s", t.ID, u)
