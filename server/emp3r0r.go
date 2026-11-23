@@ -153,21 +153,37 @@ func (s *Server) reconcileEmp3r0rStatus(tag string) {
 	if err != nil || rec == nil || rec.Status == db.SessionAlive {
 		return
 	}
+	if s.emp3r0r.client == nil {
+		return
+	}
+	// 复活先探活：agent 在 cc 列表但命令已不可达时仍保持 dead（诚实）。
+	var sec session.Secret
+	if err := json.Unmarshal(rec.Secret, &sec); err != nil {
+		return
+	}
+	e, rerr := session.RestoreEmp3r0r(id, sec, s.emp3r0r.client)
+	if rerr != nil {
+		return
+	}
+	if terr := e.Test(ctx); terr != nil {
+		log.Printf("[emp3r0r] agent %s 在 cc 在线但探活失败，保持 dead: %v", tag, terr)
+		return
+	}
 	if err := s.sessStore.UpdateStatus(ctx, id, db.SessionAlive); err != nil {
 		log.Printf("[emp3r0r] agent %s 复活落库失败: %v", tag, err)
 		return
 	}
-	if s.sessReg != nil && s.emp3r0r.client != nil {
+	// 复查行仍存在且已 alive——并发删除/改写时不把幽灵会话补回注册表。
+	fresh, ferr := s.sessStore.Get(ctx, id)
+	if ferr != nil || fresh == nil || fresh.Status != db.SessionAlive {
+		return
+	}
+	if s.sessReg != nil {
 		if _, have := s.sessReg.Get(id); !have {
-			var sec session.Secret
-			if err := json.Unmarshal(rec.Secret, &sec); err == nil {
-				if e, rerr := session.RestoreEmp3r0r(id, sec, s.emp3r0r.client); rerr == nil {
-					s.sessReg.Add(e)
-				}
-			}
+			s.sessReg.Add(e)
 		}
 	}
-	log.Printf("[emp3r0r] agent %s 在线但库内标 dead → 复活 session %d", tag, id)
+	log.Printf("[emp3r0r] agent %s 在线且探活通过但库内标 dead → 复活 session %d", tag, id)
 }
 
 // registerEmp3r0rAgent 把新上线 agent 落库（kind=emp3r0r）并注册进 Registry。
