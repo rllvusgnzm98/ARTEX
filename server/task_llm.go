@@ -60,7 +60,9 @@ type taskLLMError struct {
 	// past while stop-loss had latched: the call is not replayed, but the task's
 	// chain still has a usable profile, so the scene must not be frozen.
 	failoverReady bool
-	cause         error
+	// revision is the chain revision the error describes; 0 when unknown.
+	revision int64
+	cause    error
 }
 
 func (e *taskLLMError) Error() string {
@@ -95,15 +97,17 @@ func isTaskLLMFailoverReady(err error) bool {
 func stoppedQuotaError(taskID string, transition db.TaskLLMTransition, cause error, hooks taskLLMStreamHooks) error {
 	exhausted := transition.ChainExhausted
 	ready := !exhausted && transition.NextProfileID != nil
+	revision := transition.Revision
 	if transition.Stale {
-		_, curErr := hooks.current()
+		cur, curErr := hooks.current()
 		if curErr != nil && !isTaskLLMChainExhausted(curErr) {
 			return curErr
 		}
 		exhausted = isTaskLLMChainExhausted(curErr)
 		ready = curErr == nil
+		revision = cur.revision
 	}
-	return &taskLLMError{taskID: taskID, chainExhausted: exhausted, failoverReady: ready, cause: cause}
+	return &taskLLMError{taskID: taskID, chainExhausted: exhausted, failoverReady: ready, revision: revision, cause: cause}
 }
 
 func isTaskLLMChainExhausted(err error) bool {
@@ -161,7 +165,7 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 	}
 	if len(pt.LLMProfileIDs) > 0 {
 		if pt.ActiveLLMProfileID == nil {
-			return sel, &taskLLMError{taskID: r.taskID, chainExhausted: true, cause: errors.New("all selected profiles are quota exhausted")}
+			return sel, &taskLLMError{taskID: r.taskID, chainExhausted: true, revision: sel.revision, cause: errors.New("all selected profiles are quota exhausted")}
 		}
 		sel.profileID = *pt.ActiveLLMProfileID
 		prov, cfg, ok := r.s.providerForProfile(sel.profileID)
@@ -314,7 +318,7 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 			return llm.Message{}, "", llm.Usage{}, stoppedQuotaError(taskID, transition, callErr, hooks)
 		}
 		if !transition.Stale && transition.NextProfileID == nil {
-			return llm.Message{}, "", llm.Usage{}, &taskLLMError{taskID: taskID, chainExhausted: transition.ChainExhausted, cause: callErr}
+			return llm.Message{}, "", llm.Usage{}, &taskLLMError{taskID: taskID, chainExhausted: transition.ChainExhausted, revision: transition.Revision, cause: callErr}
 		}
 		// 没有任何输出交付给调用方,换下一个 profile 重放同一逻辑请求是安全的。
 	}
@@ -419,7 +423,7 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 				return
 			}
 			if committed || (!transition.Stale && transition.NextProfileID == nil) {
-				yield(llm.StreamEvent{}, &taskLLMError{taskID: taskID, chainExhausted: transition.ChainExhausted, cause: streamErr})
+				yield(llm.StreamEvent{}, &taskLLMError{taskID: taskID, chainExhausted: transition.ChainExhausted, revision: transition.Revision, cause: streamErr})
 				return
 			}
 			// No event reached the caller, so replaying the same logical request on

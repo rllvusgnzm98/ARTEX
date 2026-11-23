@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"sync"
 
 	"github.com/Autumn-27/artex/agent"
@@ -58,6 +59,34 @@ func applySupplyHold(t *Task) {
 		return
 	}
 	holdTaskSupply(t.ID)
+}
+
+// applySupplyHoldAt freezes dispatch for a supply failure observed at chain
+// revision (0 = unknown). A chain replaced since then already released the
+// hold, so a late failure must not restore it; the re-check after holding
+// closes the race with a concurrent replacement.
+func applySupplyHoldAt(t *Task, revision int64) bool {
+	if t == nil {
+		return false
+	}
+	replaced := func() bool { return revision > 0 && t.llmStateSnapshot().ChainRevision > revision }
+	if replaced() {
+		return false
+	}
+	holdTaskSupply(t.ID)
+	if replaced() {
+		releaseTaskSupply(t.ID)
+		return false
+	}
+	return true
+}
+
+func taskLLMErrorRevision(err error) int64 {
+	var target *taskLLMError
+	if errors.As(err, &target) {
+		return target.revision
+	}
+	return 0
 }
 
 // shouldClaimWork is the engine-side dispatch gate.

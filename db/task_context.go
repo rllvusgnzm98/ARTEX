@@ -40,6 +40,8 @@ type TaskLLMTransition struct {
 	// provider. The caller may retry a pre-stream request against the new chain,
 	// but must not report or persist a transition for this result.
 	Stale bool
+	// Revision is the task's chain revision after an advancing transition.
+	Revision int64
 }
 
 func (d *DB) hydrateTaskContext(t *Task) error {
@@ -526,6 +528,7 @@ ORDER BY position LIMIT 1`, taskID, position).Scan(&next)
 	case nil:
 		out.Advanced = true
 		out.NextProfileID = &next
+		out.Revision = currentRevision + 1
 		if _, err := tx.Exec(`UPDATE tasks
 				SET active_llm_profile_id=$2, llm_profile_id=$2, llm_chain_revision=llm_chain_revision+1
 				WHERE id=$1`, taskID, next); err != nil {
@@ -534,6 +537,7 @@ ORDER BY position LIMIT 1`, taskID, position).Scan(&next)
 	case sql.ErrNoRows:
 		out.Advanced = true
 		out.ChainExhausted = true
+		out.Revision = currentRevision + 1
 		if _, err := tx.Exec(`UPDATE tasks
 				SET active_llm_profile_id=NULL, llm_profile_id=NULL, llm_chain_revision=llm_chain_revision+1
 				WHERE id=$1`, taskID); err != nil {

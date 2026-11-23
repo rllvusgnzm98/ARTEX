@@ -113,3 +113,18 @@ func TestTaskLLMChainExhaustedIsSupplyFailure(t *testing.T) {
 		t.Fatal("wrapped chain-exhausted error must still classify")
 	}
 }
+
+func TestLateSupplyFailureDoesNotRefreezeReplacedChain(t *testing.T) {
+	t.Cleanup(releaseAllTaskSupply)
+	task := &Task{ID: "task-replaced", LLMChainRevision: 5}
+	if applySupplyHoldAt(task, 4) || taskSupplyFrozen(task) {
+		t.Fatal("failure from a replaced chain revision must not freeze the task")
+	}
+	if !applySupplyHoldAt(task, 5) || !taskSupplyFrozen(task) {
+		t.Fatal("failure at the current revision must freeze the task")
+	}
+	releaseTaskSupply(task.ID)
+	if !applySupplyHoldAt(task, 0) || !taskSupplyFrozen(task) {
+		t.Fatal("failure with unknown revision keeps the legacy freeze")
+	}
+}
