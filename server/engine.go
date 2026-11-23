@@ -1126,6 +1126,12 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		wrote = wrote.Add(attemptWrites)
 		e.EndLLMCall(t.ID)
 	}
+	// 止损锁定后的额度耗尽已由路由记账并切到备用 profile:本次不重放,按止损收场,
+	// 不把整个任务当供应故障冻结。
+	if loss.Fired() && isTaskLLMFailoverReady(err) {
+		log.Printf("[worker %s] task %s 意图 #%d 止损后额度耗尽，已切换备用 profile，按止损收场: %v", name, t.ID, intent.ID, err)
+		err = nil
+	}
 	// Capture kill state before detachWork cancels workCtx. kill = this work's
 	// ctx was cancelled (planner kill_work) while the TASK ctx kept running; a
 	// pause cancels the task ctx (ectx) instead. Checking workCtx.Err() AFTER
