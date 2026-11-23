@@ -59,9 +59,12 @@ services:
     command: >
       sh -c "apk add --no-cache curl xz coreutils >/dev/null &&
              curl -fsSL https://github.com/jm33-m0/emp3r0r/releases/download/${EMP3R0R_VERSION:-v5.9.1}/emp3r0r -o /usr/bin/emp3r0r &&
-             ( [ -n '${EMP3R0R_SHA256:-}' ] &&
-               echo \"${EMP3R0R_SHA256}  /usr/bin/emp3r0r\" | sha256sum -c - ||
-               echo '[emp3r0r] WARN: EMP3R0R_SHA256 未设置，二进制未校验完整性' ) &&
+             ( if [ -n '${EMP3R0R_SHA256:-}' ]; then
+                 echo \"${EMP3R0R_SHA256}  /usr/bin/emp3r0r\" | sha256sum -c - ||
+                   { echo '[emp3r0r] FAIL: 校验和不匹配，拒绝启动'; exit 1; };
+               else
+                 echo '[emp3r0r] WARN: EMP3R0R_SHA256 未设置，二进制未校验完整性';
+               fi ) &&
              chmod +x /usr/bin/emp3r0r &&
              emp3r0r server --port ${EMP3R0R_WG_PORT:-13377} --operators artex"
     environment:
