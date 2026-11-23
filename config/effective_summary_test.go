@@ -124,6 +124,22 @@ func TestEffectiveSummaryKeepsNoDSN(t *testing.T) {
 	}
 }
 
+func TestEffectiveSummaryDoesNotGuessLoginPasswordWhenDSNParsingFails(t *testing.T) {
+	for _, dsn := range []string{
+		"postgres://user@localhost/postgres?sslpassword=TLS-KEY-ONLY&sslmode=bogus",
+		"host=localhost user=user sslpassword=TLS-KEY-ONLY sslmode=bogus",
+	} {
+		t.Setenv("ARTEX_PG_DSN", dsn)
+		sum := EffectiveSummary()
+		if sum["db_identity_parsed"] != false {
+			t.Fatal("invalid DSN must not be reported as parsed")
+		}
+		if _, ok := sum["db_password_set"]; ok {
+			t.Fatal("login password status must be unknown after a parse failure")
+		}
+	}
+}
+
 // TestConnectionIdentityUsesRealParser 覆盖手写切分会错的三种 DSN：引号里的口令可以含
 // 空格甚至 "dbname=" 字样、`=` 两侧可以有空白、URL 查询串能覆盖 host/port/dbname。
 // 这些都曾让快照指向错误的库，或把口令碎片当成库名记进去。

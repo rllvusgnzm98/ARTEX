@@ -409,7 +409,6 @@ func connectionIdentity(dsn string) map[string]any {
 	if err != nil {
 		return map[string]any{
 			"db_identity_parsed": false,
-			"db_password_set":    len(dsnSecretValues(dsn)) > 0,
 		}
 	}
 	out := map[string]any{
@@ -634,7 +633,7 @@ func TaskProxyPortRange() string {
 // 还叠了环境变量、默认值归一化，以及 SetListenAddr 这类运行期写入。做运行溯源必须记后者，
 // 否则快照可能显示一份进程从未使用过的端口区间或 DSN 来源。
 //
-// 凭据只记「是否配置」与来源，DSN 一律经 Redact 打码后再记，绝不落原文口令。
+// 凭据只记「是否配置」与来源，不记录 DSN。
 //
 // 刻意不含 host_pace_rps：每主机限速可由 Settings 在运行期改写（Manager.SetHostPace），
 // 生效值只有 Manager 知道，这里给出的只会是启动默认值。该字段由 server 侧补上生效值。
@@ -664,7 +663,7 @@ func EffectiveSummary() map[string]any {
 		out[k] = v
 	}
 	if err != nil {
-		out["db_dsn_error"] = ScrubSecrets(dsn, err.Error())
+		out["db_dsn_error"] = err.Error()
 	}
 	return out
 }

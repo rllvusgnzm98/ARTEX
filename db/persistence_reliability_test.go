@@ -454,11 +454,7 @@ func TestDevBuildWithoutCommitIsNotRecorded(t *testing.T) {
 	}
 }
 
-// TestProbeErrorDoesNotLeakDSNPassword 是评审第 1 条（阻塞项）的回归测试，不需要活库：
-// 一条带查询串口令、且 sslmode 非法的 URL 会在连接之前就被 pgx 拒绝，而 pgx 的解析错误
-// 把整条 DSN 嵌进 message，且只打码 URL userinfo 与 libpq 键值形态。实测 `?password=`
-// 与 `?sslpassword=` 原样输出，再经 artex doctor 打印、或 log.Fatalf("open stores: %v")
-// 落进日志。连接路径的错误必须先过 ScrubSecrets。
+// pgx can include the original DSN in errors for invalid connection settings.
 func TestProbeErrorDoesNotLeakDSNPassword(t *testing.T) {
 	const canary = "PW-LEAK-CANARY"
 	for _, dsn := range []string{
@@ -473,6 +469,9 @@ func TestProbeErrorDoesNotLeakDSNPassword(t *testing.T) {
 		}
 		if strings.Contains(err.Error(), canary) {
 			t.Fatalf("连接错误泄露了口令原文:\n  %v", err)
+		}
+		if err.Error() != "invalid PostgreSQL DSN" || errors.Unwrap(err) != nil {
+			t.Fatal("expected only a fixed reason, without the underlying parse error")
 		}
 	}
 }
