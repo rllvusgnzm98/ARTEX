@@ -192,7 +192,8 @@ func TestEnginePostStopLossRecordsOneTermination(t *testing.T) {
 				wantClass, wantCalls = "cancelled", 3
 			}
 			if mode == "link_timeout" {
-				wantClass, wantCalls = "persistence_failed", 4
+				// The stop hook offers one write-back round before ending the run.
+				wantClass, wantCalls = "persistence_failed", 5
 				wantWrites.Failures = 1
 				triggers := task.drainTriggers()
 				if len(triggers) != 1 || triggers[0].Kind != "done" || triggers[0].IntentID != iid {
