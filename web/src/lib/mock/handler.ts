@@ -205,6 +205,33 @@ const mockIntents = structuredClone(D.intents);
 const mockCompanies = structuredClone(D.companies);
 const mockAssets = structuredClone(D.assets);
 const mockActivity = structuredClone(D.activity);
+let nextMockTTPID = 3;
+const mockTTP: Record<string, unknown>[] = [
+  {
+    id: 1,
+    source: "retro",
+    category: "web",
+    scene: "拿到低权接口后",
+    criteria: "返回体是否带他人对象标识(可用 B 账号复现)",
+    pivot: "有则转水平越权枚举,无则换对象类型/方法",
+    status: "pending",
+    confidence: 0,
+    task_id: 1,
+    created_at: new Date().toISOString(),
+  },
+  {
+    id: 2,
+    source: "writeup",
+    category: "recon",
+    scene: "只有根域名",
+    criteria: "多源被动交叉验证归属,新增趋零即收敛",
+    pivot: "名称反查噪声大就换指纹锚点(favicon/证书 SAN)",
+    status: "pending",
+    confidence: 0.6,
+    origin_ref: "示例 writeup",
+    created_at: new Date().toISOString(),
+  },
+];
 type MockTaskArchiveSnapshot = {
   task: Task;
   numericTaskID: number;
@@ -2506,6 +2533,36 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
 
   // ── 旁路提问(/btw)：demo 无旁路会话 ──
   // 必须显式命中：路径以 s 结尾会被下面的读兜底判成集合返回 []，items 就成了 undefined。
+  // ── 结构化复盘 / TTP 审核 (demo) ──
+  if (seg[0] === "ttp" && seg[1] === "entries" && seg.length === 2 && m === "GET") {
+    const status = q.get("status");
+    return { entries: mockTTP.filter((entry) => !status || entry.status === status) };
+  }
+  if (seg[0] === "ttp" && seg[1] === "entries" && seg[3] && m === "POST") {
+    const entry = mockTTP.find((candidate) => candidate.id === Number(seg[2]));
+    if (!entry) throw new Error("条目不存在");
+    if (entry.status !== "pending") throw new Error("该条目已审核");
+    entry.status = seg[3] === "approve" ? "approved" : "rejected";
+    entry.reviewed_at = new Date().toISOString();
+    return { ok: true, entry: structuredClone(entry) };
+  }
+  if (seg[0] === "ttp" && seg[1] === "writeups" && m === "POST") {
+    const text = typeof b.text === "string" ? b.text.trim() : "";
+    if (!text) throw new Error("writeup 内容不能为空");
+    mockTTP.unshift({
+      id: nextMockTTPID++,
+      source: "writeup",
+      category: "meta",
+      scene: "演示:从 writeup 解析出的处境",
+      criteria: "演示判据(真实环境由模型解析)",
+      pivot: "演示转向",
+      status: "pending",
+      confidence: 0.5,
+      origin_ref: typeof b.origin_ref === "string" ? b.origin_ref : "",
+      created_at: new Date().toISOString(),
+    });
+    return { ok: true, queued: 1 };
+  }
   if (seg.at(-1) === "side-questions") {
     if (m === "GET") return { items: [], current: null, next_cursor: 0, snapshot: null };
     if (m === "POST") throw new Error("演示模式不支持旁路提问");

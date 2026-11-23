@@ -108,6 +108,7 @@ import type {
   TrafficEvidenceRole,
   TrafficHost,
   TrafficResp,
+  TTPEntry,
   TunnelRecord,
   UpdateCheck,
   UsageStats,
@@ -523,6 +524,15 @@ export const api = {
     post<{ ok: boolean }>(`/tasks/${encodeURIComponent(id)}/goals/${goalId}/anchors`, { asset_id: assetId }),
   unanchorGoalAsset: (id: string, goalId: string, assetId: number) =>
     del<{ ok: boolean }>(`/tasks/${encodeURIComponent(id)}/goals/${goalId}/anchors/${assetId}`),
+  // ---- 结构化复盘 / TTP 沉淀 ----
+  ttpEntries: (status?: string) =>
+    get<{ entries: TTPEntry[] }>(`/ttp/entries${status ? `?status=${encodeURIComponent(status)}` : ""}`).then((r) => ({
+      entries: arr(r.entries),
+    })),
+  approveTTP: (id: number) => post<{ ok: boolean; entry?: TTPEntry }>(`/ttp/entries/${id}/approve`),
+  rejectTTP: (id: number) => post<{ ok: boolean; entry?: TTPEntry }>(`/ttp/entries/${id}/reject`),
+  importWriteup: (text: string, originRef?: string) =>
+    post<{ ok: boolean; queued: number }>("/ttp/writeups", { text, origin_ref: originRef ?? "" }),
   deleteAssets: (ids: number[]) =>
     http<{ deleted: number }>("/assets", { method: "DELETE", body: JSON.stringify({ ids }) }),
   // task-scoped view of the same endpoint — server-side paginated like `assets`

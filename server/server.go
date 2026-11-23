@@ -283,6 +283,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	go s.reconcileConcurrency()
 	s.startTaskArchiveWorker()
 	s.wireInterceptReviewer()      // LLM 兜底审批:未命中拦截规则的命令交给模型判定
+	s.wireRetro()                  // 任务收官自动复盘 + 审核通过的 TTP 运行时并入决策语料
 	s.bootJWTKeyRing(keyDir)       // 签名钥匙环；按龄轮换，并启动可停止的 6h 检查
 	s.registerEgressFingerprints() // 出口敏感指纹(只存哈希);profile/jwt/钥匙环已就绪后注册
 	go s.engine.processHeartbeat(s.ctx)
@@ -796,6 +797,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/assets", s.deleteAssets)
 	mux.HandleFunc("POST /api/assets/{id}/crown-jewel", s.markCrownJewel)     // 目标导向:标记靶标资产
 	mux.HandleFunc("DELETE /api/assets/{id}/crown-jewel", s.unmarkCrownJewel) // 目标导向:取消靶标
+	// 结构化复盘与 TTP 沉淀:人工审核流水线 + 外部 writeup 导入(入库待审→通过并入决策语料)
+	mux.HandleFunc("GET /api/ttp/entries", s.listTTPEntries)
+	mux.HandleFunc("POST /api/ttp/entries/{id}/approve", s.approveTTPEntry)
+	mux.HandleFunc("POST /api/ttp/entries/{id}/reject", s.rejectTTPEntry)
+	mux.HandleFunc("POST /api/ttp/writeups", s.importWriteup)
 
 	// company system
 	mux.HandleFunc("GET /api/companies", s.listCompanies)

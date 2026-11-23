@@ -268,6 +268,9 @@ func (e *Engine) settleTask(ctx context.Context, t *Task) {
 	default:
 		log.Printf("[deadline] task %s 收尾时已是终态,保留原状态", t.ID)
 	}
+	if met {
+		e.fireRetro(t.ID) // 超时收尾也判定目标达成 → 同样触发一次复盘
+	}
 }
 
 // runFinalPlannerRound drives exactly ONE terminal planner round with the
