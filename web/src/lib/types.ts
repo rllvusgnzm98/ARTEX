@@ -1617,7 +1617,6 @@ export interface InterceptExecution {
   items: Activity[];
 }
 
-
 /** GET /api/intranet/topology 的主机节点。 */
 export interface IntranetNode {
   id: string;
@@ -1739,4 +1738,21 @@ export interface Credential {
 export interface CredentialList {
   items: Credential[];
   skipped: number;
+}
+
+// 结构化复盘与 TTP 沉淀: a reviewable 场景→判据→转向 decision-skeleton entry.
+export interface TTPEntry {
+  id: number;
+  source: "retro" | "writeup";
+  category: string;
+  scene: string;
+  criteria: string;
+  pivot: string;
+  status: "pending" | "approved" | "rejected";
+  confidence: number;
+  task_id?: number;
+  origin_ref?: string;
+  created_at: string;
+  reviewed_at?: string;
+  reviewer?: string;
 }
