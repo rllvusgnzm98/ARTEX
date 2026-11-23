@@ -710,7 +710,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if !budgetProvider.loss.Fired() {
 		w.recoverSettlement(ctx, s, opts, settle, err, tsx, emitWrap)
 	}
-	return reason, tsx.Writes(), err
+	return reason, tsx.finishEvidenceWrites(), err
 }
 
 func captureWorkerSession(ctx context.Context, s *agentcore.Session, input string, emit func(db.Activity)) (harness.TerminalReason, error) {

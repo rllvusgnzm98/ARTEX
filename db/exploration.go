@@ -896,7 +896,11 @@ WHERE exploration_id=$1 AND kind='intent' AND state='open'`, s.expID).Scan(&n)
 
 // GetNode returns one node of this exploration by id (nil, nil if not found).
 func (s *ExplorationStore) GetNode(id int64) (*Node, error) {
-	n, err := scanNode(s.db.QueryRow(`SELECT `+nodeCols+` FROM exploration_nodes WHERE id=$1 AND exploration_id=$2`, id, s.expID))
+	return s.GetNodeCtx(context.Background(), id)
+}
+
+func (s *ExplorationStore) GetNodeCtx(ctx context.Context, id int64) (*Node, error) {
+	n, err := scanNode(s.db.QueryRowContext(ctx, `SELECT `+nodeCols+` FROM exploration_nodes WHERE id=$1 AND exploration_id=$2`, id, s.expID))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

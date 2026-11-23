@@ -212,6 +212,10 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 			if t.as == nil {
 				return actool.Errorf("insert_assets 未启用: AssetStore 未初始化"), nil
 			}
+			if !t.beginEvidenceWrite(ctx) {
+				return actool.Errorf("evidence write interrupted"), nil
+			}
+			defer t.writeWG.Done()
 			var a struct {
 				Assets []assetInputItem `json:"assets"`
 			}
@@ -348,13 +352,15 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 				}
 
 				if err != nil {
-					t.writes.Failures++
+					t.countWrites(WriteCounts{Failures: 1})
 					errs = append(errs, errEntry{Index: i, Error: err.Error()})
 					continue
 				}
 				results = append(results, result{Index: i, ID: id, Type: typ})
-				t.writes.Assets++
-				t.anchorOwner(id)
+				t.countWrites(WriteCounts{Assets: 1})
+				if t.ts != nil && t.ownerNode > 0 && id > 0 {
+					_ = t.ts.AnchorCtx(ctx, t.ownerNode, id)
+				}
 				if taskID > 0 {
 					var sourceNodeID *int64
 					if t.ownerNode > 0 {
@@ -366,7 +372,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 						summary = fmt.Sprintf("Worker 意图 #%d 通过 insert_assets 登记", t.ownerNode)
 					}
 					if err := t.as.SetTaskAssetSourceCtx(ctx, taskID, id, "agent", summary, sourceNodeID); err != nil {
-						t.writes.Failures++
+						t.countWrites(WriteCounts{Failures: 1})
 					}
 				}
 				// 自动入测试范围(source='auto')：只对 worker 顶层显式插入的这一项，按其
@@ -379,7 +385,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 						svcIP = item.IP
 					}
 					if err := t.as.AddAutoScopeCtx(ctx, taskID, typ, item.Domain, item.URL, svcIP); err != nil {
-						t.writes.Failures++
+						t.countWrites(WriteCounts{Failures: 1})
 					}
 				}
 			}

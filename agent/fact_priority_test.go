@@ -13,6 +13,32 @@ import (
 	"github.com/Autumn-27/artex/db"
 )
 
+func TestRecordFactIntentLookupDistinguishesDeadlineFromInvalidInput(t *testing.T) {
+	d, es := retentionStore(t)
+	intent, err := es.AddIntent(map[string]any{"summary": "record facts"}, 0, nil, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := NewToolSet(es, "worker")
+	item := factItem{Summary: "checkpoint"}
+	if _, err := ts.recordOneFactCtx(t.Context(), item, intent+1); err == nil || ts.Writes() != (WriteCounts{}) {
+		t.Fatalf("missing intent: error=%v writes=%#v", err, ts.Writes())
+	}
+	lock, err := d.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Rollback()
+	if _, err := lock.Exec("LOCK TABLE exploration_nodes IN ACCESS EXCLUSIVE MODE"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	if _, err := ts.recordOneFactCtx(ctx, item, intent); !errors.Is(err, context.DeadlineExceeded) || ts.Writes() != (WriteCounts{Failures: 1}) {
+		t.Fatalf("blocked intent lookup: error=%v writes=%#v", err, ts.Writes())
+	}
+}
+
 func TestRecordFactRollsBackWhenIntentLinkMissesDeadline(t *testing.T) {
 	d, es := retentionStore(t)
 	intent, err := es.AddIntent(map[string]any{"summary": "record facts"}, 0, nil, "test")
