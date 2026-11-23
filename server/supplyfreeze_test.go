@@ -128,3 +128,26 @@ func TestLateSupplyFailureDoesNotRefreezeReplacedChain(t *testing.T) {
 		t.Fatal("failure with unknown revision keeps the legacy freeze")
 	}
 }
+
+func TestStaleSupplyRollbackKeepsReplacementChainFreeze(t *testing.T) {
+	t.Cleanup(releaseAllTaskSupply)
+	t.Cleanup(func() { afterSupplyHoldSwap = nil })
+	task := &Task{ID: "task-rollback", LLMChainRevision: 4}
+	afterSupplyHoldSwap = func() {
+		afterSupplyHoldSwap = nil
+		// Operator replaces the chain, then a worker on the new chain freezes.
+		task.llmMu.Lock()
+		task.LLMChainRevision = 5
+		task.llmMu.Unlock()
+		releaseTaskSupply(task.ID)
+		if !applySupplyHoldAt(task, 5) {
+			t.Error("current-revision failure did not freeze")
+		}
+	}
+	if applySupplyHoldAt(task, 4) {
+		t.Fatal("stale failure froze the replaced chain")
+	}
+	if !taskSupplyFrozen(task) {
+		t.Fatal("stale rollback cleared the replacement chain's freeze")
+	}
+}

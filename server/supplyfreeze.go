@@ -12,13 +12,16 @@ import (
 // persisted LLMFailoverState of "chain_exhausted" is frozen even after a
 // restart; this map covers the no-explicit-chain path (global / single
 // profile) until an operator resets health or edits the chain.
-var supplyHolds sync.Map // taskID -> struct{}
+var supplyHolds sync.Map // taskID -> *supplyHold
+
+// supplyHold is a distinct token per hold, so a rollback removes only its own.
+type supplyHold struct{ _ byte }
 
 func holdTaskSupply(taskID string) {
 	if taskID == "" {
 		return
 	}
-	supplyHolds.Store(taskID, struct{}{})
+	supplyHolds.Store(taskID, &supplyHold{})
 }
 
 func releaseTaskSupply(taskID string) {
@@ -65,6 +68,8 @@ func applySupplyHold(t *Task) {
 // revision (0 = unknown). A chain replaced since then already released the
 // hold, so a late failure must not restore it; the re-check after holding
 // closes the race with a concurrent replacement.
+var afterSupplyHoldSwap func() // test hook
+
 func applySupplyHoldAt(t *Task, revision int64) bool {
 	if t == nil {
 		return false
@@ -73,9 +78,17 @@ func applySupplyHoldAt(t *Task, revision int64) bool {
 	if replaced() {
 		return false
 	}
-	holdTaskSupply(t.ID)
+	own := &supplyHold{}
+	prev, held := supplyHolds.Swap(t.ID, own)
+	if afterSupplyHoldSwap != nil {
+		afterSupplyHoldSwap()
+	}
 	if replaced() {
-		releaseTaskSupply(t.ID)
+		if held {
+			supplyHolds.CompareAndSwap(t.ID, own, prev)
+		} else {
+			supplyHolds.CompareAndDelete(t.ID, own)
+		}
 		return false
 	}
 	return true
