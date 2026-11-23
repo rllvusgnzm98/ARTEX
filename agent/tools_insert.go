@@ -212,6 +212,10 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 			if t.as == nil {
 				return actool.Errorf("insert_assets 未启用: AssetStore 未初始化"), nil
 			}
+			if !t.beginEvidenceWrite(ctx) {
+				return actool.Errorf("evidence write interrupted"), nil
+			}
+			defer t.endEvidenceWrite()
 			var a struct {
 				Assets []assetInputItem `json:"assets"`
 			}
@@ -316,9 +320,6 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 							IP:            svcIP,
 							TaskID:        taskID,
 						})
-						if err == nil {
-							t.evaluateHoneypot(id, serviceViewFromItem(item, true))
-						}
 					} else {
 						id, err = t.as.UpsertOtherServiceCtx(ctx, db.UpsertOtherServiceReq{
 							Domain:      item.Domain,
@@ -328,9 +329,6 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 							Auth:        item.Auth,
 							TaskID:      taskID,
 						})
-						if err == nil {
-							t.evaluateHoneypot(id, serviceViewFromItem(item, false))
-						}
 					}
 
 				case "endpoint":
@@ -348,12 +346,18 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 				}
 
 				if err != nil {
+					t.countWrites(WriteCounts{Failures: 1})
 					errs = append(errs, errEntry{Index: i, Error: err.Error()})
 					continue
 				}
 				results = append(results, result{Index: i, ID: id, Type: typ})
-				t.writes.Assets++
-				t.anchorOwner(id)
+				t.countWrites(WriteCounts{Assets: 1})
+				if typ == "service" {
+					t.evaluateHoneypot(id, serviceViewFromItem(item, item.URL != ""))
+				}
+				if t.ts != nil && t.ownerNode > 0 && id > 0 {
+					_ = t.ts.AnchorCtx(ctx, t.ownerNode, id)
+				}
 				if taskID > 0 {
 					var sourceNodeID *int64
 					if t.ownerNode > 0 {
@@ -364,7 +368,9 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 					if t.ownerNode > 0 {
 						summary = fmt.Sprintf("Worker 意图 #%d 通过 insert_assets 登记", t.ownerNode)
 					}
-					_ = t.as.SetTaskAssetSourceCtx(ctx, taskID, id, "agent", summary, sourceNodeID)
+					if err := t.as.SetTaskAssetSourceCtx(ctx, taskID, id, "agent", summary, sourceNodeID); err != nil {
+						t.countWrites(WriteCounts{Failures: 1})
+					}
 				}
 				// 自动入测试范围(source='auto')：只对 worker 顶层显式插入的这一项，按其
 				// 类型加保守范围；side-effect 派生的资产不经此处，故范围不盲目扩大。taskID=0 时无操作。
@@ -375,7 +381,9 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 					if svcIP == "" {
 						svcIP = item.IP
 					}
-					_ = t.as.AddAutoScopeCtx(ctx, taskID, typ, item.Domain, item.URL, svcIP)
+					if err := t.as.AddAutoScopeCtx(ctx, taskID, typ, item.Domain, item.URL, svcIP); err != nil {
+						t.countWrites(WriteCounts{Failures: 1})
+					}
 				}
 			}
 

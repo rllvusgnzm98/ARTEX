@@ -8,10 +8,21 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/norma/llm"
 )
 
 type runBudgetKey struct{}
+type modelRetryStopKey struct{}
+
+func WithModelRetryStop(ctx context.Context, monitor *StopLossMonitor) context.Context {
+	return llmpool.WithFailoverStop(context.WithValue(ctx, modelRetryStopKey{}, monitor), monitor.Fired)
+}
+
+func ModelRetriesStopped(ctx context.Context) bool {
+	monitor, _ := ctx.Value(modelRetryStopKey{}).(*StopLossMonitor)
+	return monitor.Fired()
+}
 
 type runBudget struct {
 	work, hard time.Time
@@ -43,11 +54,22 @@ func isRunBudgetError(err error) bool {
 }
 
 type runBudgetProvider struct {
-	inner llm.Provider
-	calls *atomic.Int64
+	inner         llm.Provider
+	calls         *atomic.Int64
+	loss          *StopLossMonitor
+	postLossCalls atomic.Int64
+}
+
+const maxPostStopLossTurns = 3
+
+func (p *runBudgetProvider) postStopLossLimitReached() bool {
+	return p.loss.Fired() && p.postLossCalls.Add(1) > maxPostStopLossTurns
 }
 
 func (p *runBudgetProvider) callContext(ctx context.Context) (context.Context, context.CancelFunc, time.Time) {
+	if p.loss != nil {
+		ctx = WithModelRetryStop(ctx, p.loss)
+	}
 	if p.calls != nil {
 		p.calls.Add(1)
 	}
@@ -56,7 +78,7 @@ func (p *runBudgetProvider) callContext(ctx context.Context) (context.Context, c
 		return ctx, func() {}, time.Time{}
 	}
 	deadline := b.work
-	if b.recovery || !time.Now().Before(b.work) {
+	if p.loss.Fired() || b.recovery || !time.Now().Before(b.work) {
 		deadline = b.hard
 	}
 	callCtx, cancel := context.WithDeadline(ctx, deadline)
@@ -71,6 +93,12 @@ func runDeadlineError(parent, call context.Context, deadline time.Time, err erro
 }
 
 func (p *runBudgetProvider) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	if err := ctx.Err(); err != nil {
+		return llm.Message{}, "", llm.Usage{}, err
+	}
+	if p.postStopLossLimitReached() {
+		return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock(p.loss.Verdict().Message())}}, "end_turn", llm.Usage{}, nil
+	}
 	callCtx, cancel, deadline := p.callContext(ctx)
 	defer cancel()
 	msg, stop, usage, err := p.inner.Complete(callCtx, req)
@@ -79,6 +107,18 @@ func (p *runBudgetProvider) Complete(ctx context.Context, req llm.CompletionRequ
 
 func (p *runBudgetProvider) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
 	return func(yield func(llm.StreamEvent, error) bool) {
+		if err := ctx.Err(); err != nil {
+			yield(llm.StreamEvent{}, err)
+			return
+		}
+		if p.postStopLossLimitReached() {
+			if yield(llm.StreamEvent{Type: llm.SEMessageStart}, nil) &&
+				yield(llm.StreamEvent{Type: llm.SETextDelta, Text: p.loss.Verdict().Message()}, nil) &&
+				yield(llm.StreamEvent{Type: llm.SEMessageDelta, StopReason: "end_turn"}, nil) {
+				yield(llm.StreamEvent{Type: llm.SEMessageStop}, nil)
+			}
+			return
+		}
 		callCtx, cancel, deadline := p.callContext(ctx)
 		defer cancel()
 		for ev, err := range p.inner.Stream(callCtx, req) {

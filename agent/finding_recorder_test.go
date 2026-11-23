@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/evidence"
@@ -16,6 +17,91 @@ type failingFindingRecorder struct{}
 
 func (failingFindingRecorder) Record(context.Context, db.RecordFindingInput, []db.TrafficRef) (*db.RecordedFinding, error) {
 	return nil, errors.New("fixture persistence failed")
+}
+
+func TestReportFindingCancellationWhileTaskLocked(t *testing.T) {
+	d := testDB(t)
+	t.Cleanup(func() { d.Close() })
+	task, err := d.CreateTask("locked task evidence", "fixture", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.DeleteTask(task.ID) })
+	locker, err := d.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Rollback()
+	var pid int
+	if err := locker.QueryRow(`SELECT pg_backend_pid() FROM tasks WHERE id=$1 FOR UPDATE`, task.ID).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := NewToolSet(d.Exploration(task.ExplorationID), "fixture")
+	ts.SetTaskID(task.ID)
+	ts.SetFindingRecorder(evidence.New(d, nil, t.TempDir()))
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	done := make(chan bool, 1)
+	go func() {
+		res, err := ts.addFinding().Call(ctx, json.RawMessage(`{"vulnclass":"TEST","summary":"blocked report","severity":"low"}`), nil)
+		done <- err == nil && res.IsError
+	}()
+	for {
+		var waiting bool
+		if err := d.QueryRowContext(ctx, `SELECT EXISTS (
+SELECT 1 FROM pg_stat_activity
+WHERE query LIKE 'SELECT deleted_at FROM tasks WHERE id=%'
+  AND $1 = ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+			t.Fatalf("report_finding never reached the task lock: %v", err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case <-done:
+			t.Fatal("report_finding exited before reaching the task lock")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case failed := <-done:
+		if !failed || ts.finishEvidenceWrites() != (WriteCounts{Failures: 1}) {
+			t.Fatalf("cancelled report failed=%v, counters=%+v", failed, ts.Writes())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled report remained blocked on the task lock")
+	}
+}
+
+func TestEvidenceDrainTimeoutSnapshotsCommittedWrites(t *testing.T) {
+	ts := NewToolSet(nil, "")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	if !ts.beginEvidenceWrite(ctx) {
+		t.Fatal("first write was not admitted")
+	}
+	ts.countWrites(WriteCounts{Facts: 1})
+	cancel()
+	done := make(chan WriteCounts, 1)
+	go func() { done <- ts.finishEvidenceWrites() }()
+	var snapshot WriteCounts
+	select {
+	case snapshot = <-done:
+	case <-time.After(2 * time.Second):
+		ts.endEvidenceWrite()
+		t.Fatal("drain waited for a write that did not return from cancellation")
+	}
+	if ts.beginEvidenceWrite(t.Context()) {
+		t.Error("admitted another write after closing the drain")
+		ts.endEvidenceWrite()
+	}
+	ts.countWrites(WriteCounts{Findings: 1})
+	ts.endEvidenceWrite()
+	if snapshot != (WriteCounts{Facts: 1, Incomplete: true}) {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
 }
 
 func TestReportFindingOptionalTrafficWithoutCapture(t *testing.T) {

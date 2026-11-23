@@ -681,6 +681,7 @@ export interface Activity {
   detail?: string;
   metadata?: {
     llm_transition?: LLMTransition;
+    outcome_class?: string;
   };
   source_task_id?: string;
   inherited?: boolean;
@@ -1430,6 +1431,7 @@ export interface CommandRecord {
   command: string; // raw tool input (JSON)
   output: string;
   is_error: boolean;
+  outcome_class?: string;
   created_at: string;
 }
 

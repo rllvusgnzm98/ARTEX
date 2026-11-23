@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -105,11 +106,14 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 				continue
 			}
 			flush()
-			out := db.RedactCredentialPayload(toolNames[ev.ToolResult.ToolUseID], blocksText(ev.ToolResult.Content))
+			result := blocksText(ev.ToolResult.Content)
+			out := db.RedactCredentialPayload(toolNames[ev.ToolResult.ToolUseID], result)
 			lastTool.done(ev.ToolResult.ToolUseID)
 			auditTrace.Complete(ev.ToolResult.ToolUseID, out, ev.ToolResult.IsError)
+			outcome := toolActivityOutcome(result, ev.ToolResult.IsError)
+			isError := ev.ToolResult.IsError && outcome != "policy_blocked"
 			rec(db.Activity{Kind: "tool_result", Tool: toolNames[ev.ToolResult.ToolUseID], ToolUseID: ev.ToolResult.ToolUseID,
-				IsError: ev.ToolResult.IsError, Summary: firstLine(out, 200), Detail: out})
+				IsError: isError, Summary: firstLine(out, 200), Detail: out, Metadata: outcomeMetadata(outcome)})
 		case harness.KindText:
 			addDelta("text", ev.Text)
 		case harness.KindThinking:
@@ -157,6 +161,25 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 	}
 	flush() // safety: any unflushed text if the stream ended without KindResult
 	return finalText, reason, rerr
+}
+
+func toolActivityOutcome(result string, isError bool) string {
+	if !isError {
+		return "executed"
+	}
+	switch {
+	case strings.HasPrefix(result, "Blocked by hook:"), strings.HasPrefix(result, "Tool call was not permitted:"):
+		return "policy_blocked"
+	case strings.HasPrefix(result, "Error: unknown tool "), strings.HasPrefix(result, "Error: invalid tool input:"):
+		return "unknown"
+	default:
+		return "tool_error"
+	}
+}
+
+func outcomeMetadata(outcome string) json.RawMessage {
+	data, _ := json.Marshal(map[string]string{"outcome_class": outcome})
+	return data
 }
 
 func activityWithUsage(activity db.Activity, usage *llm.Usage) db.Activity {

@@ -49,6 +49,16 @@ function truncate(s: string, maxLen: number): string {
 const PAGE_SIZES = [25, 50, 100];
 const CMD_MAX_LEN = 80;
 
+function CommandOutcomeBadge({ command }: { command: CommandRecord }) {
+  if (command.outcome_class === "policy_blocked") {
+    return <Badge variant="outline" className="text-xs">已拦截</Badge>;
+  }
+  if (command.outcome_class === "tool_error" || command.is_error) {
+    return <Badge variant="destructive" className="text-xs">失败</Badge>;
+  }
+  return <Badge variant="secondary" className="text-xs text-emerald-600">成功</Badge>;
+}
+
 export default function CommandsPage() {
   const [page, setPage] = React.useState(0);
   const [size, setSize] = React.useState(50);
@@ -253,15 +263,7 @@ export default function CommandsPage() {
                         </code>
                       </TableCell>
                       <TableCell>
-                        {cmd.is_error ? (
-                          <Badge variant="destructive" className="text-xs">
-                            失败
-                          </Badge>
-                        ) : (
-                          <Badge variant="secondary" className="text-xs text-emerald-600">
-                            成功
-                          </Badge>
-                        )}
+                        <CommandOutcomeBadge command={cmd} />
                       </TableCell>
                     </TableRow>
                   ))
@@ -349,15 +351,7 @@ export default function CommandsPage() {
                   <Badge variant="secondary" className="text-xs font-mono">
                     {selected.tool || "-"}
                   </Badge>
-                  {selected.is_error ? (
-                    <Badge variant="destructive" className="text-xs">
-                      失败
-                    </Badge>
-                  ) : (
-                    <Badge variant="secondary" className="text-xs text-emerald-600">
-                      成功
-                    </Badge>
-                  )}
+                  <CommandOutcomeBadge command={selected} />
                 </div>
               </SheetHeader>
               <div className="grid min-h-0 flex-1 grid-rows-2 divide-y">
@@ -375,7 +369,9 @@ export default function CommandsPage() {
                     <pre
                       className={cn(
                         "p-5 font-mono text-xs break-all whitespace-pre-wrap",
-                        selected.is_error && "text-red-600 dark:text-red-400",
+                        selected.outcome_class !== "policy_blocked" &&
+                          (selected.outcome_class === "tool_error" || selected.is_error) &&
+                          "text-red-600 dark:text-red-400",
                       )}
                     >
                       {selected.output || "（空）"}

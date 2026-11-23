@@ -302,13 +302,17 @@ func (sc *Scheduler) fireToolCalls(triggers []*db.AgentTrigger) {
 		if len(want) == 0 {
 			continue
 		}
+		if e.ToolOutcome == "policy_blocked" {
+			continue
+		}
+		toolError := e.ToolOutcome == "tool_error" || (e.ToolOutcome == "unknown" && e.ToolIsErr)
 		// A failed finding write has no committed finding to report. Keep other
 		// tool-error triggers available for user-defined automation.
-		if e.ToolIsErr && e.Tool == "report_finding" {
+		if toolError && e.Tool == "report_finding" {
 			continue
 		}
 		errTag := ""
-		if e.ToolIsErr {
+		if toolError {
 			errTag = "[error] "
 		}
 		msgCtx := fmt.Sprintf("\n\n【本次由工具调用触发】\n工具: %s\n入参: %s\n返回: %s%s",

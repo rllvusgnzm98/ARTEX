@@ -10,14 +10,15 @@ import (
 // CommandRecord is a paired tool_use + tool_result from the activity table
 // (any tool, not just Bash). Command holds the raw tool input (JSON).
 type CommandRecord struct {
-	ID        int64     `json:"id"`
-	ExpID     int64     `json:"exploration_id"`
-	Worker    string    `json:"worker"`
-	Tool      string    `json:"tool"`
-	Command   string    `json:"command"`
-	Output    string    `json:"output"`
-	IsError   bool      `json:"is_error"`
-	CreatedAt time.Time `json:"created_at"`
+	ID           int64     `json:"id"`
+	ExpID        int64     `json:"exploration_id"`
+	Worker       string    `json:"worker"`
+	Tool         string    `json:"tool"`
+	Command      string    `json:"command"`
+	Output       string    `json:"output"`
+	IsError      bool      `json:"is_error"`
+	OutcomeClass string    `json:"outcome_class"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 // commandFilter builds the WHERE clause shared by the tool-execution list and
@@ -102,7 +103,8 @@ func (d *DB) ListCommands(expID *int64, q string, page, size int) ([]CommandReco
 	// data query: join tool_use with its tool_result
 	dataQ := `
 SELECT u.id, u.exploration_id, COALESCE(u.worker,''), COALESCE(u.tool,''), COALESCE(u.detail,''),
-       COALESCE(r.detail,''), COALESCE(r.is_error, false), u.created_at
+       COALESCE(r.detail,''), COALESCE(r.is_error, false),
+       COALESCE(NULLIF(r.metadata->>'outcome_class',''),'unknown'), u.created_at
 FROM activity u
 LEFT JOIN activity r ON r.tool_use_id = u.tool_use_id AND r.kind = 'tool_result'
 ` + where + `
@@ -119,7 +121,7 @@ LIMIT $` + fmt.Sprintf("%d", argN) + ` OFFSET $` + fmt.Sprintf("%d", argN+1)
 	out := []CommandRecord{}
 	for rows.Next() {
 		var c CommandRecord
-		if err := rows.Scan(&c.ID, &c.ExpID, &c.Worker, &c.Tool, &c.Command, &c.Output, &c.IsError, &c.CreatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.ExpID, &c.Worker, &c.Tool, &c.Command, &c.Output, &c.IsError, &c.OutcomeClass, &c.CreatedAt); err != nil {
 			return nil, 0, err
 		}
 		out = append(out, c)

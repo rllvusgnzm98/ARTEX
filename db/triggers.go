@@ -149,17 +149,18 @@ ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`, key, value)
 // TaskEvent is a finding/goal event carrying the owning task's info, used to
 // compose the trigger message context.
 type TaskEvent struct {
-	NodeID     int64  `json:"node_id"`
-	TaskID     int64  `json:"task_id"`
-	TaskDesc   string `json:"task_description"`
-	TaskGoal   string `json:"task_goal"`
-	Summary    string `json:"summary"`     // finding summary / goal text
-	VulnClass  string `json:"vulnclass"`   // finding only
-	Severity   string `json:"severity"`    // finding only
-	Tool       string `json:"tool"`        // tool-call only: tool name
-	ToolInput  string `json:"tool_input"`  // tool-call only: 入参(JSON 文本)
-	ToolOutput string `json:"tool_output"` // tool-call only: 返回内容
-	ToolIsErr  bool   `json:"tool_is_err"` // tool-call only: 工具返回是否为错误
+	NodeID      int64  `json:"node_id"`
+	TaskID      int64  `json:"task_id"`
+	TaskDesc    string `json:"task_description"`
+	TaskGoal    string `json:"task_goal"`
+	Summary     string `json:"summary"`     // finding summary / goal text
+	VulnClass   string `json:"vulnclass"`   // finding only
+	Severity    string `json:"severity"`    // finding only
+	Tool        string `json:"tool"`        // tool-call only: tool name
+	ToolInput   string `json:"tool_input"`  // tool-call only: 入参(JSON 文本)
+	ToolOutput  string `json:"tool_output"` // tool-call only: 返回内容
+	ToolIsErr   bool   `json:"tool_is_err"` // tool-call only: 工具返回是否为错误
+	ToolOutcome string `json:"tool_outcome,omitempty"`
 }
 
 // NewFindingsSince returns findings with node id > lastID across all live tasks,
@@ -246,7 +247,8 @@ ORDER BY id`, lastID)
 // (conversation_activities), so a tool-call trigger never fires on its own output.
 func (d *DB) NewToolCallsSince(lastID int64) ([]TaskEvent, error) {
 	rows, err := d.Query(`
-SELECT r.id, t.id, t.description, t.goal, r.tool, COALESCE(u.detail,''), COALESCE(r.detail,''), r.is_error
+SELECT r.id, t.id, t.description, t.goal, r.tool, COALESCE(u.detail,''), COALESCE(r.detail,''), r.is_error,
+       COALESCE(NULLIF(r.metadata->>'outcome_class',''),'unknown')
 FROM activity r
 JOIN tasks t ON t.exploration_id = r.exploration_id
 LEFT JOIN activity u ON u.exploration_id = r.exploration_id AND u.tool_use_id = r.tool_use_id AND u.kind='tool_use'
@@ -259,7 +261,7 @@ ORDER BY r.id`, lastID)
 	out := []TaskEvent{}
 	for rows.Next() {
 		var e TaskEvent
-		if err := rows.Scan(&e.NodeID, &e.TaskID, &e.TaskDesc, &e.TaskGoal, &e.Tool, &e.ToolInput, &e.ToolOutput, &e.ToolIsErr); err != nil {
+		if err := rows.Scan(&e.NodeID, &e.TaskID, &e.TaskDesc, &e.TaskGoal, &e.Tool, &e.ToolInput, &e.ToolOutput, &e.ToolIsErr, &e.ToolOutcome); err != nil {
 			return nil, err
 		}
 		out = append(out, e)

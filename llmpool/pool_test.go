@@ -368,3 +368,32 @@ func TestExpiredWindowIsClosed(t *testing.T) {
 		t.Fatal("expired window should read as closed")
 	}
 }
+
+func TestStoppedFailoverMarksBackup(t *testing.T) {
+	ctx := WithFailoverStop(context.Background(), func() bool { return true })
+	for _, stream := range []bool{true, false} {
+		for _, backup := range []bool{true, false} {
+			a, b := failProv("a", 402), okProv("b", "hello")
+			members := []*Member{member(1, "a", 10, a)}
+			if backup {
+				members = append(members, member(2, "b", 5, b))
+			}
+			p := New(members, NewRegistry(nil, nil))
+			var err error
+			if stream {
+				_, err = drain(p.Stream(ctx, llm.CompletionRequest{}))
+			} else {
+				_, _, _, err = p.Complete(ctx, llm.CompletionRequest{})
+			}
+			if err == nil || !strings.Contains(err.Error(), "402") {
+				t.Fatalf("stream=%t backup=%t: err = %v, want raw 402", stream, backup, err)
+			}
+			if HasStoppedBackup(err) != backup {
+				t.Fatalf("stream=%t backup=%t: HasStoppedBackup = %t", stream, backup, !backup)
+			}
+			if a.calls != 1 || b.calls != 0 {
+				t.Fatalf("stream=%t backup=%t: calls a=%d b=%d, want 1/0", stream, backup, a.calls, b.calls)
+			}
+		}
+	}
+}

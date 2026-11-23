@@ -56,7 +56,11 @@ type taskLLMRuntime struct {
 type taskLLMError struct {
 	taskID         string
 	chainExhausted bool
-	cause          error
+	// failoverReady marks a quota failure the router already booked and advanced
+	// past while stop-loss had latched: the call is not replayed, but the task's
+	// chain still has a usable profile, so the scene must not be frozen.
+	failoverReady bool
+	cause         error
 }
 
 func (e *taskLLMError) Error() string {
@@ -77,6 +81,29 @@ func (e *taskLLMError) Is(target error) bool {
 func isTaskLLMRuntimeError(err error) bool {
 	var target *taskLLMError
 	return errors.As(err, &target)
+}
+
+func isTaskLLMFailoverReady(err error) bool {
+	var target *taskLLMError
+	return errors.As(err, &target) && target.failoverReady
+}
+
+// stoppedQuotaError ends a stop-latched call after its quota failure has been
+// booked, instead of replaying it on the next profile.
+// A stale transition says nothing about the chain's current state (another
+// worker may have exhausted the last profile), so it is re-read.
+func stoppedQuotaError(taskID string, transition db.TaskLLMTransition, cause error, hooks taskLLMStreamHooks) error {
+	exhausted := transition.ChainExhausted
+	ready := !exhausted && transition.NextProfileID != nil
+	if transition.Stale {
+		_, curErr := hooks.current()
+		if curErr != nil && !isTaskLLMChainExhausted(curErr) {
+			return curErr
+		}
+		exhausted = isTaskLLMChainExhausted(curErr)
+		ready = curErr == nil
+	}
+	return &taskLLMError{taskID: taskID, chainExhausted: exhausted, failoverReady: ready, cause: cause}
 }
 
 func isTaskLLMChainExhausted(err error) bool {
@@ -257,12 +284,12 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 		retries, backoffOf := sameProviderRetryPolicy(selection.retry)
 		for attempt := 0; ; attempt++ {
 			msg, sr, usage, callErr = selection.provider.Complete(ctx, req)
-			if callErr != nil && ctx.Err() == nil &&
+			if callErr != nil && ctx.Err() == nil && !agent.ModelRetriesStopped(ctx) &&
 				attempt < retries && isRetryableStreamError(callErr) {
 				backoff := backoffOf(attempt)
 				log.Printf("[task-llm] task %s 非流式调用失败,%v 后同 provider 重试 (%d/%d): %v",
 					taskID, backoff, attempt+1, retries, callErr)
-				if sleepCtx(ctx, backoff) {
+				if sleepCtx(ctx, backoff) || agent.ModelRetriesStopped(ctx) {
 					break // 退避期间 ctx 取消 → 停止重试
 				}
 				continue
@@ -282,6 +309,9 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 		}
 		if transition.Advanced && !transition.Stale && hooks.transition != nil {
 			hooks.transition(selection, transition, callErr)
+		}
+		if agent.ModelRetriesStopped(ctx) {
+			return llm.Message{}, "", llm.Usage{}, stoppedQuotaError(taskID, transition, callErr, hooks)
 		}
 		if !transition.Stale && transition.NextProfileID == nil {
 			return llm.Message{}, "", llm.Usage{}, &taskLLMError{taskID: taskID, chainExhausted: transition.ChainExhausted, cause: callErr}
@@ -331,12 +361,12 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 						return
 					}
 				}
-				if streamErr != nil && !committed && ctx.Err() == nil &&
+				if streamErr != nil && !committed && ctx.Err() == nil && !agent.ModelRetriesStopped(ctx) &&
 					attempt < retries && isRetryableStreamError(streamErr) {
 					backoff := backoffOf(attempt)
 					log.Printf("[task-llm] task %s 提交前流失败,%v 后同 provider 重试 (%d/%d): %v",
 						taskID, backoff, attempt+1, retries, streamErr)
-					if sleepCtx(ctx, backoff) {
+					if sleepCtx(ctx, backoff) || agent.ModelRetriesStopped(ctx) {
 						break // 退避期间 ctx 取消 → 停止重试
 					}
 					continue
@@ -354,7 +384,7 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 			// profileID=0 means the explicit chain was cleared while this stable task
 			// bundle was still in use. Agent/global fallback errors follow the legacy
 			// behavior and never mutate task failover state.
-			if selection.profileID == 0 || !isQuotaExhaustedError(streamErr) {
+			if (committed && agent.ModelRetriesStopped(ctx)) || selection.profileID == 0 || !isQuotaExhaustedError(streamErr) {
 				for _, buffered := range pending {
 					if !yield(buffered, nil) {
 						return
@@ -378,6 +408,15 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 			}
 			if transition.Advanced && !transition.Stale && hooks.transition != nil {
 				hooks.transition(selection, transition, streamErr)
+			}
+			if !committed && agent.ModelRetriesStopped(ctx) {
+				for _, buffered := range pending {
+					if !yield(buffered, nil) {
+						return
+					}
+				}
+				yield(llm.StreamEvent{}, stoppedQuotaError(taskID, transition, streamErr, hooks))
+				return
 			}
 			if committed || (!transition.Stale && transition.NextProfileID == nil) {
 				yield(llm.StreamEvent{}, &taskLLMError{taskID: taskID, chainExhausted: transition.ChainExhausted, cause: streamErr})

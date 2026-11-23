@@ -200,6 +200,14 @@ func (s *ExplorationStore) AddNode(kind string, payload map[string]any, priority
 }
 
 func (s *ExplorationStore) AddNodeCtx(ctx context.Context, kind string, payload map[string]any, priority int, state, origin string, anchors []int64) (int64, error) {
+	return s.addNodeCtx(ctx, kind, payload, priority, state, origin, anchors, 0)
+}
+
+func (s *ExplorationStore) AddFactCtx(ctx context.Context, payload map[string]any, origin string, anchors []int64, intentID int64) (int64, error) {
+	return s.addNodeCtx(ctx, KindFact, payload, 5, "confirmed", origin, anchors, intentID)
+}
+
+func (s *ExplorationStore) addNodeCtx(ctx context.Context, kind string, payload map[string]any, priority int, state, origin string, anchors []int64, intentID int64) (int64, error) {
 	raw, _ := json.Marshal(payload)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -216,6 +224,11 @@ VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
 	for _, a := range anchors {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_anchors(node_id, asset_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, id, a); err != nil {
 			return 0, err
+		}
+	}
+	if intentID > 0 {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_edges(exploration_id, src_id, rel, dst_id) VALUES ($1,$2,$3,$4)`, s.expID, intentID, RelYields, id); err != nil {
+			return 0, fmt.Errorf("link fact to intent %d: %w", intentID, err)
 		}
 	}
 	return id, tx.Commit()
@@ -577,7 +590,7 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 		if err != nil {
 			return out, err
 		}
-		res, err := tx.Exec(`DELETE FROM activity WHERE exploration_id=$1 AND node_id=$2`, s.expID, iid)
+		res, err := tx.Exec(`DELETE FROM activity WHERE exploration_id=$1 AND node_id=$2 AND kind IS DISTINCT FROM 'termination'`, s.expID, iid)
 		if err != nil {
 			return out, err
 		}
@@ -883,7 +896,11 @@ WHERE exploration_id=$1 AND kind='intent' AND state='open'`, s.expID).Scan(&n)
 
 // GetNode returns one node of this exploration by id (nil, nil if not found).
 func (s *ExplorationStore) GetNode(id int64) (*Node, error) {
-	n, err := scanNode(s.db.QueryRow(`SELECT `+nodeCols+` FROM exploration_nodes WHERE id=$1 AND exploration_id=$2`, id, s.expID))
+	return s.GetNodeCtx(context.Background(), id)
+}
+
+func (s *ExplorationStore) GetNodeCtx(ctx context.Context, id int64) (*Node, error) {
+	n, err := scanNode(s.db.QueryRowContext(ctx, `SELECT `+nodeCols+` FROM exploration_nodes WHERE id=$1 AND exploration_id=$2`, id, s.expID))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1285,9 +1302,18 @@ func (s *ExplorationStore) AppendActivityCtx(ctx context.Context, a Activity) (i
 	var id int64
 	err := s.db.QueryRowContext(ctx, `
 INSERT INTO activity(exploration_id, node_id, worker, kind, tool, tool_use_id, is_error, summary, detail, metadata, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, main_seg)
-VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),$7,NULLIF($8,''),NULLIF($9,''),$10,$11,$12,$13,$14,$15)
+VALUES ($1,
+        CASE WHEN $4='termination' THEN (
+            SELECT id FROM exploration_nodes WHERE id=$2 AND exploration_id=$1 FOR KEY SHARE
+        ) ELSE $2 END,
+        NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),$7,NULLIF($8,''),NULLIF($9,''),$10,$11,$12,$13,$14,$15)
+ON CONFLICT (exploration_id, (metadata->>'run_id')) WHERE kind='termination' DO NOTHING
 RETURNING id`, s.expID, a.NodeID, utf8Clean(a.Worker), utf8Clean(a.Kind), utf8Clean(a.Tool), utf8Clean(a.ToolUseID), a.IsError, utf8Clean(a.Summary), utf8Clean(a.Detail),
 		metadata, a.InputTokens, a.OutputTokens, a.CacheReadTokens, a.CacheWriteTokens, a.MainSeg).Scan(&id)
+	if err == sql.ErrNoRows && a.Kind == "termination" {
+		err = s.db.QueryRowContext(ctx, `SELECT id FROM activity WHERE exploration_id=$1 AND kind='termination'
+AND metadata->>'run_id' = $2::jsonb->>'run_id'`, s.expID, metadata).Scan(&id)
+	}
 	return id, err
 }
 

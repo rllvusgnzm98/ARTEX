@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"iter"
 	"log"
 	"net/http"
 	"net/url"
@@ -277,14 +278,37 @@ func (c Config) NewProvider() (llm.Provider, error) {
 	lc.RetryInterval = c.Retry.ConnectInterval
 	lc.EmptyResponseRetries = c.Retry.EmptyAttempts
 	lc.EmptyResponseInterval = c.Retry.EmptyInterval
-	if c.RatePerSecond > 0 || c.RatePerMinute > 0 {
-		lc.RateLimit = &llm.RateLimit{PerSecond: c.RatePerSecond, PerMinute: c.RatePerMinute}
-	}
 	p, err := llm.NewProvider(lc)
 	if err != nil {
 		return nil, err
 	}
-	return wrapCallTimeout(p, c), nil
+	lc.MaxRetries, lc.EmptyResponseRetries = -1, -1
+	once, err := llm.NewProvider(lc)
+	if err != nil {
+		return nil, err
+	}
+	return wrapCallTimeout(llm.RateLimited(retryGatedProvider{p, once}, llm.RateLimit{
+		PerSecond: c.RatePerSecond, PerMinute: c.RatePerMinute,
+	}), c), nil
+}
+
+type retryGatedProvider struct {
+	regular, single llm.Provider
+}
+
+func (p retryGatedProvider) selectProvider(ctx context.Context) llm.Provider {
+	if ModelRetriesStopped(ctx) {
+		return p.single
+	}
+	return p.regular
+}
+
+func (p retryGatedProvider) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+	return p.selectProvider(ctx).Stream(ctx, req)
+}
+
+func (p retryGatedProvider) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	return p.selectProvider(ctx).Complete(ctx, req)
 }
 
 // IsQuotaExhaustedMessage deliberately recognizes only explicit balance,

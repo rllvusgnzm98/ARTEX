@@ -21,6 +21,172 @@ func budgetToolMessage(name string) llm.Message {
 	return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: llm.BlockToolUse, ID: "budget-write", Name: name, Input: json.RawMessage(`{"summary":"settlement evidence","confidence":"observed"}`)}}}
 }
 
+func TestWorkerJoinsCancelledRecordFact(t *testing.T) {
+	d, store := retentionStore(t)
+	iid, err := store.AddIntent(map[string]any{"summary": "blocked fact"}, 0, nil, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := store.GetNode(iid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locker, err := d.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Rollback()
+	if _, err := locker.Exec("LOCK TABLE exploration_edges IN EXCLUSIVE MODE"); err != nil {
+		t.Fatal(err)
+	}
+	policy := tightPolicy()
+	loss := NewStopLossMonitor(policy)
+	loss.ObserveTool("Bash", []byte(`{"command":"fixture"}`), false)
+	loss.ObserveTool("Bash", []byte(`{"command":"fixture"}`), false)
+	if !loss.Recompute().Fired() {
+		t.Fatal("fixture did not latch")
+	}
+	fake := budgetFakeProvider{complete: func(context.Context, llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+		msg := budgetToolMessage("record_fact")
+		msg.Content[0].Input, _ = json.Marshal(map[string]any{"summary": "cancelled fact", "intent_id": iid})
+		return msg, "tool_use", llm.Usage{}, nil
+	}}
+	worker := NewWorker(fake, "fixture", t.TempDir(), nil, 0, 0)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	type result struct {
+		writes WriteCounts
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		_, writes, err := worker.Execute(ctx, "fixture", 0, nil, store, intent, WrapStopLoss(nil, loss), nil, nil, nil)
+		done <- result{writes, err}
+	}()
+	for {
+		var waiting bool
+		if err := d.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pg_locks
+WHERE relation='exploration_edges'::regclass AND mode='RowExclusiveLock' AND NOT granted)`).Scan(&waiting); err != nil {
+			t.Fatalf("record_fact never reached the link: %v", err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case got := <-done:
+			t.Fatalf("worker stopped before reaching the link: %+v", got)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case got := <-done:
+		if !errors.Is(got.err, context.Canceled) || got.writes != (WriteCounts{Failures: 1}) {
+			t.Fatalf("cancelled worker: err=%v writes=%#v", got.err, got.writes)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled worker did not finish with the edge lock still held")
+	}
+	if err := locker.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if ids, err := store.FactsYielded(iid); err != nil || len(ids) != 0 {
+		t.Fatalf("unexpected persisted evidence: %v, %v", ids, err)
+	}
+}
+
+func TestWorkerPostStopLossBound(t *testing.T) {
+	for _, mode := range []string{"denied_stream", "denied_complete", "record_fact_loop", "hard_deadline", "parent_deadline", "cancel"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if mode == "parent_deadline" {
+				var cancelParent context.CancelFunc
+				ctx, cancelParent = context.WithTimeout(ctx, 200*time.Millisecond)
+				defer cancelParent()
+			}
+			duration := 3 * time.Second
+			if mode == "hard_deadline" {
+				duration = 200 * time.Millisecond
+			}
+			ctx, work := withRunBudget(ctx, time.Now(), duration, duration/4)
+			policy := tightPolicy()
+			policy.IdleProbeLimit = 1
+			loss := NewStopLossMonitor(policy)
+			probes, facts, calls, blocked, results := 0, 0, 0, 0, 0
+			mockTool := func(name string, runs *int) actool.CoreTool {
+				return actool.Build(actool.Spec{Name: name, Schema: obj(map[string]any{}), RawInput: true,
+					Run: func(context.Context, json.RawMessage, *actool.ToolContext) (actool.Result, error) {
+						*runs++
+						return actool.Text("fixture"), nil
+					}})
+			}
+			fake := budgetFakeProvider{complete: func(call context.Context, _ llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+				calls++
+				if calls == 1 {
+					msg := budgetToolMessage("Bash")
+					msg.Content[0].Input = json.RawMessage(`{"command":"fixture"}`)
+					return msg, "tool_use", llm.Usage{}, nil
+				}
+				switch mode {
+				case "hard_deadline", "parent_deadline", "cancel":
+					if mode == "cancel" {
+						cancel()
+					}
+					<-call.Done()
+					return llm.Message{}, "", llm.Usage{}, call.Err()
+				case "record_fact_loop":
+					return budgetToolMessage("record_fact"), "tool_use", llm.Usage{}, nil
+				default:
+					return budgetToolMessage("Bash"), "tool_use", llm.Usage{}, nil
+				}
+			}}
+			opts := agentcore.Options{Provider: &runBudgetProvider{inner: fake, loss: loss}, Hooks: WrapStopLoss(nil, loss),
+				Tools:          []actool.CoreTool{mockTool("Bash", &probes), mockTool("record_fact", &facts)},
+				PermissionMode: permission.ModeBypass, NonStreaming: mode != "denied_stream", MaxDuration: work, DisableBackgroundTasks: true}
+			session := agentcore.NewSession(opts)
+			defer session.Close()
+			start := time.Now()
+			reason, err := captureWorkerSession(ctx, session, "fixture", func(a db.Activity) {
+				if a.Kind == "result" {
+					results++
+				}
+				if a.Kind == "tool_result" && strings.Contains(string(a.Metadata), "policy_blocked") {
+					if a.IsError {
+						t.Error("captured policy block had is_error=true")
+					}
+					blocked++
+				}
+			})
+			if !loss.Fired() || probes != 1 || results != 1 {
+				t.Fatalf("verdict=%v probes=%d results=%d reason=%s err=%v", loss.Verdict(), probes, results, reason, err)
+			}
+			switch mode {
+			case "hard_deadline":
+				if !isRunBudgetError(err) || reason != harness.ReasonTimeout || calls != 2 || time.Since(start) > time.Second {
+					t.Fatalf("hard deadline: reason=%s calls=%d elapsed=%s err=%v", reason, calls, time.Since(start), err)
+				}
+			case "parent_deadline":
+				if !errors.Is(err, context.DeadlineExceeded) || isRunBudgetError(err) || calls != 2 || time.Since(start) > time.Second {
+					t.Fatalf("parent deadline: calls=%d elapsed=%s err=%v", calls, time.Since(start), err)
+				}
+			case "cancel":
+				if !errors.Is(err, context.Canceled) || calls != 2 || time.Since(start) > time.Second {
+					t.Fatalf("cancel: calls=%d elapsed=%s err=%v", calls, time.Since(start), err)
+				}
+			default:
+				wantFacts, wantBlocked := 0, maxPostStopLossTurns
+				if mode == "record_fact_loop" {
+					wantFacts, wantBlocked = maxPostStopLossTurns, 0
+				}
+				if err != nil || reason != harness.ReasonStopHookPrevented || calls != 1+maxPostStopLossTurns || facts != wantFacts || blocked != wantBlocked {
+					t.Fatalf("reason=%s calls=%d facts=%d blocked=%d err=%v", reason, calls, facts, blocked, err)
+				}
+			}
+		})
+	}
+}
+
 func TestWorkerRecoverySettlement(t *testing.T) {
 	for _, mode := range []string{"work", "work_stream", "hard", "call_timeout", "zero", "short", "unlimited", "cancel", "no_transcript", "turn_cap", "recovery_error"} {
 		t.Run(mode, func(t *testing.T) {

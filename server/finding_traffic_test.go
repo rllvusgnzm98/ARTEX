@@ -386,6 +386,46 @@ func TestFindingTrafficFailedReportDoesNotTrigger(t *testing.T) {
 	}
 }
 
+func TestFindingTrafficPolicyBlockedReportDoesNotTrigger(t *testing.T) {
+	s, f, _ := trafficEvidenceServer(t)
+	finding, err := s.m.pg.GetFinding(f.FindingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := s.m.pg.GetTask(*finding.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := s.m.pg.Exploration(task.ExplorationID)
+	if _, err := store.AppendActivity(db.Activity{Kind: "tool_use", Tool: "report_finding", ToolUseID: "blocked-fixture"}); err != nil {
+		t.Fatal(err)
+	}
+	id, err := store.AppendActivity(db.Activity{
+		Kind: "tool_result", Tool: "report_finding", ToolUseID: "blocked-fixture",
+		Metadata: json.RawMessage(`{"outcome_class":"policy_blocked"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.m.pg.SetSchedState(schedKeyLastToolCall, strconv.FormatInt(id-1, 10)); err != nil {
+		t.Fatal(err)
+	}
+	events, err := s.m.pg.NewToolCallsSince(id - 1)
+	if err != nil || len(events) != 1 || events[0].ToolOutcome != "policy_blocked" || events[0].ToolIsErr {
+		t.Fatalf("blocked report events: %+v, %v", events, err)
+	}
+	commands, _, err := s.m.pg.ListCommands(&task.ExplorationID, "report_finding", 0, 10)
+	if err != nil || len(commands) != 1 || commands[0].OutcomeClass != "policy_blocked" || commands[0].IsError {
+		t.Fatalf("blocked report history: %+v, %v", commands, err)
+	}
+	// A nil server makes any attempted trigger fail this test immediately.
+	scheduler := &Scheduler{pg: s.m.pg}
+	scheduler.fireToolCalls([]*db.AgentTrigger{{OnToolCall: true, ToolNames: []string{"report_finding"}, AgentKey: "reporter"}})
+	if got := scheduler.mustState(schedKeyLastToolCall); got != strconv.FormatInt(id, 10) {
+		t.Fatal("blocked finding must still advance watermark", got)
+	}
+}
+
 func TestFindingTrafficUTF8SegmentsAndInheritedWrites(t *testing.T) {
 	s, f, req := trafficEvidenceServer(t)
 	ctx := context.Background()

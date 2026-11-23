@@ -185,6 +185,9 @@ func TestStopLossHookEnforcedInCodeNotPrompt(t *testing.T) {
 	if !block || !strings.Contains(msg, StopLossMessagePrefix) {
 		t.Fatalf("probe after stop-loss must be blocked by the hook, block=%v msg=%q", block, msg)
 	}
+	if block, _, _ := hooks.PreToolUse(context.Background(), "unrecognized_tool", nil); !block {
+		t.Fatal("unrecognized tools must be blocked after stop-loss")
+	}
 	// Write-back remains allowed so already-identified facts can still be persisted.
 	block, _, _ = hooks.PreToolUse(context.Background(), "record_fact", []byte(`{"summary":"x"}`))
 	if block {
@@ -203,6 +206,23 @@ func TestStopLossHookEnforcedInCodeNotPrompt(t *testing.T) {
 	})
 	if promptOnly.Fired() {
 		t.Fatalf("policy must not fire from time alone or imagined prompt text: %+v", promptOnly)
+	}
+}
+
+func TestStopLossLatchesFirstVerdictAndCounterSnapshot(t *testing.T) {
+	policy := tightPolicy()
+	policy.IdleProbeLimit = 1
+	mon := NewStopLossMonitor(policy)
+	hooks := WrapStopLoss(nil, mon)
+	input, _ := jsonCmd(`{"command":"test"}`)
+	hooks.PostToolUse(t.Context(), "Bash", input, nil, false)
+	first := mon.Verdict()
+	if first.Kind != StopLossNoProgress || first.Signals.IdleProbes != 1 || first.Signals.RepeatCount != 1 {
+		t.Fatalf("first verdict = %+v", first)
+	}
+	hooks.PostToolUse(t.Context(), "Bash", input, nil, false)
+	if later := mon.Verdict(); later != first {
+		t.Fatalf("first verdict changed: first=%+v later=%+v", first, later)
 	}
 }
 

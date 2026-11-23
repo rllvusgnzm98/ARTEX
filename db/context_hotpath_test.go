@@ -15,6 +15,9 @@ func TestContextBoundHotPathWrites(t *testing.T) {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
 	defer d.Close()
+	if err := d.EnsureLLMUsageTable(); err != nil {
+		t.Fatal(err)
+	}
 
 	expID, err := d.CreateExploration("context hot path", "cancellation")
 	if err != nil {

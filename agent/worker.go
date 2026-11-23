@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -592,8 +593,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		settle = wrapupSettlementForTask("worker", []string{"Bash"}, clamped)
 	}
 	window := w.compactionWindow()
+	budgetProvider := &runBudgetProvider{inner: w.prov}
 	opts := agentcore.Options{
-		Provider:        &runBudgetProvider{inner: w.prov},
+		Provider:        budgetProvider,
 		SystemPrompt:    system,
 		DynamicBoundary: boundary,
 		Tools:           tools,
@@ -637,6 +639,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if hooks != nil {                                // typed-nil guard: only set when concrete (avoids harness panic)
 		AttachStopLossWrites(hooks, func() (WriteCounts, bool) { return tsx.Writes(), true })
 		opts.Hooks = hooks
+		if h, ok := hooks.(stopLossHooks); ok {
+			budgetProvider.loss = h.mon
+		}
 	}
 	if w.tx != nil { // persist raw LLM conversation; one file per worked intent
 		opts.Transcript = w.tx
@@ -701,10 +706,28 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		}
 	}
 
-	_, reason, err := captureRunSession(ctx, s, resumeWarning+input, emitWrap)
-	w.recoverSettlement(ctx, s, opts, settle, err, tsx, emitWrap)
-	if isRunBudgetError(err) {
-		reason = harness.ReasonTimeout
+	reason, err := captureWorkerSession(ctx, s, resumeWarning+input, emitWrap)
+	if !budgetProvider.loss.Fired() {
+		w.recoverSettlement(ctx, s, opts, settle, err, tsx, emitWrap)
 	}
-	return reason, tsx.Writes(), err
+	return reason, tsx.finishEvidenceWrites(), err
+}
+
+func captureWorkerSession(ctx context.Context, s *agentcore.Session, input string, emit func(db.Activity)) (harness.TerminalReason, error) {
+	runCtx := ctx
+	var hardEnd *RunBudgetError
+	if b, ok := ctx.Value(runBudgetKey{}).(runBudget); ok {
+		hardEnd = &RunBudgetError{Deadline: b.hard}
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithDeadlineCause(ctx, b.hard, hardEnd)
+		defer cancel()
+	}
+	_, reason, err := captureRunSession(runCtx, s, input, emit)
+	if hardEnd != nil && context.Cause(runCtx) == hardEnd && errors.Is(err, context.DeadlineExceeded) {
+		return harness.ReasonTimeout, hardEnd
+	}
+	if isRunBudgetError(err) {
+		return harness.ReasonTimeout, err
+	}
+	return reason, err
 }

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Autumn-27/artex/agent/chainskel"
 	"github.com/Autumn-27/artex/db"
@@ -69,10 +71,13 @@ type ToolSet struct {
 	// ownerNode is the exploration node that writes attach to: assets this run
 	// touches get anchored to it as lineage/provenance (NOT visibility — the asset
 	// graph is global and shared). Worker = its claimed intent; planner = begin root.
-	ownerNode int64
-	GoalMet   bool
-	Reason    string
-	writes    WriteCounts
+	ownerNode    int64
+	GoalMet      bool
+	Reason       string
+	writes       WriteCounts
+	writeMu      sync.Mutex
+	writeActive  int
+	writeDrained chan struct{}
 	// killWork, if set, terminates a running work by intent id (engine callback,
 	// wired by the planner). nil = the kill_work tool reports unavailable.
 	killWork func(context.Context, int64) error
@@ -144,9 +149,11 @@ type EnrichTrigger interface {
 // findings under "facts" (record_fact → Facts, insert_assets → Assets,
 // report_finding → Findings; each element of a batch counts once).
 type WriteCounts struct {
-	Facts    int
-	Assets   int
-	Findings int
+	Facts      int
+	Assets     int
+	Findings   int
+	Failures   int
+	Incomplete bool `json:"incomplete,omitempty"`
 }
 
 // Total is every node persisted this run, regardless of kind — the
@@ -161,7 +168,70 @@ func (w WriteCounts) String() string {
 // Writes reports what this run wrote back, split by node kind (so the engine can
 // tell "explored but persisted nothing" apart from a completed intent, and log an
 // honest breakdown instead of calling assets/findings "facts").
-func (t *ToolSet) Writes() WriteCounts { return t.writes }
+func (t *ToolSet) Writes() WriteCounts {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	return t.writes
+}
+
+func (t *ToolSet) countWrites(delta WriteCounts) {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	t.writes = t.writes.Add(delta)
+}
+
+func (w WriteCounts) Add(delta WriteCounts) WriteCounts {
+	return WriteCounts{
+		Facts: w.Facts + delta.Facts, Assets: w.Assets + delta.Assets,
+		Findings: w.Findings + delta.Findings, Failures: w.Failures + delta.Failures,
+		Incomplete: w.Incomplete || delta.Incomplete,
+	}
+}
+
+func (t *ToolSet) beginEvidenceWrite(ctx context.Context) bool {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	if t.writeDrained != nil || ctx.Err() != nil {
+		return false
+	}
+	t.writeActive++
+	return true
+}
+
+func (t *ToolSet) endEvidenceWrite() {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	t.writeActive--
+	if t.writeActive == 0 && t.writeDrained != nil {
+		close(t.writeDrained)
+	}
+}
+
+const evidenceDrainTimeout = 250 * time.Millisecond
+
+func (t *ToolSet) finishEvidenceWrites() WriteCounts {
+	t.writeMu.Lock()
+	if t.writeDrained == nil {
+		t.writeDrained = make(chan struct{})
+		if t.writeActive == 0 {
+			close(t.writeDrained)
+		}
+	}
+	drained := t.writeDrained
+	t.writeMu.Unlock()
+
+	timer := time.NewTimer(evidenceDrainTimeout)
+	defer timer.Stop()
+	select {
+	case <-drained:
+	case <-timer.C:
+	}
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	writes := t.writes
+	writes.Incomplete = t.writeActive != 0
+	return writes
+}
 
 func NewToolSet(ts *db.ExplorationStore, worker string) *ToolSet {
 	return &ToolSet{ts: ts, worker: worker}
@@ -227,15 +297,6 @@ func (t *ToolSet) SetEnrich(e EnrichTrigger) { t.enrich = e }
 // intent node; planner/main: the begin root). Assets created/referenced while
 // ownerNode is set are anchored to it as lineage (not visibility).
 func (t *ToolSet) SetOwnerNode(id int64) { t.ownerNode = id }
-
-// anchorOwner records a lineage edge from this run's owner node to an asset
-// (no-op if unset). Provenance only — the asset graph is global and shared, so
-// this no longer affects which assets a task can read.
-func (t *ToolSet) anchorOwner(assetID int64) {
-	if t.ts != nil && t.ownerNode > 0 && assetID > 0 {
-		_ = t.ts.AnchorCtx(context.Background(), t.ownerNode, assetID)
-	}
-}
 
 // pid parses an id that may arrive as a JSON number or string ("" / 0 → 0).
 func pid(raw json.RawMessage) int64 {
@@ -1346,6 +1407,10 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			return actool.Errorf(err.Error()), nil
 		}
 		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs)}
+		if !t.beginEvidenceWrite(ctx) {
+			return actool.Errorf("evidence write interrupted"), nil
+		}
+		defer t.endEvidenceWrite()
 		var recorded *db.RecordedFinding
 		if t.findingRecorder != nil {
 			recorded, err = t.findingRecorder.Record(ctx, input, refs)
@@ -1355,8 +1420,10 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			recorded, err = t.ts.RecordFinding(ctx, input)
 		}
 		if err != nil {
+			t.countWrites(WriteCounts{Failures: 1})
 			return actool.Errorf(err.Error()), nil
 		}
+		t.countWrites(WriteCounts{Findings: 1})
 		if t.notifyFinding != nil {
 			iid := input.IntentID
 			if iid <= 0 {
@@ -1366,7 +1433,6 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		} else if t.notify != nil {
 			t.notify()
 		}
-		t.writes.Findings++
 		// Keep the first line's node-ID contract for existing reporter triggers.
 		for i := range recorded.Traffic.Bindings {
 			recorded.Traffic.Bindings[i].Snapshot.ReqHead = ""
@@ -1442,20 +1508,22 @@ func (t *ToolSet) recordOneFactCtx(ctx context.Context, it factItem, defaultInte
 		intent = defaultIntent
 	}
 	if intent > 0 {
-		node, err := t.ts.GetNode(intent)
-		if err != nil || node == nil || node.Kind != db.KindIntent {
+		node, err := t.ts.GetNodeCtx(ctx, intent)
+		if err != nil {
+			t.countWrites(WriteCounts{Failures: 1})
+			return 0, fmt.Errorf("lookup intent %d for fact: %w", intent, err)
+		}
+		if node == nil || node.Kind != db.KindIntent {
 			return 0, fmt.Errorf("intent_id 必须是本任务的意图（关联任务意图只读）")
 		}
 	}
 	// a fact is its OWN node kind (distinct from a vuln finding).
-	id, err := t.ts.AddNodeCtx(ctx, db.KindFact, payload, 5, "confirmed", t.worker, pidList(it.AssetIDs))
+	id, err := t.ts.AddFactCtx(ctx, payload, t.worker, pidList(it.AssetIDs), intent)
 	if err != nil {
+		t.countWrites(WriteCounts{Failures: 1})
 		return 0, err
 	}
-	if intent > 0 {
-		_ = t.ts.LinkCtx(ctx, intent, db.RelYields, id) // chain: intent -> fact
-	}
-	t.writes.Facts++
+	t.countWrites(WriteCounts{Facts: 1})
 	return id, nil
 }
 
@@ -1498,6 +1566,10 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 				items = []factItem{a.factItem}
 			}
 			defaultIntent := pid(a.factItem.IntentID) // 顶层 intent_id = 批量默认
+			if !t.beginEvidenceWrite(ctx) {
+				return actool.Errorf("evidence write interrupted"), nil
+			}
+			defer t.endEvidenceWrite()
 
 			ids := make([]int64, len(items))
 			errs := map[string]string{}

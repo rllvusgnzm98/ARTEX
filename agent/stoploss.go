@@ -105,6 +105,7 @@ type StopLossVerdict struct {
 	Kind                StopLossKind
 	Detail              string
 	TargetFailureWrites int
+	Signals             ProgressSignals
 }
 
 // Fired reports an early stop-loss (not the safety ceiling). The ceiling is
@@ -359,10 +360,15 @@ func (m *StopLossMonitor) Recompute() StopLossVerdict {
 }
 
 func (m *StopLossMonitor) recomputeLocked() StopLossVerdict {
-	v := EvaluateStopLoss(m.policy, m.signalsLocked())
+	if m.verdict.Fired() {
+		return m.verdict
+	}
+	signals := m.signalsLocked()
+	v := EvaluateStopLoss(m.policy, signals)
 	// The live hook does not enforce the wall-clock cap (MaxDuration does,
 	// and still runs settlement). Only early stop-loss is stored here.
 	if v.Fired() {
+		v.Signals = signals
 		m.verdict = v
 	}
 	return m.verdict
@@ -431,8 +437,12 @@ func AttachStopLossWrites(hooks harness.HookRunner, fn func() (WriteCounts, bool
 }
 
 func (h stopLossHooks) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
-	if h.mon != nil && h.mon.Fired() && isProbeTool(name) {
-		return true, h.mon.Verdict().Message(), nil
+	if verdict := h.mon.Verdict(); verdict.Fired() {
+		switch name {
+		case "record_fact":
+		default:
+			return true, verdict.Message(), nil
+		}
 	}
 	if h.inner != nil {
 		return h.inner.PreToolUse(ctx, name, input)
