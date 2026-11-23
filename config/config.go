@@ -435,3 +435,28 @@ func TaskProxyPortRange() string {
 	}
 	return "21100-21199"
 }
+
+// Summary 返回可安全落库/上报的「有效配置」摘要。任务溯源需要知道当时跑的是哪套
+// 配置，但配置里混着凭据（DSN、库口令、JWT 相关、emp3r0r 密钥），所以这里按白名单
+// 取值：只收行为相关的开关与范围，凭据一律只记「是否配置」这一个布尔，绝不记原文。
+// 新增配置字段默认不进摘要——必须显式加进来，避免哪天把新的密钥顺手带出去。
+func (c Config) Summary() map[string]any {
+	return map[string]any{
+		"skill_dir":             c.SkillDir,
+		"callback_addr":         c.CallbackAddr,
+		"tunnel_port_range":     c.TunnelPortRange,
+		"task_proxy_port_range": c.TaskProxyPortRange,
+		"own_infra_hosts":       len(c.OwnInfraHosts),
+		"gate_mode":             c.GateMode,
+		"jwt_ttl":               c.JWTTTL,
+		"jwt_rotation_period":   c.JWTRotationPeriod,
+		"jwt_grace":             c.JWTGrace,
+		"db_host":               c.Database.Host,
+		"db_port":               c.Database.Port,
+		"db_name":               c.Database.DBName,
+		"db_sslmode":            c.Database.SSLMode,
+		"db_password_set":       c.Database.Password != "",
+		"db_dsn_set":            c.Database.DSN != "",
+		"emp3r0r_enabled":       c.Emp3r0r.Enabled,
+	}
+}

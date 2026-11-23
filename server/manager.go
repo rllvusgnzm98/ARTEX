@@ -1587,6 +1587,34 @@ func (m *Manager) TaskStatus(id string) string {
 	return ""
 }
 
+// StampTaskRunProvenance records the build version and sanitized effective config
+// that actually ran this task. Idempotent in the DB (first real run wins), so a
+// restart or upgrade never rewrites the evidence of an earlier run.
+func (m *Manager) StampTaskRunProvenance(id string, version string, runtime map[string]any) error {
+	if m == nil || m.pg == nil {
+		return nil
+	}
+	n, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return err
+	}
+	return m.pg.StampRunProvenance(n, version, runtime)
+}
+
+// TaskProvenance returns the recorded build/config provenance for a task. Legacy
+// rows report Recorded=false — callers must surface "构建未知" rather than assume
+// the currently running binary.
+func (m *Manager) TaskProvenance(id string) (pgdb.TaskProvenance, error) {
+	if m == nil || m.pg == nil {
+		return pgdb.TaskProvenance{}, nil
+	}
+	n, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return pgdb.TaskProvenance{}, err
+	}
+	return m.pg.TaskProvenance(n)
+}
+
 // StampTaskFirstRun stamps first_run_at + deadline_at on the first real run (idempotent
 // in DB) and mirrors deadline_at on the live handle. Returns the deadline unix (0 = 不限).
 func (m *Manager) StampTaskFirstRun(id string) (int64, error) {

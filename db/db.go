@@ -147,7 +147,22 @@ func (e *ProbeQueryError) Unwrap() error {
 
 // DB wraps the shared *sql.DB. PG handles its own connection pool + concurrency
 // (MVCC), so unlike the old SQLite store there is no process-wide write mutex.
-type DB struct{ *sql.DB }
+type DB struct {
+	*sql.DB
+	// health 记录本进程内的落库失败（丢弃的 activity、悬空锚点、写入失败），
+	// 让「执行成功但没落库」不再只存在于日志里。
+	health *PersistenceHealth
+}
+
+// Health 返回落库健康登记表。没有打开数据库时返回 nil —— PersistenceHealth 的每个
+// 方法都容忍 nil 接收者，所以调用方不必判空；这里不做惰性初始化，否则共享 *DB 会出
+// 现并发写字段的数据竞争。
+func (d *DB) Health() *PersistenceHealth {
+	if d == nil {
+		return nil
+	}
+	return d.health
+}
 
 // ensureDatabase connects to the postgres system database and creates the target
 // database if it does not exist. dsn must be a postgres:// URL.
@@ -204,7 +219,7 @@ func Open(dsn string) (*DB, error) {
 		sqlDB.Close()
 		return nil, fmt.Errorf("ping postgres (%s): %w", config.Redact(dsn), err)
 	}
-	d := &DB{sqlDB}
+	d := &DB{DB: sqlDB, health: NewPersistenceHealth()}
 	// pgx runs multi-statement Exec via the simple protocol when there are no args.
 	// Keep the dedicated lock connection checked out until both DDL and seeding
 	// finish so concurrent application instances cannot initialize out of order.

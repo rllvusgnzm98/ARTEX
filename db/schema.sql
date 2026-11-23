@@ -580,6 +580,12 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS active_llm_profile_id BIGINT REFERENCES llm_profiles(id) ON DELETE SET NULL;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS llm_chain_revision BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+
+-- 运行溯源：任务第一次真正执行时，记下当时真正在跑的二进制版本与脱敏后的有效配置。
+-- 判定某一轮跑分归因于哪个 build / 哪套配置时，不能靠「当前检出」或「当前进程」倒推。
+-- 旧任务没有这些证据，保持空值（接口上报「构建未知」），绝不回填为当前版本。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS build_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS runtime_provenance JSONB NOT NULL DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS idx_tasks_category ON tasks(category_id, created_at DESC)
     WHERE deleted_at IS NULL AND category_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_pinned ON tasks(pinned_at DESC)

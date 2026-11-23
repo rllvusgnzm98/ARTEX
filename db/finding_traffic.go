@@ -379,6 +379,11 @@ func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, pre
 VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string(payload), in.Worker).Scan(&out.NodeID); err != nil {
 		return nil, err
 	}
+	// 与 AddNode 同一套锚点校验：缺失的 asset 会让整个证据事务被 23503 拒绝，
+	// 这里先给出明确的一致性错误，而不是把裸外键错误抛给调用方。
+	if err := checkAnchorAssets(ctx, tx, nil, in.ExplorationID, in.AssetIDs); err != nil {
+		return nil, err
+	}
 	for _, asset := range in.AssetIDs {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_anchors(node_id,asset_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, out.NodeID, asset); err != nil {
 			return nil, err

@@ -1079,6 +1079,22 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 	st, _ := t.Store.Stats()
 	out["exploration"] = st
 
+	// 落库健康：丢弃的 activity、悬空锚点、其它写入失败。没有这块，「执行成功但
+	// 没落库」只会出现在后端日志里，判定上下文优化是否有效时无从区分证据缺失与
+	// 真的没进展。
+	ph := s.m.pg.Health().Snapshot(t.Store.ID())
+	out["persistence"] = ph
+	out["persistence_healthy"] = ph.Healthy()
+
+	// 运行溯源：这个任务是哪个 build、哪套有效配置跑的。旧任务没有证据时如实报
+	// 未知，不拿当前进程的版本顶替。
+	if prov, err := s.m.TaskProvenance(t.ID); err == nil {
+		out["provenance"] = prov
+		if !prov.Recorded {
+			out["provenance_note"] = "构建未知"
+		}
+	}
+
 	// per-task running state + heartbeat (distinct from "LLM configured").
 	intents, _ := t.Store.ListByKind(db.KindIntent, 100000)
 	inFlight := 0
