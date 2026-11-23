@@ -228,7 +228,7 @@ VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
 	}
 	for _, a := range anchors {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_anchors(node_id, asset_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, id, a); err != nil {
-			return 0, err
+			return 0, anchorWriteErr(err, s.db.Health(), s.expID, []int64{a})
 		}
 	}
 	if intentID > 0 {
@@ -295,7 +295,7 @@ func (s *ExplorationStore) AnchorCtx(ctx context.Context, nodeID, assetID int64)
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_anchors(node_id, asset_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, nodeID, assetID); err != nil {
-		return err
+		return anchorWriteErr(err, s.db.Health(), s.expID, []int64{assetID})
 	}
 	return tx.Commit()
 }
@@ -2187,13 +2187,15 @@ type anchorQuerier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
-// checkAnchorAssets 在写入锚点之前，确认每个 asset 都还在。命中的行用 FOR SHARE
-// 锁住，使得「校验通过」到「锚点写入」之间不会被并发删除插空——否则校验只是把
-// 竞态窗口变窄，而不是消除它。FOR SHARE 与 assets 的删除（需要行独占）互斥，但
-// 不阻塞其它只读路径。
+// checkAnchorAssets 在写入锚点之前，确认每个 asset 都还在，把常见情形报成明确的
+// *DanglingAnchorError（已排序去重的缺失 id）而不是裸的外键错误，并把事件记进落库
+// 健康表，让这种一致性问题在接口上可见而不是只进日志。
 //
-// 返回 *DanglingAnchorError（已排序去重的缺失 id）而不是裸的外键错误，并把事件
-// 记进落库健康表，让这种一致性问题在接口上可见而不是只进日志。
+// 这里刻意不加 FOR SHARE：DeleteTaskCascadePrepared 会先拿 assets + exploration_anchors
+// 的 SHARE ROW EXCLUSIVE 表锁再删资产行，若本路径先锁住资产行、再去插锚点（需要
+// anchors 的 ROW EXCLUSIVE），两边加锁顺序正好相反，PostgreSQL 只能判一方死锁。
+// 因此校验只做读：真正保证「不留半成品」的是外键本身——校验到写入之间若被并发清理
+// 插空，FK 会拒绝并回滚整笔事务，再由 anchorWriteErr 翻译成同一个一致性错误。
 func (s *ExplorationStore) checkAnchorAssets(ctx context.Context, q anchorQuerier, anchors []int64) error {
 	return checkAnchorAssets(ctx, q, s.db.Health(), s.expID, anchors)
 }
@@ -2205,7 +2207,7 @@ func checkAnchorAssets(ctx context.Context, q anchorQuerier, health *Persistence
 	if len(ids) == 0 {
 		return nil
 	}
-	rows, err := q.QueryContext(ctx, `SELECT id FROM assets WHERE id = ANY($1::bigint[]) FOR SHARE`, ids)
+	rows, err := q.QueryContext(ctx, `SELECT id FROM assets WHERE id = ANY($1::bigint[])`, ids)
 	if err != nil {
 		return err
 	}
@@ -2235,6 +2237,20 @@ func checkAnchorAssets(ctx context.Context, q anchorQuerier, health *Persistence
 	err = &DanglingAnchorError{ExplorationID: expID, Missing: missing}
 	health.RecordDanglingAnchors(expID, missing, err.Error())
 	return err
+}
+
+// anchorWriteErr 把锚点写入撞上的外键冲突翻译成明确的一致性错误。
+//
+// 校验（只读）到写入之间仍可能被并发的资产清理插空；此时外键会拒绝并回滚整笔事务，
+// 半成品不会落库，这里只负责让调用方看到 DanglingAnchorError 而不是裸驱动错误，并把
+// 事件同样记进落库健康表。
+func anchorWriteErr(err error, health *PersistenceHealth, expID int64, assets []int64) error {
+	if err == nil || !isFKViolation(err) {
+		return err
+	}
+	out := &DanglingAnchorError{ExplorationID: expID, Missing: dedupePositive(assets)}
+	health.RecordDanglingAnchors(expID, out.Missing, out.Error())
+	return out
 }
 
 // dedupePositive 返回升序去重后的正数 id。

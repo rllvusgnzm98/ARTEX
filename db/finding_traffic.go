@@ -351,7 +351,7 @@ type RecordedFinding struct {
 
 // ctx 由调用方传入本次事务所用的上下文（而非在内部取 context.Background）：
 // 事务内新加的推送事件写入同样应受调用方的取消与超时约束。
-func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, prepared []PreparedTrafficEvidence) (*RecordedFinding, error) {
+func RecordFindingTx(ctx context.Context, tx *sql.Tx, health *PersistenceHealth, in RecordFindingInput, prepared []PreparedTrafficEvidence) (*RecordedFinding, error) {
 	if err := LockTaskEvidenceTxCtx(ctx, tx, in.TaskID); err != nil {
 		return nil, err
 	}
@@ -381,12 +381,12 @@ VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string
 	}
 	// 与 AddNode 同一套锚点校验：缺失的 asset 会让整个证据事务被 23503 拒绝，
 	// 这里先给出明确的一致性错误，而不是把裸外键错误抛给调用方。
-	if err := checkAnchorAssets(ctx, tx, nil, in.ExplorationID, in.AssetIDs); err != nil {
+	if err := checkAnchorAssets(ctx, tx, health, in.ExplorationID, in.AssetIDs); err != nil {
 		return nil, err
 	}
 	for _, asset := range in.AssetIDs {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_anchors(node_id,asset_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, out.NodeID, asset); err != nil {
-			return nil, err
+			return nil, anchorWriteErr(err, health, in.ExplorationID, []int64{asset})
 		}
 	}
 	if in.IntentID > 0 {
@@ -427,7 +427,11 @@ VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, in.TaskID, out.NodeI
 // RecordFinding is the atomic legacy/no-recorder path used by tools and tests.
 func (s *ExplorationStore) RecordFinding(ctx context.Context, in RecordFindingInput) (out *RecordedFinding, err error) {
 	in.ExplorationID = s.expID
-	err = s.db.WithEvidenceTx(ctx, func(tx *sql.Tx) error { var e error; out, e = RecordFindingTx(ctx, tx, in, nil); return e })
+	err = s.db.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
+		var e error
+		out, e = RecordFindingTx(ctx, tx, s.db.Health(), in, nil)
+		return e
+	})
 	return
 }
 

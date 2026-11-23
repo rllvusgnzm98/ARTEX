@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // 本文件覆盖阶段四的三件事，都必须实连 PostgreSQL 才算验证过（外键、事务回滚、
@@ -244,5 +246,88 @@ func TestPersistenceHealthTracksLoss(t *testing.T) {
 	nilHealth.RecordDroppedActivity(1, "x")
 	if !nilHealth.Snapshot(1).Healthy() {
 		t.Fatal("nil 登记表应为健康")
+	}
+}
+
+// TestLegacyRanTaskStaysUnknownAfterUpgrade 覆盖「升级前就跑过的任务」：schema 的回填
+// 把它标成 legacy-unknown，之后再怎么启动都报「构建未知」，绝不被当前 build 顶替——
+// 否则旧证据会被归因到升级后的新版本。还没真正跑过的任务不受影响，首次跑时照常盖章。
+func TestLegacyRanTaskStaysUnknownAfterUpgrade(t *testing.T) {
+	d := reliabilityTestDB(t)
+	ran := newReliabilityTask(t, d, "升级前跑过-"+t.Name())
+	fresh := newReliabilityTask(t, d, "还没跑过-"+t.Name())
+
+	// 模拟旧库：跑过（status 已离开 created），但没有任何溯源列。
+	if _, err := d.Exec(`UPDATE tasks SET status='running', build_version='' WHERE id=$1`, ran.ID); err != nil {
+		t.Fatalf("构造旧任务失败: %v", err)
+	}
+	if _, err := d.Exec(`UPDATE tasks SET build_version='' WHERE id=$1`, fresh.ID); err != nil {
+		t.Fatalf("构造新任务失败: %v", err)
+	}
+
+	// 与 schema.sql 同一条回填语句。
+	if _, err := d.Exec(`UPDATE tasks SET build_version = 'legacy-unknown'
+ WHERE build_version = '' AND (first_run_at IS NOT NULL OR status <> 'created')`); err != nil {
+		t.Fatalf("回填失败: %v", err)
+	}
+
+	prov, err := d.TaskProvenance(ran.ID)
+	if err != nil {
+		t.Fatalf("读旧任务溯源失败: %v", err)
+	}
+	if prov.Recorded {
+		t.Fatalf("升级前跑过的任务不该被当成有证据: %+v", prov)
+	}
+	if prov.BuildVersion != LegacyUnknownBuild {
+		t.Fatalf("旧任务该标为 %q，实际 %q", LegacyUnknownBuild, prov.BuildVersion)
+	}
+
+	// 升级后它又被调度起来：不得把新 build 写成它的「第一次运行」。
+	if err := d.StampRunProvenance(ran.ID, "v-after-upgrade", map[string]any{"build_version": "v-after-upgrade"}); err != nil {
+		t.Fatalf("盖章失败: %v", err)
+	}
+	if again, err := d.TaskProvenance(ran.ID); err != nil {
+		t.Fatalf("再读旧任务溯源失败: %v", err)
+	} else if again.BuildVersion != LegacyUnknownBuild || again.Recorded {
+		t.Fatalf("旧任务被回填成了 %+v", again)
+	}
+
+	// 真没跑过的任务不受回填影响，首次真跑照常留证。
+	if err := d.StampRunProvenance(fresh.ID, "v-first", map[string]any{"build_version": "v-first"}); err != nil {
+		t.Fatalf("新任务盖章失败: %v", err)
+	}
+	if got, err := d.TaskProvenance(fresh.ID); err != nil {
+		t.Fatalf("读新任务溯源失败: %v", err)
+	} else if !got.Recorded || got.BuildVersion != "v-first" {
+		t.Fatalf("新任务首次盖章没生效: %+v", got)
+	}
+}
+
+// TestAnchorWriteErrMapsFKViolation 不连库：去掉校验时的 FOR SHARE 后，校验与写入之间
+// 的并发清理由外键兜底，这里确认它被翻译成同一个一致性错误并记进健康表，而不是把裸的
+// 驱动错误抛出去；非外键错误必须原样返回。
+func TestAnchorWriteErrMapsFKViolation(t *testing.T) {
+	h := NewPersistenceHealth()
+	err := anchorWriteErr(&pgconn.PgError{Code: "23503"}, h, 11, []int64{5, 5, 3})
+	if !errors.Is(err, ErrDanglingAnchor) {
+		t.Fatalf("外键冲突该翻译成悬空锚点错误，实际 %v", err)
+	}
+	var dangling *DanglingAnchorError
+	if !errors.As(err, &dangling) {
+		t.Fatalf("该带上缺失 id: %v", err)
+	}
+	if len(dangling.Missing) != 2 || dangling.Missing[0] != 3 || dangling.Missing[1] != 5 {
+		t.Fatalf("缺失 id 该去重排序，实际 %v", dangling.Missing)
+	}
+	if snap := h.Snapshot(11); snap.Healthy() || snap.DanglingAnchors == 0 {
+		t.Fatalf("悬空锚点该在健康表里可见: %+v", snap)
+	}
+
+	other := errors.New("连接断了")
+	if got := anchorWriteErr(other, h, 11, []int64{3}); got != other {
+		t.Fatalf("非外键错误该原样返回，实际 %v", got)
+	}
+	if anchorWriteErr(nil, h, 11, []int64{3}) != nil {
+		t.Fatal("nil 该返回 nil")
 	}
 }

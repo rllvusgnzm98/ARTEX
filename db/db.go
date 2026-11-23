@@ -121,6 +121,16 @@ func Probe(dsn string) (int, error) {
 	return n, nil
 }
 
+const pgForeignKeyViolation = "23503"
+
+// isFKViolation 认出外键冲突。锚点写入一旦撞上它，说明引用的 asset 在本事务提交前就
+// 已经不在了：调用方应当把它翻译成明确的 DanglingAnchorError，而不是把裸的驱动错误
+// 抛出去。
+func isFKViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == pgForeignKeyViolation
+}
+
 const pgUndefinedTable = "42P01"
 
 func isUndefinedTable(err error) bool {
