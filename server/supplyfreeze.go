@@ -15,7 +15,8 @@ import (
 var supplyHolds sync.Map // taskID -> *supplyHold
 
 // supplyHold is a distinct token per hold, so a rollback removes only its own.
-type supplyHold struct{ _ byte }
+// revision is the chain revision it was set for (0 = unknown).
+type supplyHold struct{ revision int64 }
 
 func holdTaskSupply(taskID string) {
 	if taskID == "" {
@@ -78,13 +79,14 @@ func applySupplyHoldAt(t *Task, revision int64) bool {
 	if replaced() {
 		return false
 	}
-	own := &supplyHold{}
+	own := &supplyHold{revision: revision}
 	prev, held := supplyHolds.Swap(t.ID, own)
 	if afterSupplyHoldSwap != nil {
 		afterSupplyHoldSwap()
 	}
 	if replaced() {
-		if held {
+		cur := t.llmStateSnapshot().ChainRevision
+		if p, ok := prev.(*supplyHold); held && ok && (p.revision == 0 || p.revision >= cur) {
 			supplyHolds.CompareAndSwap(t.ID, own, prev)
 		} else {
 			supplyHolds.CompareAndDelete(t.ID, own)

@@ -151,3 +151,27 @@ func TestStaleSupplyRollbackKeepsReplacementChainFreeze(t *testing.T) {
 		t.Fatal("stale rollback cleared the replacement chain's freeze")
 	}
 }
+
+func TestTwoStaleSupplyFailuresDoNotRefreezeReplacedChain(t *testing.T) {
+	t.Cleanup(releaseAllTaskSupply)
+	t.Cleanup(func() { afterSupplyHoldSwap = nil })
+	task := &Task{ID: "task-two-stale", LLMChainRevision: 4}
+	afterSupplyHoldSwap = func() {
+		// Second stale worker swaps in after the first, then the chain is replaced.
+		afterSupplyHoldSwap = func() {
+			afterSupplyHoldSwap = nil
+			task.llmMu.Lock()
+			task.LLMChainRevision = 5
+			task.llmMu.Unlock()
+		}
+		if applySupplyHoldAt(task, 4) {
+			t.Error("second stale failure froze the replaced chain")
+		}
+	}
+	if applySupplyHoldAt(task, 4) {
+		t.Fatal("first stale failure froze the replaced chain")
+	}
+	if taskSupplyFrozen(task) {
+		t.Fatal("stale holds left the replacement chain frozen")
+	}
+}
