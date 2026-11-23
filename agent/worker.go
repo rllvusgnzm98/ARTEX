@@ -450,37 +450,142 @@ func renderIntentTask(intent *db.Node) string {
 		chainskel.ForIntent(intent.Payload) + chainskel.RefsGuideForIntent(intent.Payload)
 }
 
-// renderWorkerGraphOverview folds the global situational snapshot into the worker's
-// launch USER message for AWARENESS ONLY. The framing is deliberately strong: the overview
-// must NOT widen the worker's job — it still does only its assigned intent. Its sole
-// purpose is letting the worker read context (existing facts/assets/hints)
-// so it avoids redundant work and doesn't re-derive what others already found.
+const (
+	workerOverviewRunningCap        = 6
+	workerOverviewRunningSummaryMax = 120
+	workerOverviewRecentFactsCap    = 10
+	workerOverviewColdDigestsCap    = 3
+	workerOverviewColdDigestBodyMax = 300
+	workerOverviewHintsCap          = 8
+	workerOverviewHintTextMax       = 200
+	workerOverviewRelatedListCap    = 5
+)
+
+// renderWorkerGraphOverview folds a slimmed global situational snapshot into the
+// worker's launch USER message for AWARENESS ONLY. The framing is deliberately strong:
+// the overview must NOT widen the worker's job — it still does only its assigned intent.
+// Planner-only fields (open_intents, recent_done_intents, crown_jewels, goals, coverage)
+// are dropped and remaining lists are tightly bounded so overview does not dominate
+// per-turn worker input tokens. Full graph data remains one tool call away.
 func renderWorkerGraphOverview(data map[string]any, seedFactIDs map[int64]bool) string {
-	// coverage 是给规划者判断「哪类测得少 / 要不要扩范围」的信号，与 worker「只做领到的
-	// 那条意图、别追未覆盖的点」的职责边界相悖 → 从 worker 视图里剔除。data 是本次 worker
-	// 专属的新 map(graphOverviewDataFrom 每次新建，键值切片也都是新的)，改它不影响 planner。
-	delete(data, "coverage")
-	// 阶段三去重：进场预塞(system prompt)已按本意图带上相关已确认事实(含 evidence_ids)。
-	// 概览里的 recent_facts 不再重复这些——它们完整在 seed 里，重复只会每轮多下发一遍；
-	// 未被选中的事实仍可用 list_facts / node_detail 回查。
-	if len(seedFactIDs) > 0 {
-		if rf, ok := data["recent_facts"].([]map[string]any); ok && len(rf) > 0 {
-			kept := make([]map[string]any, 0, len(rf))
-			for _, m := range rf {
+	// 规划者专用调度字段（coverage/open_intents/recent_done_intents/crown_jewels/goals/
+	// cold_digests_more）与 worker「只做领到的那条意图」的职责无关且体积占比最大 →
+	// 从 worker 视图里剔除。data 是本次 worker 专属的新 map，改它不影响 planner。
+	for _, k := range []string{
+		"coverage", "open_intents", "recent_done_intents",
+		"crown_jewels", "goals", "cold_digests_more",
+	} {
+		delete(data, k)
+	}
+	// running_intents：worker 只需粗略知道其他在跑意图的标题以防撞车，保留前 N 条短摘要。
+	if ri, ok := data["running_intents"].([]map[string]any); ok {
+		lim := min(len(ri), workerOverviewRunningCap)
+		slim := make([]map[string]any, 0, lim)
+		for _, m := range ri[:lim] {
+			entry := map[string]any{"id": m["id"]}
+			if s, ok := m["summary"].(string); ok {
+				entry["summary"] = clipPlainRunes(s, workerOverviewRunningSummaryMax)
+			}
+			slim = append(slim, entry)
+		}
+		data["running_intents"] = slim
+	}
+	// 阶段三去重 + 体积封顶：进场预塞(system prompt)已按本意图带上相关已确认事实。
+	// 概览里的 recent_facts 剔除重复后只保留最新一小窗（≤10 条，摘要封顶 160 字）。
+	if rf, ok := data["recent_facts"].([]map[string]any); ok && len(rf) > 0 {
+		kept := make([]map[string]any, 0, min(len(rf), workerOverviewRecentFactsCap))
+		for _, m := range rf {
+			if len(seedFactIDs) > 0 {
 				if id, ok := m["id"].(int64); ok && seedFactIDs[id] {
 					continue // 已在进场预塞里，省去重复
 				}
-				kept = append(kept, m)
 			}
-			data["recent_facts"] = kept
+			if s, ok := m["summary"].(string); ok {
+				m["summary"] = clipPlainRunes(s, factSummaryMax)
+			}
+			kept = append(kept, m)
+			if len(kept) >= workerOverviewRecentFactsCap {
+				break
+			}
 		}
+		data["recent_facts"] = kept
+	}
+	// finding_list 摘要封顶，防止单条超长漏洞摘要撑爆概览。
+	if fl, ok := data["finding_list"].([]map[string]any); ok {
+		for _, m := range fl {
+			if s, ok := m["summary"].(string); ok {
+				m["summary"] = clipPlainRunes(s, factSummaryMax)
+			}
+		}
+	}
+	// cold_digests：worker 不需携带多达 15 篇完整冷区长摘要；仅保留最新 3 篇且正文裁至 300 字，
+	// 需要回查冷区历史时可按 id 调 expand_digest 或 list_facts。
+	if cds, ok := data["cold_digests"].([]map[string]any); ok && len(cds) > 0 {
+		lim := min(len(cds), workerOverviewColdDigestsCap)
+		slim := make([]map[string]any, 0, lim)
+		for _, cd := range cds[:lim] {
+			entry := map[string]any{"id": cd["id"]}
+			if mc, ok := cd["member_count"]; ok {
+				entry["member_count"] = mc
+			}
+			if body, ok := cd["body"].(string); ok {
+				entry["body"] = clipPlainRunes(body, workerOverviewColdDigestBodyMax)
+			}
+			slim = append(slim, entry)
+		}
+		data["cold_digests"] = slim
+	}
+	// hints：保留最新 8 条、每条正文封顶 200 字。
+	if hs, ok := data["hints"].([]map[string]any); ok && len(hs) > 0 {
+		lim := min(len(hs), workerOverviewHintsCap)
+		slim := make([]map[string]any, 0, lim)
+		for _, h := range hs[:lim] {
+			entry := map[string]any{"id": h["id"], "state": h["state"]}
+			if text, ok := h["text"].(string); ok {
+				entry["text"] = clipPlainRunes(text, workerOverviewHintTextMax)
+			}
+			if refs, ok := h["traffic_refs"]; ok {
+				entry["traffic_refs"] = refs
+			}
+			slim = append(slim, entry)
+		}
+		data["hints"] = slim
+	}
+	// related_tasks：跨任务概览在 planner 上限 48k runes，对 worker 裁剪为轻量索引
+	// （保留任务信息、计数和少量近期 findings/facts 摘要，细节走 list_facts/list_findings）。
+	if rts, ok := data["related_tasks"].([]map[string]any); ok && len(rts) > 0 {
+		slim := make([]map[string]any, 0, len(rts))
+		for _, rt := range rts {
+			entry := map[string]any{}
+			for _, k := range []string{"source_task_id", "inherited", "task", "facts", "findings"} {
+				if v, exists := rt[k]; exists {
+					entry[k] = v
+				}
+			}
+			for _, listKey := range []string{"recent_findings", "recent_facts"} {
+				if list, ok := rt[listKey].([]map[string]any); ok && len(list) > 0 {
+					lim := min(len(list), workerOverviewRelatedListCap)
+					sub := make([]map[string]any, 0, lim)
+					for _, item := range list[:lim] {
+						cp := map[string]any{"id": item["id"]}
+						if s, ok := item["summary"].(string); ok {
+							cp["summary"] = clipPlainRunes(s, factSummaryMax)
+						}
+						sub = append(sub, cp)
+					}
+					entry[listKey] = sub
+				}
+			}
+			slim = append(slim, entry)
+		}
+		data["related_tasks"] = slim
 	}
 	b, err := json.Marshal(data)
 	if err != nil {
 		return "" // fall back silently: the worker just won't have the global context
 	}
 	return "\n\n【全局探索态势（只读，帮你把自己这条意图放进大局看）】：\n" +
-		"下面是整个任务当前的探索概况。用途有两个：一是知道别人已发现什么，别重复；二是让你探自己这条意图时，能联想到它和全局的关系。\n" +
+		"下面是整个任务当前的精简探索概况（需要完整历史可按需调 list_facts / list_findings / node_detail）。用途有两个：一是知道别人已发现什么，别重复；二是让你探自己这条意图时，能联想到它和全局的关系。\n" +
 		"**发散是好事**：探本意图时尽管深想、多联想。唯一的界线是——别真的动手去执行别的意图（那是别的 worker 的事，由规划者调度）。但凡你联想到有价值的线索（跨资产的联动、疑似另一条利用链的入口、全局层面的可疑点），**务必写进 fact 交规划者**——这是你重要的产出，不是可有可无。宁可多报一条让规划者判断，也别自己咽下去。\n" +
 		string(b)
 }

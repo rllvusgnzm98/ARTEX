@@ -38,7 +38,10 @@ func (e *Engine) logProcessHeartbeat(now time.Time, previous sql.DBStats) sql.DB
 	if e.m != nil {
 		for _, task := range e.m.List() {
 			state := task.lifecycleSnapshot()
-			if state.Status == "running" && !state.Paused && !state.Queued {
+			if state.Paused || state.Queued || isTerminalStatus(state.Status) {
+				continue
+			}
+			if state.Status == "running" || (task.ID != "" && e.Started(task.ID) && !e.IsPaused(task.ID)) {
 				running++
 			}
 		}
@@ -46,9 +49,11 @@ func (e *Engine) logProcessHeartbeat(now time.Time, previous sql.DBStats) sql.DB
 			stats = e.m.pg.Stats()
 		}
 	}
-	log.Printf("[heartbeat] running_tasks=%d engine_inflight=%d llm_inflight=%d last_llm_start_s=%.1f last_llm_finish_s=%.1f db_in_use=%d db_idle=%d db_wait_count=%d db_wait_count_delta=%d db_wait_duration_delta=%s goroutines=%d",
+	log.Printf("[heartbeat] running_tasks=%d engine_inflight=%d llm_inflight=%d last_llm_start_s=%.1f last_llm_finish_s=%.1f provider_inflight=%d last_provider_start_s=%.1f last_provider_finish_s=%.1f db_in_use=%d db_idle=%d db_wait_count=%d db_wait_count_delta=%d db_wait_duration_delta=%s goroutines=%d",
 		running, sumEngineCounters(&e.inflight), sumEngineCounters(&e.llmCalls),
 		secondsSince(now, e.lastLLMStart.Load()), secondsSince(now, e.lastLLMFinish.Load()),
+		max(int64(0), e.providerInflight.Load()),
+		secondsSince(now, e.lastProviderStart.Load()), secondsSince(now, e.lastProviderFinish.Load()),
 		stats.InUse, stats.Idle, stats.WaitCount, stats.WaitCount-previous.WaitCount, stats.WaitDuration-previous.WaitDuration, runtime.NumGoroutine())
 	return stats
 }

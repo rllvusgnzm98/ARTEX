@@ -57,8 +57,9 @@ func TestTaskLLMDoesNotRetryProductionProviderAfterStopLoss(t *testing.T) {
 }
 
 func TestTaskLLMStopLossDoesNotReplayPool(t *testing.T) {
-	loss := agent.NewStopLossMonitor(agent.DefaultStopLossPolicy())
-	for range 2 {
+	policy := agent.DefaultStopLossPolicy()
+	loss := agent.NewStopLossMonitor(policy)
+	for range policy.RepeatCommandLimit {
 		loss.ObserveTool("Bash", []byte(`{"command":"fixture"}`), false)
 	}
 	if !loss.Recompute().Fired() {

@@ -164,3 +164,26 @@ func TestStaleSupplyFailuresAfterReplacementLeaveTaskUnfrozen(t *testing.T) {
 		releaseTaskSupply(task.ID)
 	}
 }
+
+func TestReleaseAllTaskSupplyConcurrentWithHold(t *testing.T) {
+	t.Cleanup(releaseAllTaskSupply)
+	task := &Task{ID: "task-release-all", LLMChainRevision: 2}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				applySupplyHoldAt(task, 2)
+				_ = taskSupplyFrozen(task)
+				releaseAllTaskSupply()
+			}
+		}()
+	}
+	wg.Wait()
+	releaseAllTaskSupply()
+	if taskSupplyFrozen(task) {
+		t.Fatal("task should be unfrozen after releaseAllTaskSupply")
+	}
+}
+

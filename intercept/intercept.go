@@ -71,6 +71,12 @@ func taskInfoFromCtx(ctx context.Context) (taskID, agentName string) {
 	return "", ""
 }
 
+// TaskIDFromContext returns the task id attached via WithTaskContext, or "".
+func TaskIDFromContext(ctx context.Context) string {
+	id, _ := taskInfoFromCtx(ctx)
+	return id
+}
+
 func taskEmitFromCtx(ctx context.Context) func(db.Activity) {
 	f, _ := ctx.Value(taskEmitCtxKey).(func(db.Activity))
 	return f

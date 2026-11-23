@@ -143,3 +143,38 @@ func TestProcessHeartbeatStopsOnCancellation(t *testing.T) {
 		t.Fatal("heartbeat did not stop")
 	}
 }
+
+func TestProcessHeartbeatCountsStartedCreatedTaskAndProviderInflight(t *testing.T) {
+	m := &Manager{tasks: map[string]*Task{
+		"101": {ID: "101", Status: "created"},
+		"102": {ID: "102", Status: "created"},
+		"103": {ID: "103", Status: "done"},
+	}}
+	e := NewEngine(m)
+	e.started.Store("101", true)
+	e.started.Store("103", true) // terminal must not count even if started bit lingering
+	e.beginProviderCall()
+	now := time.Now()
+	e.lastProviderStart.Store(now.Add(-7 * time.Second).UnixNano())
+	e.lastProviderFinish.Store(now.Add(-2 * time.Second).UnixNano())
+
+	var output bytes.Buffer
+	original := log.Writer()
+	log.SetOutput(&output)
+	defer log.SetOutput(original)
+
+	e.logProcessHeartbeat(now, sql.DBStats{})
+	line := output.String()
+	for _, want := range []string{"running_tasks=1", "provider_inflight=1", "last_provider_start_s=7.0", "last_provider_finish_s=2.0"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("heartbeat missing %q: %s", want, line)
+		}
+	}
+	e.endProviderCall()
+	output.Reset()
+	e.logProcessHeartbeat(now, sql.DBStats{})
+	if !strings.Contains(output.String(), "provider_inflight=0") {
+		t.Fatalf("expected provider_inflight=0 after endProviderCall: %s", output.String())
+	}
+}
+

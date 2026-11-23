@@ -35,10 +35,18 @@ func (s *Server) chatGuard() *guard.Guard {
 
 // wireInterceptReviewer installs the LLM fallback judge into the interceptor. The
 // judge runs only on tool calls that matched no rule (see intercept.Judge). It
-// resolves the configured judge profile (0 → active/default), builds a provider,
-// runs a one-shot JSON classification with an explanation for every verdict.
+// resolves the configured judge profile (0 → triggering task's active profile →
+// global active/default), builds a provider, and runs a one-shot JSON
+// classification with an explanation for every verdict.
 func (s *Server) wireInterceptReviewer() {
 	s.m.interceptor.SetReviewer(func(ctx context.Context, profileID int64, prompt string, input intercept.ReviewInput) (intercept.Decision, error) {
+		if profileID == 0 {
+			if tid := intercept.TaskIDFromContext(ctx); tid != "" {
+				if id := s.taskActiveLLMProfileID(tid); id != nil {
+					profileID = *id
+				}
+			}
+		}
 		if profileID == 0 {
 			if p, err := s.m.pg.ActiveProfile(); err == nil && p != nil {
 				profileID = p.ID

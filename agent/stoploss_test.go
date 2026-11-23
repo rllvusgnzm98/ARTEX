@@ -469,3 +469,146 @@ func TestStopLossReminderYieldsToPendingSteer(t *testing.T) {
 		t.Fatalf("reminder must still fire after the steer is gone, got block=%v msg=%q", block, msg)
 	}
 }
+
+func TestStopLossDefaultPolicyAndEnvOverrides(t *testing.T) {
+	t.Setenv("ARTEX_STOPLOSS_IDLE_PROBES", "")
+	t.Setenv("ARTEX_STOPLOSS_REPEAT_LIMIT", "")
+	def := DefaultStopLossPolicy()
+	if def.IdleProbeLimit != 8 || def.RepeatCommandLimit != 3 {
+		t.Fatalf("default policy = %+v, want IdleProbeLimit=8 RepeatCommandLimit=3", def)
+	}
+	t.Setenv("ARTEX_STOPLOSS_IDLE_PROBES", "12")
+	t.Setenv("ARTEX_STOPLOSS_REPEAT_LIMIT", "5")
+	over := DefaultStopLossPolicy()
+	if over.IdleProbeLimit != 12 || over.RepeatCommandLimit != 5 {
+		t.Fatalf("env override policy = %+v, want 12/5", over)
+	}
+}
+
+func TestStopLossMultiToolTurnReminderHoldsAllSiblings(t *testing.T) {
+	// Norma executes all tool calls in a single assistant turn before returning
+	// tool results to the model. Once the reminder triggers on the first probe
+	// of a turn, sibling probes in the SAME turn must also be held so they
+	// cannot slip through and latch no_progress before the model sees the nudge.
+	p := tightPolicy()
+	p.IdleProbeLimit = 3
+	mon := NewStopLossMonitor(p)
+	hooks := WrapStopLoss(nil, mon)
+
+	mon.BeginModelTurn()
+	a, _ := jsonCmd(`{"command":"curl https://a.example.test/1"}`)
+	hooks.PostToolUse(context.Background(), "Bash", a, []byte("ok"), false)
+	mon.BeginModelTurn()
+	b, _ := jsonCmd(`{"command":"curl https://a.example.test/2"}`)
+	hooks.PostToolUse(context.Background(), "Bash", b, []byte("ok"), false)
+
+	// Next turn emits TWO probes in parallel (idle == limit-1 == 2):
+	mon.BeginModelTurn()
+	c, _ := jsonCmd(`{"command":"curl https://a.example.test/3"}`)
+	d, _ := jsonCmd(`{"command":"curl https://a.example.test/4"}`)
+	block1, msg1, _ := hooks.PreToolUse(context.Background(), "Bash", c)
+	block2, msg2, _ := hooks.PreToolUse(context.Background(), "Bash", d)
+	if !block1 || !strings.Contains(msg1, StopLossWriteBackReminderPrefix) {
+		t.Fatalf("first probe should be held with reminder, got block=%v msg=%q", block1, msg1)
+	}
+	if !block2 || !strings.Contains(msg2, StopLossWriteBackReminderPrefix) {
+		t.Fatalf("same-turn sibling probe must also be held with reminder, got block=%v msg=%q", block2, msg2)
+	}
+	if mon.Fired() {
+		t.Fatalf("reminder-held sibling turn must not latch stop-loss, verdict=%+v", mon.Verdict())
+	}
+
+	// On the NEXT model turn, if the model still ignores the reminder and probes,
+	// it is allowed through so PostToolUse can latch no_progress cleanly.
+	mon.BeginModelTurn()
+	if block3, msg3, _ := hooks.PreToolUse(context.Background(), "Bash", c); block3 {
+		t.Fatalf("next-turn probe after reminder should proceed to latch, got block=%v msg=%q", block3, msg3)
+	}
+}
+
+func TestStopLossLocalEditsAndLocalReadOnlyBashExemptFromIdle(t *testing.T) {
+	p := tightPolicy()
+	p.IdleProbeLimit = 2
+	p.RepeatCommandLimit = 5
+	mon := NewStopLossMonitor(p)
+
+	// Local file authoring and local read-only shell commands must not burn idle budget.
+	mon.ObserveTool("Write", []byte(`{"file_path":"/tmp/exp.py","content":"v1"}`), false)
+	mon.ObserveTool("Edit", []byte(`{"file_path":"/tmp/exp.py","old_string":"v1","new_string":"v2"}`), false)
+	mon.ObserveTool("MultiEdit", []byte(`{"file_path":"/tmp/exp.py","edits":[]}`), false)
+	mon.ObserveTool("Bash", []byte(`{"command":"ls -la /tmp && cat /tmp/exp.py | head -n 5"}`), false)
+	mon.ObserveTool("Bash", []byte(`{"command":"grep -n foo /tmp/exp.py"}`), false)
+	if v := mon.Recompute(); v.Fired() || v.Signals.IdleProbes != 0 {
+		t.Fatalf("local edits/reads should not increment IdleProbes, got verdict=%+v", v)
+	}
+
+	// Network-facing recon command (dig) and active probe (curl) DO count.
+	mon.ObserveTool("Bash", []byte(`{"command":"dig target.example.test"}`), false)
+	mon.ObserveTool("Bash", []byte(`{"command":"curl https://target.example.test/"}`), false)
+	if v := mon.Recompute(); !v.Fired() || v.Kind != StopLossNoProgress || v.Signals.IdleProbes != 2 {
+		t.Fatalf("network probes must trip no_progress at limit=2, got %+v", v)
+	}
+}
+
+func TestStopLossEditClearsBashRepeatsAndWriteBackClearsAllRepeats(t *testing.T) {
+	p := tightPolicy()
+	p.IdleProbeLimit = 20
+	p.RepeatCommandLimit = 3
+	mon := NewStopLossMonitor(p)
+
+	runExp, _ := jsonCmd(`{"command":"python3 exploit.py"}`)
+	mon.ObserveTool("Bash", runExp, false)
+	mon.ObserveTool("Bash", runExp, false) // count=2 (<3)
+	// Editing the script should reset Bash repeat counts so re-running is not a false loop.
+	mon.ObserveTool("Edit", []byte(`{"file_path":"exploit.py","old_string":"a","new_string":"b"}`), false)
+	mon.ObserveTool("Bash", runExp, false) // count=1 after reset
+	mon.ObserveTool("Bash", runExp, false) // count=2
+	if v := mon.Recompute(); v.Fired() {
+		t.Fatalf("re-running edited script must not trigger repeated_command: %+v", v)
+	}
+
+	// Write-back (record_fact) also resets repeats for the new window.
+	mon.ObserveTool("record_fact", []byte(`{"summary":"progress"}`), false)
+	mon.ObserveTool("Bash", runExp, false) // count=1
+	mon.ObserveTool("Bash", runExp, false) // count=2
+	if v := mon.Recompute(); v.Fired() {
+		t.Fatalf("write-back must reset repeat window: %+v", v)
+	}
+
+	// Repeating identical Write 3 times without progress STILL trips repeated_command.
+	sameWrite := []byte(`{"file_path":"exploit.py","content":"unchanged"}`)
+	mon.ObserveTool("Write", sameWrite, false)
+	mon.ObserveTool("Write", sameWrite, false)
+	mon.ObserveTool("Write", sameWrite, false)
+	if v := mon.Recompute(); !v.Fired() || v.Kind != StopLossRepeatedCommand {
+		t.Fatalf("identical Write loop must still trip repeated_command, got %+v", v)
+	}
+}
+
+func TestStopLossPostLatchAllowsAllWriteBackTools(t *testing.T) {
+	p := tightPolicy()
+	p.IdleProbeLimit = 1
+	mon := NewStopLossMonitor(p)
+	hooks := WrapStopLoss(nil, mon)
+
+	mon.ObserveTool("Bash", []byte(`{"command":"curl https://t.example.test/"}`), false)
+	if !mon.Recompute().Fired() {
+		t.Fatal("expected stop-loss to latch")
+	}
+
+	// All 4 write-back tools must remain allowed after stop-loss latches.
+	for _, tool := range []string{"record_fact", "insert_assets", "report_finding", "add_finding"} {
+		block, msg, _ := hooks.PreToolUse(context.Background(), tool, []byte(`{}`))
+		if block {
+			t.Fatalf("post-stop-loss %s must be allowed, got blocked: %q", tool, msg)
+		}
+	}
+	// Non-write-back execution tools remain blocked.
+	for _, tool := range []string{"Bash", "Write", "Edit"} {
+		block, msg, _ := hooks.PreToolUse(context.Background(), tool, []byte(`{}`))
+		if !block || !strings.Contains(msg, "record_fact") || !strings.Contains(msg, "report_finding") {
+			t.Fatalf("post-stop-loss %s must be blocked with write-back guidance, block=%v msg=%q", tool, block, msg)
+		}
+	}
+}
+

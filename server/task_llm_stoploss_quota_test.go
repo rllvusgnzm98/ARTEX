@@ -129,3 +129,30 @@ func TestTaskLLMStopLossQuotaBooksFailoverWithoutReplay(t *testing.T) {
 		})
 	}
 }
+
+func TestTaskLLMNonStopLossCommittedQuotaSetsFailoverReady(t *testing.T) {
+	// Even without stop-loss latched, a mid-stream (committed) quota failure
+	// with a healthy backup profile must NOT replay the partial turn, MUST mark
+	// failoverReady=true so runIntent does not freeze the whole task, and MUST
+	// remain wrapped as a taskLLMError so retryableWorkerModelError stays false.
+	quota := errors.New("openai: status 402: insufficient_quota")
+	provider := &scriptedLLMProvider{events: []llm.StreamEvent{{Type: llm.SETextDelta, Text: "partial"}}, err: quota}
+	next := int64(22)
+	hooks := taskLLMStreamHooks{
+		current: func() (taskLLMSelection, error) {
+			return taskLLMSelection{profileID: 11, revision: 4, provider: provider}, nil
+		},
+		exhaust: func(taskLLMSelection, error) (db.TaskLLMTransition, error) {
+			return db.TaskLLMTransition{PreviousProfileID: 11, NextProfileID: &next, Advanced: true, Revision: 4}, nil
+		},
+	}
+	events, err := collectTaskLLMStream(streamTaskLLM(t.Context(), "9", llm.CompletionRequest{}, hooks))
+	if len(events) != 1 || !errors.Is(err, quota) {
+		t.Fatalf("events=%+v err=%v", events, err)
+	}
+	if !isTaskLLMRuntimeError(err) || !isTaskLLMFailoverReady(err) || isTaskLLMChainExhausted(err) || taskLLMErrorRevision(err) != 4 {
+		t.Fatalf("runtime=%v failoverReady=%v exhausted=%v rev=%d err=%v",
+			isTaskLLMRuntimeError(err), isTaskLLMFailoverReady(err), isTaskLLMChainExhausted(err), taskLLMErrorRevision(err), err)
+	}
+}
+

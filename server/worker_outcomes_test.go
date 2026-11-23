@@ -33,6 +33,10 @@ func TestWorkerTerminationOutcome(t *testing.T) {
 		{harness.ReasonStopHookPrevented, nil, stopped, agent.WriteCounts{}, "stop_loss", "no_progress"},
 		{harness.ReasonStopHookPrevented, nil, stopped, agent.WriteCounts{Facts: 1, Failures: 1}, "persistence_failed", "evidence_write"},
 		{harness.ReasonAbortedStreaming, context.Canceled, stopped, agent.WriteCounts{}, "cancelled", "context_cancelled"},
+		{harness.ReasonModelError, &agent.CallTimeoutError{Provider: "openai", Model: "m", Timeout: time.Second, Elapsed: time.Second}, agent.StopLossVerdict{}, agent.WriteCounts{}, "llm_timeout", "call_timeout"},
+		{harness.ReasonModelError, &agent.StreamIdleTimeoutError{Idle: time.Second}, agent.StopLossVerdict{}, agent.WriteCounts{}, "llm_timeout", "call_timeout"},
+		{harness.ReasonModelError, errors.New("status 402: insufficient_quota"), agent.StopLossVerdict{}, agent.WriteCounts{}, "supply_failure", "http_402"},
+		{harness.ReasonModelError, errors.New("insufficient_quota"), agent.StopLossVerdict{}, agent.WriteCounts{}, "supply_failure", "quota_exhausted"},
 	} {
 		class, reason := workerTerminationOutcome(tc.reason, tc.err, tc.verdict, tc.writes, nil)
 		if class != tc.class || reason != tc.subreason {
@@ -61,6 +65,7 @@ func TestDetachedWorkCompletionReportsOnce(t *testing.T) {
 }
 
 func TestEnginePostStopLossRecordsOneTermination(t *testing.T) {
+	repeatLimit := agent.DefaultStopLossPolicy().RepeatCommandLimit
 	for _, mode := range []string{"denied", "cancelled", "link_timeout", "retry_writes"} {
 		t.Run(mode, func(t *testing.T) {
 			pg := openTestPG(t)
@@ -145,13 +150,13 @@ func TestEnginePostStopLossRecordsOneTermination(t *testing.T) {
 					}
 				}
 				path := fixture
-				if calls > 2 {
+				if calls > repeatLimit {
 					if mode == "cancelled" {
 						cancel()
 						return llm.Message{}, "", llm.Usage{}, ctx.Err()
 					}
 					if mode == "link_timeout" {
-						if calls > 3 {
+						if calls > repeatLimit+1 {
 							return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("done")}}, "end_turn", llm.Usage{}, nil
 						}
 						input, _ := json.Marshal(map[string]any{"summary": "checkpoint", "intent_id": iid})
@@ -185,14 +190,14 @@ func TestEnginePostStopLossRecordsOneTermination(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			wantClass, wantCalls := "stop_loss", 5
+			wantClass, wantCalls := "stop_loss", repeatLimit+3
 			wantKind := "repeated_command"
 			wantWrites := agent.WriteCounts{}
 			if mode == "cancelled" {
-				wantClass, wantCalls = "cancelled", 3
+				wantClass, wantCalls = "cancelled", repeatLimit+1
 			}
 			if mode == "link_timeout" {
-				wantClass, wantCalls = "persistence_failed", 4
+				wantClass, wantCalls = "persistence_failed", repeatLimit+2
 				wantWrites.Failures = 1
 				triggers := task.drainTriggers()
 				if len(triggers) != 1 || triggers[0].Kind != "done" || triggers[0].IntentID != iid {
@@ -201,6 +206,7 @@ func TestEnginePostStopLossRecordsOneTermination(t *testing.T) {
 			}
 			if mode == "retry_writes" {
 				wantClass, wantKind = "persistence_failed", ""
+				wantCalls = 5
 				wantWrites = agent.WriteCounts{Facts: 2, Failures: 1}
 			}
 			terminations := 0

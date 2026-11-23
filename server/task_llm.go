@@ -15,6 +15,7 @@ import (
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/llmrec"
+	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
 )
@@ -258,7 +259,19 @@ func (r *taskLLMRuntime) streamHooks() taskLLMStreamHooks {
 
 func (r *taskLLMRuntime) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
 	ctx = llmrec.WithTaskID(ctx, r.taskID)
-	return streamTaskLLM(ctx, r.taskID, req, r.streamHooks())
+	seq := streamTaskLLM(ctx, r.taskID, req, r.streamHooks())
+	if r.s == nil || r.s.engine == nil {
+		return seq
+	}
+	return func(yield func(llm.StreamEvent, error) bool) {
+		r.s.engine.beginProviderCall()
+		defer r.s.engine.endProviderCall()
+		for ev, err := range seq {
+			if !yield(ev, err) {
+				return
+			}
+		}
+	}
 }
 
 // Complete is the non-streaming counterpart of Stream. A non-streaming call is
@@ -268,6 +281,10 @@ func (r *taskLLMRuntime) Stream(ctx context.Context, req llm.CompletionRequest) 
 // streaming path needs is unnecessary here).
 func (r *taskLLMRuntime) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
 	ctx = llmrec.WithTaskID(ctx, r.taskID)
+	if r.s != nil && r.s.engine != nil {
+		r.s.engine.beginProviderCall()
+		defer r.s.engine.endProviderCall()
+	}
 	return completeTaskLLM(ctx, r.taskID, req, r.streamHooks())
 }
 
@@ -422,7 +439,18 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 				yield(llm.StreamEvent{}, stoppedQuotaError(taskID, transition, streamErr, hooks))
 				return
 			}
-			if committed || (!transition.Stale && transition.NextProfileID == nil) {
+			if committed {
+				// Output was already yielded, so this call cannot be replayed on the next
+				// profile. Still classify failoverReady/chainExhausted/revision so a healthy
+				// backup lets the task continue without freezing the whole scene.
+				outErr := stoppedQuotaError(taskID, transition, streamErr, hooks)
+				if !isTaskLLMRuntimeError(outErr) {
+					outErr = &taskLLMError{taskID: taskID, cause: outErr}
+				}
+				yield(llm.StreamEvent{}, outErr)
+				return
+			}
+			if !transition.Stale && transition.NextProfileID == nil {
 				yield(llm.StreamEvent{}, &taskLLMError{taskID: taskID, chainExhausted: transition.ChainExhausted, revision: transition.Revision, cause: streamErr})
 				return
 			}
@@ -592,6 +620,45 @@ func (s *Server) taskRuntimeAvailable(t *Task, agentKeys ...string) bool {
 	return true
 }
 
+// taskActiveLLMProfileID resolves the active (or pinned) LLM profile ID for
+// taskID, returning nil when the task has no explicit LLM profile configured.
+// Used by non-main-loop components (intercept judge, triggered agents, retro)
+// so they inherit the task's profile instead of falling back to an unrelated
+// global active profile.
+func (s *Server) taskActiveLLMProfileID(taskID string) *int64 {
+	if s == nil || s.m == nil || strings.TrimSpace(taskID) == "" {
+		return nil
+	}
+	if t, ok := s.m.Task(taskID); ok && t != nil {
+		st := t.llmStateSnapshot()
+		if st.ActiveID != nil && *st.ActiveID > 0 {
+			return cloneInt64Ptr(st.ActiveID)
+		}
+		if st.ProfileID != nil && *st.ProfileID > 0 {
+			return cloneInt64Ptr(st.ProfileID)
+		}
+		return nil
+	}
+	if s.m.pg == nil {
+		return nil
+	}
+	num, err := parseTaskID(taskID)
+	if err != nil {
+		return nil
+	}
+	pt, err := s.m.pg.GetTask(num)
+	if err != nil || pt == nil {
+		return nil
+	}
+	if pt.ActiveLLMProfileID != nil && *pt.ActiveLLMProfileID > 0 {
+		return cloneInt64Ptr(pt.ActiveLLMProfileID)
+	}
+	if pt.LLMProfileID != nil && *pt.LLMProfileID > 0 {
+		return cloneInt64Ptr(pt.LLMProfileID)
+	}
+	return nil
+}
+
 func (s *Server) invalidateTaskAgents() {
 	s.taskAgentMu.Lock()
 	s.taskAgents = map[string]*taskAgentBundle{}
@@ -634,6 +701,12 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	pl.SetKillWork(s.engine.killWorkAttributed)
 	pl.SetSteerWork(s.engine.SteerWork)
+	pl.SetGuardResolver(func(tid int64) harness.HookRunner {
+		if task, ok := s.m.Task(strconv.FormatInt(tid, 10)); ok && task != nil && task.Guard != nil {
+			return task.Guard.Hooks()
+		}
+		return nil
+	})
 	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	pl.SetUAResolver(s.uaForTask) // WebFetch 与 worker 共用按任务稳定 UA
 	pl.SetWebSearch(s.webSearchFor("planner"))

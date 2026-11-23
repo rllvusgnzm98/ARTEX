@@ -23,6 +23,10 @@ type WorkerEntrySeed struct {
 	GraphIncomplete   bool
 	IncompleteReasons []string
 	Prefetched        bool
+	// EmptyGraph is true when prefetch succeeded cleanly and the exploration
+	// graph currently has zero confirmed facts (fresh opening). In that state
+	// the worker does not need to spend turn 1 calling list_facts.
+	EmptyGraph bool
 	// Writes is always empty when produced by LoadWorkerEntrySeed / BuildWorkerEntrySeed:
 	// prefetch is read-only. Tests assert this so a prefetch failure cannot be
 	// recorded as a target/goal failure.
@@ -31,15 +35,17 @@ type WorkerEntrySeed struct {
 
 // EntryFact is a relevant confirmed fact or a task-wide key observation.
 type EntryFact struct {
-	ID          int64
-	Summary     string
-	Detail      string
-	Confidence  string
-	Category    string
-	EvidenceIDs []string
-	AssetIDs    []int64
-	Assets      []string
-	FromIntent  int64
+	ID           int64
+	Summary      string
+	Detail       string
+	Confidence   string
+	Category     string
+	EvidenceIDs  []string
+	AssetIDs     []int64
+	Assets       []string
+	FromIntent   int64
+	DirectParent bool // true when directly linked via derived_from to the claimed intent
+	Relevant     bool // true when linked via intent lineage or asset anchors (vs unrelated-host key fact)
 }
 
 // EntryTarget is a target confirmed reachable by a prior fact but not yet
@@ -266,11 +272,20 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 		byID[n.ID] = fv
 	}
 
+	seed.EmptyGraph = g.PrefetchErr == nil && !seed.GraphIncomplete && len(confirmed) == 0
+
 	relevant := map[int64]bool{}
+	intentRelevant := map[int64]bool{}
 	seedAnchors := map[int64]bool{}
-	mark := func(id int64) {
+	mark := func(id int64, isIntentRelevant bool) {
 		fv, ok := byID[id]
-		if !ok || relevant[id] {
+		if !ok {
+			return
+		}
+		if isIntentRelevant {
+			intentRelevant[id] = true
+		}
+		if relevant[id] {
 			return
 		}
 		relevant[id] = true
@@ -282,21 +297,29 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 		}
 	}
 	for id := range parentFacts {
-		mark(id)
+		mark(id, true)
 	}
 	for id := range siblingFacts {
-		mark(id)
+		mark(id, true)
 	}
 	for _, fv := range confirmed {
-		if isKeyFact(fv.category, fv.evidenceIDs) || overlapsID(fv.assets, intentAssets) {
-			mark(fv.node.ID)
+		if overlapsID(fv.assets, intentAssets) {
+			mark(fv.node.ID, true)
 		}
 	}
 	// One expansion: confirmed facts that share an anchor with the seed set
 	// (prior-stage observations on a host this hop is continuing from).
 	for _, fv := range confirmed {
 		if overlapsSet(fv.assets, seedAnchors) {
-			mark(fv.node.ID)
+			mark(fv.node.ID, true)
+		}
+	}
+	// Task-wide key facts (scope limits, negative results, cleanup status,
+	// evidence-bearing facts) are always included even when on other hosts,
+	// without widening seedAnchors or marking them intent-relevant.
+	for _, fv := range confirmed {
+		if isKeyFact(fv.category, fv.evidenceIDs) {
+			mark(fv.node.ID, false)
 		}
 	}
 
@@ -310,15 +333,17 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 			labels = append(labels, assetLabelOf(g.Assets, a))
 		}
 		facts = append(facts, EntryFact{
-			ID:          fv.node.ID,
-			Summary:     fv.summary,
-			Detail:      fv.detail,
-			Confidence:  fv.confidence,
-			Category:    fv.category,
-			EvidenceIDs: fv.evidenceIDs,
-			AssetIDs:    fv.assets,
-			Assets:      labels,
-			FromIntent:  fv.from,
+			ID:           fv.node.ID,
+			Summary:      fv.summary,
+			Detail:       fv.detail,
+			Confidence:   fv.confidence,
+			Category:     fv.category,
+			EvidenceIDs:  fv.evidenceIDs,
+			AssetIDs:     fv.assets,
+			Assets:       labels,
+			FromIntent:   fv.from,
+			DirectParent: parentFacts[fv.node.ID],
+			Relevant:     intentRelevant[fv.node.ID],
 		})
 	}
 	sort.Slice(facts, func(i, j int) bool { return facts[i].ID < facts[j].ID })
@@ -366,8 +391,11 @@ const (
 	entrySeedFactCap    = 60
 	entrySeedKeyFactCap = 40
 	// 阶段三(上下文控制)：关键事实(否定结果/范围限制/清理状态/带证据)保留内联细节但裁剪；
-	// 普通事实只给摘要，完整细节改为按需 node_detail 回查，不再每轮随 system prompt 重复下发。
-	entrySeedKeyDetailCap = 300
+	// 本意图的直接上游父事实(derived_from)保留更多细节(最多 8 条 × 600 字)，避免 worker
+	// 进场后反复调 node_detail 回查上游参数/凭据/路径；其余普通事实只给摘要。
+	entrySeedKeyDetailCap         = 300
+	entrySeedParentDetailCap      = 600
+	entrySeedParentDetailCountCap = 8
 )
 
 func clipRunes(s string, n int) string {
@@ -401,18 +429,38 @@ func RenderWorkerEntrySeed(seed WorkerEntrySeed) string {
 	}
 
 	if len(seed.ConfirmedFacts) == 0 {
-		b.WriteString("\n\n【进场预塞】没有相关事实或关键限制/证据。第一次工具仍须先读图（list_facts）。")
+		if seed.EmptyGraph {
+			b.WriteString("\n\n【进场预塞】当前探索图尚无已确认事实（任务开局），视为读图已完成；无需额外调 list_facts 空查，可直接围绕本意图开展探测。")
+		} else if seed.Prefetched && !seed.GraphIncomplete {
+			b.WriteString("\n\n【进场预塞】暂无与本意图直接关联的已确认事实或关键限制/证据；如需查看全局其他分支结论，可按需调 list_facts / node_detail。")
+		} else {
+			b.WriteString("\n\n【进场预塞】没有相关事实或关键限制/证据。第一次工具仍须先读图（list_facts）。")
+		}
 		return b.String()
 	}
 
 	b.WriteString("\n\n【进场预塞：相关事实与任务关键限制/证据】\n")
-	fmt.Fprintf(&b, "关键事实优先（最多 %d 条，保留最早记录）；其余位置补最新相关普通事实，总计最多 %d 条。\n", entrySeedKeyFactCap, entrySeedFactCap)
-	b.WriteString("普通事实只列摘要（含 evidence_ids、资产、来源意图），完整细节用 node_detail 查；关键事实保留裁剪后的细节。\n")
+	fmt.Fprintf(&b, "关键事实优先（最多 %d 条，本意图相关与范围/清理限制优先）；其余位置补最新相关普通事实，总计最多 %d 条。\n", entrySeedKeyFactCap, entrySeedFactCap)
+	b.WriteString("上游直接父事实与关键事实保留裁剪后的细节；其余普通事实只列摘要（含 evidence_ids、资产、来源意图），完整细节按需用 node_detail 查。\n")
 	keys, general, omittedKeys, omittedGeneral := selectedEntrySeedFacts(seed)
 	if omittedKeys+omittedGeneral > 0 {
 		fmt.Fprintf(&b, "（另有 %d 条事实未列出：关键事实 %d 条，相关普通事实 %d 条；需要时用 list_facts / node_detail 查）\n", omittedKeys+omittedGeneral, omittedKeys, omittedGeneral)
 	}
 	facts := append(keys, general...)
+	inlineParents := map[int64]bool{}
+	var parentIDs []int64
+	for _, f := range facts {
+		if f.DirectParent && strings.TrimSpace(f.Detail) != "" {
+			parentIDs = append(parentIDs, f.ID)
+		}
+	}
+	sort.Slice(parentIDs, func(i, j int) bool { return parentIDs[i] < parentIDs[j] })
+	if len(parentIDs) > entrySeedParentDetailCountCap {
+		parentIDs = parentIDs[len(parentIDs)-entrySeedParentDetailCountCap:]
+	}
+	for _, id := range parentIDs {
+		inlineParents[id] = true
+	}
 	for _, f := range facts {
 		conf := f.Confidence
 		if conf == "" {
@@ -435,10 +483,16 @@ func RenderWorkerEntrySeed(seed WorkerEntrySeed) string {
 			fmt.Fprintf(&b, "［来自意图 #%d］", f.FromIntent)
 		}
 		b.WriteByte('\n')
-		// 阶段三：只对关键事实内联(裁剪后的)细节；普通事实的细节改走按需 node_detail 回查，
-		// 不再每轮随 system prompt 重复下发(摘要+evidence_ids 已足以感知与去重)。
-		if d := strings.TrimSpace(f.Detail); d != "" && isKeyFact(f.Category, f.EvidenceIDs) {
-			fmt.Fprintf(&b, "  细节：%s\n", clipRunes(d, entrySeedKeyDetailCap))
+		// 阶段三+优化：本意图直接上游父事实（derived_from，最多最新 8 条）保留最多 600 字细节，
+		// 减少 worker 开局反复调 node_detail 回查上游线索；关键事实保留 300 字细节；
+		// 其余普通事实仅给摘要，按需 node_detail 回查。
+		if d := strings.TrimSpace(f.Detail); d != "" {
+			switch {
+			case inlineParents[f.ID]:
+				fmt.Fprintf(&b, "  细节：%s\n", clipRunes(d, entrySeedParentDetailCap))
+			case isKeyFact(f.Category, f.EvidenceIDs):
+				fmt.Fprintf(&b, "  细节：%s\n", clipRunes(d, entrySeedKeyDetailCap))
+			}
 		}
 	}
 
@@ -696,8 +750,11 @@ func entrySeedFactIDSet(seed WorkerEntrySeed) map[int64]bool {
 	return m
 }
 
-// selectedEntrySeedFacts applies the render caps: oldest entrySeedKeyFactCap key
-// facts, then the newest general facts filling up to entrySeedFactCap.
+// selectedEntrySeedFacts applies the render caps: up to entrySeedKeyFactCap key
+// facts (intent-relevant and scope/cleanup constraints prioritized before
+// unrelated-host key facts, oldest first within each tier), then general facts
+// filling up to entrySeedFactCap (protecting direct parent facts alongside the
+// newest relevant general facts).
 func selectedEntrySeedFacts(seed WorkerEntrySeed) (keys, general []EntryFact, omittedKeys, omittedGeneral int) {
 	for _, fact := range seed.ConfirmedFacts {
 		if isKeyFact(fact.Category, fact.EvidenceIDs) {
@@ -706,15 +763,34 @@ func selectedEntrySeedFacts(seed WorkerEntrySeed) (keys, general []EntryFact, om
 			general = append(general, fact)
 		}
 	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i].ID < keys[j].ID })
-	sort.Slice(general, func(i, j int) bool { return general[i].ID < general[j].ID })
+	keyTier := func(f EntryFact) int {
+		if f.DirectParent || f.Relevant || f.Category == "scope_limit" || f.Category == "cleanup_status" {
+			return 0
+		}
+		return 1
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		ti, tj := keyTier(keys[i]), keyTier(keys[j])
+		if ti != tj {
+			return ti < tj
+		}
+		return keys[i].ID < keys[j].ID
+	})
+	sort.Slice(general, func(i, j int) bool {
+		if general[i].DirectParent != general[j].DirectParent {
+			return !general[i].DirectParent
+		}
+		return general[i].ID < general[j].ID
+	})
 	keyCount, generalCount := len(keys), len(general)
 	if len(keys) > entrySeedKeyFactCap {
 		keys = keys[:entrySeedKeyFactCap]
 	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i].ID < keys[j].ID })
 	generalSlots := entrySeedFactCap - len(keys)
 	if len(general) > generalSlots {
 		general = general[len(general)-generalSlots:]
 	}
+	sort.Slice(general, func(i, j int) bool { return general[i].ID < general[j].ID })
 	return keys, general, keyCount - len(keys), generalCount - len(general)
 }

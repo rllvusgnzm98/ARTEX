@@ -11,6 +11,7 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
+	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
@@ -41,6 +42,7 @@ type Planner struct {
 	maxTokensFn       func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
 	compactor         *Compactor                             // cold-node compaction (§7); nil = disabled
 	uaFn              func(taskID int64) string              // 按任务稳定 UA → WebFetch 请求头；nil = 官方默认
+	guardFn           func(taskID int64) harness.HookRunner  // 任务级 Guard hooks（用于规划者开局探测经由范围/拦截规则检查）
 
 	// todos keeps ONE plan-scratchpad per task (keyed by exploration id) so the
 	// planner's multi-step plan survives across wake-ups — each Plan() is a fresh
@@ -111,6 +113,10 @@ func (p *Planner) uaForTask(taskID int64) string {
 	return p.uaFn(taskID)
 }
 
+// SetGuardResolver wires a per-task Guard hook resolver so the planner's
+// opening probes still pass through task scope, RoE, and intercept guards.
+func (p *Planner) SetGuardResolver(fn func(taskID int64) harness.HookRunner) { p.guardFn = fn }
+
 // SetWebSearch selects the web_search backend for the planner (off by default).
 func (p *Planner) SetWebSearch(o WebSearchOpts) { p.webSearch = o }
 
@@ -146,6 +152,17 @@ func (p *Planner) probeFor(expID int64) *plannerProbeState {
 		p.probes[expID] = s
 	}
 	return s
+}
+
+// ForgetExploration drops per-exploration in-memory planner state (todos and
+// opening-probe counters) when a task is deleted or archived.
+func (p *Planner) ForgetExploration(expID int64) {
+	p.todoMu.Lock()
+	delete(p.todos, expID)
+	p.todoMu.Unlock()
+	p.probeMu.Lock()
+	delete(p.probes, expID)
+	p.probeMu.Unlock()
 }
 
 // SetKillWork wires the engine's per-work terminate callback so the planner's
@@ -469,15 +486,26 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	}
 	AttachStableWebFetch(&opts, p.uaForTask(taskID))
 	// Enforce the planner's probe boundaries in the harness, not just in the prompt:
-	// no self-probing once workers have produced facts, and a finite opening
-	// allowance shared across this task's wake-ups. Planning, graph reads and
-	// intent generation are untouched.
-	opts.Hooks = WrapPlannerProbe(nil, p.probeFor(ts.ID()), PlannerProbeLimit, func() (int, bool) {
+	// no self-probing once workers have produced facts or findings, and a finite
+	// opening allowance shared across this task's wake-ups. Allowed opening probes
+	// still traverse the task's Guard (scope/RoE/intercept) via innerHooks.
+	var innerHooks harness.HookRunner
+	if p.guardFn != nil {
+		innerHooks = p.guardFn(taskID)
+	}
+	opts.Hooks = WrapPlannerProbe(innerHooks, p.probeFor(ts.ID()), PlannerProbeLimit, func() (int, bool) {
 		n, err := ts.CountWorkerFacts()
 		if err != nil {
 			return 0, false // fail soft: never guess the graph is empty
 		}
-		return n, true
+		if n > 0 {
+			return n, true
+		}
+		f, err := ts.CountByKind(db.KindFinding)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
 	})
 	if p.tx != nil { // persist raw LLM conversation; one accumulating file per task's planner
 		opts.Transcript = p.tx

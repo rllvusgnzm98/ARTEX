@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -115,8 +116,9 @@ func retryableWorkerModelError(reason harness.TerminalReason, err error) bool {
 // (re)installed at runtime (LLM configured from the UI); the loops always run
 // but idle until an LLM is set.
 type Engine struct {
-	m        *Manager
-	debounce time.Duration
+	m            *Manager
+	debounce     time.Duration
+	planCooldown atomic.Int64
 
 	// retroHook, when set by the server, fires once per task when all goals are met
 	// (task 收官) so a structured retro can distill reusable TTP from the run.
@@ -135,8 +137,11 @@ type Engine struct {
 	// version + effective config) stamped in this process.
 	provStamped sync.Map // taskID -> true
 
-	lastLLMStart  atomic.Int64
-	lastLLMFinish atomic.Int64
+	lastLLMStart       atomic.Int64
+	lastLLMFinish      atomic.Int64
+	providerInflight   atomic.Int64
+	lastProviderStart  atomic.Int64
+	lastProviderFinish atomic.Int64
 
 	// deleteMu makes installing the delete barrier atomic with registering a new
 	// task operation. Once BeginDelete returns, every admitted writer is reflected
@@ -326,8 +331,11 @@ func (e *Engine) StopTask(taskID string) {
 	e.deleting.Delete(taskID)
 	e.deleteMu.Unlock()
 
-	// 任务删除/归档连带销毁其 MITM 实例（端口注销；CA/录制树保留）。
+	// 任务删除/归档连带销毁其 MITM 实例（端口注销；CA/录制树保留）与持久化健康记录。
 	if e.m != nil {
+		if t, ok := e.m.Task(taskID); ok && t != nil && t.ExpID > 0 && e.m.pg != nil {
+			e.m.pg.Health().Forget(t.ExpID)
+		}
 		if id, err := strconv.ParseInt(taskID, 10, 64); err == nil {
 			e.m.CloseTaskProxy(id)
 		}
@@ -430,13 +438,72 @@ func (e *Engine) ActiveLLMCalls(taskID string) int64 {
 	return 0
 }
 
+// beginProviderCall / endProviderCall track actual in-flight HTTP/streaming LLM
+// requests inside taskLLMRuntime so process heartbeats can distinguish a hung
+// provider call from a long-running local tool execution inside worker.Execute.
+func (e *Engine) beginProviderCall() {
+	if e == nil {
+		return
+	}
+	e.lastProviderStart.Store(time.Now().UnixNano())
+	e.providerInflight.Add(1)
+}
+
+func (e *Engine) endProviderCall() {
+	if e == nil {
+		return
+	}
+	e.lastProviderFinish.Store(time.Now().UnixNano())
+	if e.providerInflight.Add(-1) < 0 {
+		e.providerInflight.Store(0)
+	}
+}
+
 func (e *Engine) touch(taskID string) { e.lastAct.Store(taskID, time.Now().Unix()) }
 
+const defaultPlanCooldown = 20 * time.Second
+
+func resolvePlanCooldown() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("ARTEX_PLANNER_COOLDOWN_SECONDS"))
+	if raw == "" {
+		return defaultPlanCooldown
+	}
+	sec, err := strconv.Atoi(raw)
+	if err != nil {
+		return defaultPlanCooldown
+	}
+	if sec <= 0 {
+		return 0
+	}
+	return time.Duration(sec) * time.Second
+}
+
+// SetPlanCooldown overrides the minimum interval between routine worker-done
+// replanning rounds (0 disables cooldown). Urgent triggers and empty frontiers
+// always bypass cooldown.
+func (e *Engine) SetPlanCooldown(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	e.planCooldown.Store(int64(d))
+}
+
+// PlanCooldown returns the active minimum interval between routine worker-done
+// replanning rounds.
+func (e *Engine) PlanCooldown() time.Duration {
+	if e == nil {
+		return 0
+	}
+	return time.Duration(e.planCooldown.Load())
+}
+
 func NewEngine(m *Manager) *Engine {
-	return &Engine{m: m, debounce: 800 * time.Millisecond, bc: NewBroadcaster(),
+	e := &Engine{m: m, debounce: 800 * time.Millisecond, bc: NewBroadcaster(),
 		execCancel: map[string]context.CancelCauseFunc{}, execCtx: map[string]context.Context{},
 		work: map[int64]*workExecution{}, steerBox: map[int64][]string{},
 		runtimes: map[string]*taskRuntime{}}
+	e.SetPlanCooldown(resolvePlanCooldown())
+	return e
 }
 
 // registerWork records the cancel for the work currently running intentID.
@@ -902,14 +969,60 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	heartbeat := time.NewTimer(interval)
 	defer heartbeat.Stop()
 	e.restorePlanRoundCounter(ctx, t)
+	var lastPlanAt time.Time
+
+	// waitCooldown 对常规 worker done 边沿唤醒做冷却合并：若距上次真实规划不足
+	// planCooldown、没有紧急唤醒（finding/目标或提示变更/人工取消/显式 Notify）、且
+	// frontier 仍有 open 意图可供 worker 消费，则把短时间内的多个 done 聚成一轮规划；
+	// 只要出现紧急唤醒或 frontier 抽干（open==0），立即跳出冷却避免空转或延迟响应。
+	waitCooldown := func() bool {
+		if e.PlanCooldown() <= 0 || lastPlanAt.IsZero() {
+			return true
+		}
+		for {
+			if ctx.Err() != nil {
+				return false
+			}
+			if e.IsPaused(t.ID) || e.IsDeleting(t.ID) || e.isSettling(t.ID) || taskSupplyFrozen(t) || t.hasUrgentWake() {
+				return true
+			}
+			if t.Store != nil {
+				open, err := t.Store.CountOpenIntents()
+				if err != nil || open == 0 {
+					return true
+				}
+			}
+			rem := e.PlanCooldown() - time.Since(lastPlanAt)
+			if rem <= 0 {
+				return true
+			}
+			cd := time.NewTimer(rem)
+			select {
+			case <-ctx.Done():
+				cd.Stop()
+				return false
+			case <-heartbeat.C:
+				cd.Stop()
+				return true
+			case <-t.notify:
+				cd.Stop()
+			case <-cd.C:
+				return true
+			}
+		}
+	}
 
 	// runRound 跑一轮规划(含 debounce 合并 + 各 guard)。src 仅用于日志区分触发来源。
-	runRound := func(src string) {
+	// 返回值表示本轮是否真正调用了 planner.Plan（用于推进冷却计时起点）。
+	runRound := func(src string) bool {
 		// debounce: coalesce a burst of changes into one planning round
 		timer := time.NewTimer(e.debounce)
 	drain:
 		for {
 			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return false
 			case <-t.notify:
 			case <-timer.C:
 				break drain
@@ -917,28 +1030,28 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		}
 		planner, _ := e.snapshotFor(t)
 		if planner == nil {
-			return // idle until LLM configured
+			return false // idle until LLM configured
 		}
 		if e.IsPaused(t.ID) {
-			return // user-paused: don't plan
+			return false // user-paused: don't plan
 		}
 		if e.IsDeleting(t.ID) {
-			return
+			return false
 		}
 		// terminal task (goals all met → done, or failed): the run is over. A
 		// resume/nudge — e.g. auto-resume of the active task on restart — must NOT
 		// re-plan (it would burn an LLM round and re-confirm a settled result).
 		if isTerminalStatus(t.lifecycleSnapshot().Status) {
-			return
+			return false
 		}
 		// 任务级超时收尾中:丢弃普通唤醒——worker 收尾写回、Resume 的 Notify 都不再
 		// 触发常规规划轮;终局那一轮由协调器(settleTask)直接驱动,不走这里。
 		if e.isSettling(t.ID) {
-			return
+			return false
 		}
 		// 供应故障冻结：不规划、不把中断写成任务完成，现场等待恢复或人工。
 		if taskSupplyFrozen(t) {
-			return
+			return false
 		}
 		// goalless（人工直投）分支：任务已无 open 目标时 planner 不跑——跑了会重判
 		// met→cancelExec 杀掉用户经主 agent 直投的意图。是否结束改由 frontier 决定：
@@ -956,10 +1069,10 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 						Summary: "目标已全部达成，直投意图已执行完毕，任务结束"})
 				}
 			}
-			return // goalless 分支永不进入 planner.Plan
+			return false // goalless 分支永不进入 planner.Plan
 		}
 		if !e.beginTaskOperation(t.ID) {
-			return
+			return false
 		}
 		defer e.decInflight(t.ID)
 		e.stampFirstRun(t) // 首次真正规划 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
@@ -967,7 +1080,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		emit := func(r db.Activity) { e.emitActivity(t, r) }
 		ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; 带任务 deadline
 		if ectx.Err() != nil || e.IsDeleting(t.ID) {
-			return
+			return false
 		}
 		// 过了取消/删除这道最终准入才算「真的跑了」：在它之前盖章，会给一次根本没执行
 		// 的尝试留下运行证据。
@@ -1016,6 +1129,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		e.recordPlanRound(ectx, t, db.PlanRound{TaskID: t.ID, Round: int64(round), StartedAt: started,
 			DurationMS: duration.Milliseconds(), TriggerSrc: src, TriggerCount: len(triggers),
 			LLMCalls: calls, Outcome: outcome})
+		return true
 	}
 
 	for {
@@ -1023,10 +1137,17 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		case <-ctx.Done():
 			return
 		case <-t.notify:
-			runRound("edge") // worker 结束 / finding / kill / resume / seed 首轮
+			if !waitCooldown() {
+				return
+			}
+			if runRound("edge") { // worker 结束 / finding / kill / resume / seed 首轮
+				lastPlanAt = time.Now()
+			}
 		case <-heartbeat.C:
 			// 周期兜底:死锁兜底 + 唤醒去监督飞行中的 worker(steer/kill) + 周期复查。
-			runRound("heartbeat")
+			if runRound("heartbeat") {
+				lastPlanAt = time.Now()
+			}
 		}
 		// 每次唤醒(边沿或心跳)后重臂心跳:任意规划触发都重算这段静置计时。
 		resetPlannerTimer(heartbeat, interval)
@@ -1209,6 +1330,11 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	defer func() {
 		if controlErr != nil {
 			outcome, outcomeReason = "persistence_failed", "intent_state_write"
+			if e.m != nil && e.m.pg != nil && t.Store != nil {
+				e.m.pg.Health().RecordWriteFailure(t.Store.ID(), "intent_state_write: "+controlErr.Error())
+			}
+		} else if wrote.Failures > 0 && e.m != nil && e.m.pg != nil && t.Store != nil {
+			e.m.pg.Health().RecordWriteFailure(t.Store.ID(), fmt.Sprintf("evidence_write: %d failures", wrote.Failures))
 		}
 		detail := struct {
 			TaskID   string                 `json:"task_id"`
@@ -1300,13 +1426,16 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		log.Printf("[worker %s] intent %d: %v", name, intent.ID, err)
 	}
 	// 供应故障（403/402/额度耗尽/轮询链耗尽）≠ 目标失败，也 ≠ 任务完成。
-	// 意图回场为 open，现场冻结，等待恢复或人工；不标 blocked/done，不唤醒规划者收场。
+	// 若故障转移链已切到健康备用 profile（failoverReady），仅将意图回场 open 交给
+	// 备用 profile 继续跑，不冻结整个任务；否则现场冻结等待恢复或人工。
 	settle := agent.SettleWorkerRun(reason, err)
 	if settle.SupplyFailure {
 		if controlErr = transitionIntentState(t.Store, intent.ID, "running", settle.IntentState); controlErr != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 供应故障回场失败: %v", name, t.ID, intent.ID, controlErr)
 		}
-		if settle.FreezeScene && applySupplyHoldAt(t, taskLLMErrorRevision(err)) {
+		if isTaskLLMFailoverReady(err) {
+			log.Printf("[worker %s] task %s 意图 #%d 供应故障后已切换至备用 profile，意图回场为 %s，不冻结现场；写回 %s", name, t.ID, intent.ID, settle.IntentState, wrote)
+		} else if settle.FreezeScene && applySupplyHoldAt(t, taskLLMErrorRevision(err)) {
 			e.emitActivity(t, db.Activity{Worker: "system", Kind: "text", IsError: true,
 				Summary: agent.SupplyFreezeSummary(), Detail: fmt.Sprintf("%s: %v", settle.Signal, err)})
 			log.Printf("[worker %s] task %s 意图 #%d 供应故障，现场冻结（%s），不记目标失败、不标 blocked/done；写回 %s", name, t.ID, intent.ID, settle.Signal, wrote)
@@ -1356,6 +1485,13 @@ func workerTerminationOutcome(reason harness.TerminalReason, runErr error, verdi
 		return "policy_blocked", string(reason)
 	case runErr == nil && reason == harness.ReasonCompleted:
 		return "executed", string(reason)
+	case agent.IsCallTimeout(runErr):
+		return "llm_timeout", "call_timeout"
+	case agent.IsSupplyFailure(runErr):
+		if class, ok := agent.ClassifySupplyFailure(runErr); ok {
+			return "supply_failure", class.Signal
+		}
+		return "supply_failure", "supply_failure"
 	default:
 		return "unknown", string(reason)
 	}

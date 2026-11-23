@@ -26,24 +26,57 @@ import (
 // 与已有的 per-attempt HTTP timeout 不冲突:那是单次 HTTP 尝试的保险,本层是单次
 // 逻辑调用(含 SDK 内部重试、流式全程)的更上层保险。
 //
-// 配置:env ARTEX_LLM_CALL_TIMEOUT,单位秒,默认 600,0 = 不限(不包这层)。
-const defaultCallTimeoutSeconds = 600
+// 配置:
+//   - ARTEX_LLM_CALL_TIMEOUT: 单次调用整体墙钟(秒),默认 600,0 = 不限。
+//   - ARTEX_LLM_HEADER_TIMEOUT: 等待上游返回 HTTP 响应头的上限(秒),默认 180,0 = 不限。
+//   - ARTEX_LLM_STREAM_IDLE_TIMEOUT: 流式响应连续无新字节的空闲上限(秒),默认 180,0 = 不限。
+const (
+	defaultCallTimeoutSeconds       = 600
+	defaultHeaderTimeoutSeconds     = 180
+	defaultStreamIdleTimeoutSeconds = 180
+)
+
+func timeoutSecondsFromEnv(envName string, defaultSec int) time.Duration {
+	s := strings.TrimSpace(os.Getenv(envName))
+	if s == "" {
+		return time.Duration(defaultSec) * time.Second
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		log.Printf("[llm-call] WARN %s=%q 非法(应为非负整数秒),按默认 %ds 处理", envName, s, defaultSec)
+		return time.Duration(defaultSec) * time.Second
+	}
+	return time.Duration(n) * time.Second
+}
 
 // callTimeoutFromEnv 解析 ARTEX_LLM_CALL_TIMEOUT(秒)。未设/非法 → 默认 600s;
 // 0 → 0(不限)。负值视为非法,回落默认。每次构建 provider 时读一次(非热路径),
 // 因此改 env 后新建/重建的 provider 即生效。
 func callTimeoutFromEnv() time.Duration {
-	s := strings.TrimSpace(os.Getenv("ARTEX_LLM_CALL_TIMEOUT"))
-	if s == "" {
-		return defaultCallTimeoutSeconds * time.Second
-	}
-	n, err := strconv.Atoi(s)
-	if err != nil || n < 0 {
-		log.Printf("[llm-call] WARN ARTEX_LLM_CALL_TIMEOUT=%q 非法(应为非负整数秒),按默认 %ds 处理", s, defaultCallTimeoutSeconds)
-		return defaultCallTimeoutSeconds * time.Second
-	}
-	return time.Duration(n) * time.Second
+	return timeoutSecondsFromEnv("ARTEX_LLM_CALL_TIMEOUT", defaultCallTimeoutSeconds)
 }
+
+func headerTimeoutFromEnv() time.Duration {
+	return timeoutSecondsFromEnv("ARTEX_LLM_HEADER_TIMEOUT", defaultHeaderTimeoutSeconds)
+}
+
+func streamIdleTimeoutFromEnv() time.Duration {
+	return timeoutSecondsFromEnv("ARTEX_LLM_STREAM_IDLE_TIMEOUT", defaultStreamIdleTimeoutSeconds)
+}
+
+// StreamIdleTimeoutError 表示流式响应在已建连后连续超过空闲上限未收到任何新字节
+// (半开连接/上游卡死)。与 CallTimeoutError 同属瞬时可恢复超时(Unwrap 为
+// context.DeadlineExceeded),交由上层重试或故障转移,不误判为目标失败或用户取消。
+type StreamIdleTimeoutError struct {
+	Idle time.Duration
+}
+
+func (e *StreamIdleTimeoutError) Error() string {
+	return fmt.Sprintf("llm stream_idle_timeout: 响应流连续 %s 无新数据，判定连接半开挂死，按瞬时超时处理", e.Idle)
+}
+
+// Unwrap 暴露 context.DeadlineExceeded,与 CallTimeoutError 保持一致。
+func (e *StreamIdleTimeoutError) Unwrap() error { return context.DeadlineExceeded }
 
 // CallTimeoutError 是整体墙钟到点后的归一化错误(call_timeout 类)。语义:本层判定
 // 该次调用挂死,属可重试的瞬时失败——llmpool 把它当传输级瞬时故障走故障转移(软熔断
@@ -85,12 +118,16 @@ func (e *CallTimeoutError) phaseText() string {
 // Unwrap 暴露 context.DeadlineExceeded:下游所有 errors.Is 截止判定继续成立。
 func (e *CallTimeoutError) Unwrap() error { return context.DeadlineExceeded }
 
-// IsCallTimeout reports whether err is (or wraps) a single-call wall-clock timeout.
-// User cancel is never normalized into *CallTimeoutError, so this stays false for
-// context.Canceled and for a caller-ctx deadline.
+// IsCallTimeout reports whether err is (or wraps) a single-call wall-clock or
+// stream-idle timeout. User cancel is never normalized into these errors, so
+// this stays false for context.Canceled and for a caller-ctx deadline.
 func IsCallTimeout(err error) bool {
-	var e *CallTimeoutError
-	return errors.As(err, &e)
+	var cto *CallTimeoutError
+	if errors.As(err, &cto) {
+		return true
+	}
+	var idle *StreamIdleTimeoutError
+	return errors.As(err, &idle)
 }
 
 // normalizeDeadline 是超时归类的纯函数,区分三种情况:

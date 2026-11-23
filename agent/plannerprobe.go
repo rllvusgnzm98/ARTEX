@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/Autumn-27/norma/harness"
@@ -31,15 +32,16 @@ const PlannerProbeLimit = 3
 // model (and tests) can tell it apart from a stop-loss or permission refusal.
 const PlannerProbeMessagePrefix = "【规划者探测边界】"
 
-// plannerProbeTools are the planner's target-facing execution tools. Local
-// read-only inspection (Read/LS/Glob/Grep) and artifact writing are untouched:
-// the boundaries are about probing the target, not about touching files.
+// plannerProbeTools are the planner's target-facing execution tools (shell,
+// HTTP fetch, and external MCP tools). Local read-only inspection
+// (Read/LS/Glob/Grep) and artifact writing are untouched: the boundaries are
+// about probing the target, not about touching files.
 func isPlannerProbeTool(name string) bool {
 	switch name {
 	case "Bash", "WebFetch":
 		return true
 	}
-	return false
+	return strings.HasPrefix(name, "mcp__")
 }
 
 // plannerProbeState is one task's opening-probe allowance. Each Plan() is a fresh

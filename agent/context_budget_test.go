@@ -176,3 +176,122 @@ func keyDetailRunes(seed WorkerEntrySeed) int {
 	}
 	return n
 }
+
+func TestRenderWorkerGraphOverviewDropsPlannerFieldsAndCapsLists(t *testing.T) {
+	longText := strings.Repeat("超长内容", 120) // 480 runes
+	running := make([]map[string]any, 10)
+	for i := range running {
+		running[i] = map[string]any{"id": int64(i + 1), "summary": longText, "asset_ids": []int64{1, 2, 3}, "parents": []int64{9}}
+	}
+	recent := make([]map[string]any, 18)
+	for i := range recent {
+		recent[i] = map[string]any{"id": int64(100 + i), "summary": longText, "state": "confirmed"}
+	}
+	cold := make([]map[string]any, 8)
+	for i := range cold {
+		cold[i] = map[string]any{"id": int64(500 + i), "member_count": 5, "body": longText}
+	}
+	hints := make([]map[string]any, 12)
+	for i := range hints {
+		hints[i] = map[string]any{"id": int64(700 + i), "state": "open", "text": longText}
+	}
+	data := map[string]any{
+		"coverage":            map[string]any{"pct": 25},
+		"open_intents":        []map[string]any{{"id": int64(1), "summary": "open"}},
+		"recent_done_intents": []map[string]any{{"id": int64(2), "summary": "done"}},
+		"crown_jewels":        []map[string]any{{"asset_id": int64(3)}},
+		"goals":               []map[string]any{{"id": int64(4), "text": "goal"}},
+		"cold_digests_more":   []int64{999},
+		"running_intents":     running,
+		"recent_facts":        recent,
+		"cold_digests":        cold,
+		"hints":               hints,
+		"related_tasks": []map[string]any{{
+			"source_task_id":        int64(42),
+			"inherited":             true,
+			"facts":                 10,
+			"recent_intent_results": []map[string]any{{"id": int64(1)}},
+			"asset_scope":           []string{"10.0.0.1"},
+			"cold_digests":          []map[string]any{{"id": int64(8), "body": longText}},
+			"recent_facts":          recent,
+		}},
+	}
+	body := newWorkerOverviewBody(data, map[int64]bool{100: true, 101: true})
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Fatalf("worker overview JSON invalid: %v\n%s", err, body)
+	}
+	for _, dropped := range []string{"coverage", "open_intents", "recent_done_intents", "crown_jewels", "goals", "cold_digests_more"} {
+		if _, ok := parsed[dropped]; ok {
+			t.Fatalf("planner-only field %q must be stripped from worker overview", dropped)
+		}
+	}
+	if got := len(parsed["running_intents"].([]any)); got != workerOverviewRunningCap {
+		t.Fatalf("running_intents len=%d want %d", got, workerOverviewRunningCap)
+	}
+	if got := len(parsed["recent_facts"].([]any)); got != workerOverviewRecentFactsCap {
+		t.Fatalf("recent_facts len=%d want %d", got, workerOverviewRecentFactsCap)
+	}
+	if got := len(parsed["cold_digests"].([]any)); got != workerOverviewColdDigestsCap {
+		t.Fatalf("cold_digests len=%d want %d", got, workerOverviewColdDigestsCap)
+	}
+	if got := len(parsed["hints"].([]any)); got != workerOverviewHintsCap {
+		t.Fatalf("hints len=%d want %d", got, workerOverviewHintsCap)
+	}
+	rt := parsed["related_tasks"].([]any)[0].(map[string]any)
+	for _, dropped := range []string{"recent_intent_results", "asset_scope", "cold_digests"} {
+		if _, ok := rt[dropped]; ok {
+			t.Fatalf("related_tasks[%q] should be stripped from worker overview", dropped)
+		}
+	}
+	if got := len(rt["recent_facts"].([]any)); got != workerOverviewRelatedListCap {
+		t.Fatalf("related_tasks recent_facts len=%d want %d", got, workerOverviewRelatedListCap)
+	}
+}
+
+func TestEntrySeedDirectParentDetailRelevantKeysAndEmptyGraph(t *testing.T) {
+	// 1. Direct parent general fact retains up to 600-rune detail; non-parent general fact omits detail.
+	parentDetail := strings.Repeat("上游凭据与参数细节", 50) // 450 runes (<600)
+	siblingDetail := strings.Repeat("无关旁枝细节", 50)
+	seed := WorkerEntrySeed{
+		Prefetched: true,
+		ConfirmedFacts: []EntryFact{
+			{ID: 10, Summary: "parent general", Detail: parentDetail, DirectParent: true, Relevant: true},
+			{ID: 11, Summary: "sibling general", Detail: siblingDetail, DirectParent: false, Relevant: true},
+		},
+	}
+	out := RenderWorkerEntrySeed(seed)
+	if !strings.Contains(out, parentDetail) {
+		t.Fatalf("direct parent general fact must inline its detail:\n%s", out)
+	}
+	if strings.Contains(out, siblingDetail) {
+		t.Fatalf("non-parent general fact must not inline its detail:\n%s", out)
+	}
+
+	// 2. Intent-relevant key facts beat 45 older unrelated-host negative_result key facts.
+	var many []EntryFact
+	for i := 1; i <= 45; i++ {
+		many = append(many, EntryFact{ID: int64(i), Summary: fmt.Sprintf("other-host-neg-%d", i), Category: "negative_result", Relevant: false})
+	}
+	many = append(many, EntryFact{ID: 999, Summary: "target-host-key", Category: "negative_result", Relevant: true})
+	keys, _, omittedKeys, _ := selectedEntrySeedFacts(WorkerEntrySeed{Prefetched: true, ConfirmedFacts: many})
+	if len(keys) != entrySeedKeyFactCap || omittedKeys != 6 {
+		t.Fatalf("len(keys)=%d omittedKeys=%d", len(keys), omittedKeys)
+	}
+	foundTarget := false
+	for _, k := range keys {
+		if k.ID == 999 {
+			foundTarget = true
+		}
+	}
+	if !foundTarget {
+		t.Fatal("intent-relevant key fact #999 must not be evicted by older unrelated-host negative results")
+	}
+
+	// 3. EmptyGraph opening avoids mandatory turn-1 list_facts round-trip.
+	empty := RenderWorkerEntrySeed(WorkerEntrySeed{Prefetched: true, EmptyGraph: true})
+	if !strings.Contains(empty, "任务开局") || !strings.Contains(empty, "无需额外调 list_facts") {
+		t.Fatalf("EmptyGraph seed should clarify opening state:\n%s", empty)
+	}
+}
+

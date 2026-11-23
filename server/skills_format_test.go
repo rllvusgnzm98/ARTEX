@@ -152,7 +152,8 @@ func repoRoot(t *testing.T) string {
 	t.Helper()
 	for _, c := range []string{".", ".."} {
 		st, err := os.Stat(filepath.Join(c, "skills"))
-		if err == nil && st.IsDir() {
+		_, modErr := os.Stat(filepath.Join(c, "go.mod"))
+		if err == nil && st.IsDir() && modErr == nil {
 			abs, err := filepath.Abs(c)
 			if err != nil {
 				t.Fatal(err)

@@ -37,6 +37,8 @@ func releaseTaskSupply(taskID string) {
 }
 
 func releaseAllTaskSupply() {
+	supplyMu.Lock()
+	defer supplyMu.Unlock()
 	supplyHolds.Range(func(key, _ any) bool {
 		supplyHolds.Delete(key)
 		return true

@@ -75,6 +75,7 @@ type Task struct {
 	// a burst into one round, so several may pile up before drainTriggers() clears them.
 	trigMu          sync.Mutex
 	pendingTriggers []agent.TriggerEvent
+	urgentNotify    bool
 }
 
 // taskLifecycleState is an internally consistent view of the mutable task
@@ -1815,7 +1816,11 @@ func rollbackTaskDelete(cause error, trafficStage *traffic.HostDeleteStage, file
 }
 
 func (m *Manager) forgetTask(id string, numericID int64) {
+	var expID int64
 	m.mu.Lock()
+	if removed := m.tasks[id]; removed != nil {
+		expID = removed.ExpID
+	}
 	delete(m.tasks, id)
 	for _, task := range m.tasks {
 		task.updateLifecycle(func(state *taskLifecycleState) {
@@ -1836,6 +1841,9 @@ func (m *Manager) forgetTask(id string, numericID int64) {
 		}
 	}
 	m.mu.Unlock()
+	if m.pg != nil && expID > 0 {
+		m.pg.Health().Forget(expID)
+	}
 }
 
 type stagedTaskPath struct {
@@ -2021,26 +2029,52 @@ func (m *Manager) List() []*Task {
 	return out
 }
 
-// Notify signals that the asset/exploration graph changed (debounced consumer
-// wakes the planner). Non-blocking.
-func (t *Task) Notify() {
+// signalNotify wakes the planner channel without altering trigger urgency.
+func (t *Task) signalNotify() {
 	select {
 	case t.notify <- struct{}{}:
 	default:
 	}
 }
 
+// Notify signals that the asset/exploration graph changed (debounced consumer
+// wakes the planner). Bare Notify calls (resume, asset import, manual nudge,
+// kill) are treated as urgent wakes that bypass planner cooldown. Non-blocking.
+func (t *Task) Notify() {
+	t.trigMu.Lock()
+	t.urgentNotify = true
+	t.trigMu.Unlock()
+	t.signalNotify()
+}
+
 // NotifyDone is Notify plus a hint: a worker just finished intentID and that is
 // what triggered this wake-up. The planner reads the accumulated triggers next
 // round so it can spell out which intent finished (+ its output). Events pile up
-// (debounce) until the round drains them via drainTriggers.
+// (debounce/cooldown) until the round drains them via drainTriggers.
 func (t *Task) NotifyDone(intentID int64) {
 	if intentID > 0 {
 		t.trigMu.Lock()
 		t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "done", IntentID: intentID})
 		t.trigMu.Unlock()
 	}
-	t.Notify()
+	t.signalNotify()
+}
+
+// hasUrgentWake reports whether an urgent wake (bare Notify, finding, goal/hint
+// edit, or user intent cancellation) is pending so planner cooldown should not
+// delay this round.
+func (t *Task) hasUrgentWake() bool {
+	t.trigMu.Lock()
+	defer t.trigMu.Unlock()
+	if t.urgentNotify {
+		return true
+	}
+	for _, ev := range t.pendingTriggers {
+		if ev.Kind != "done" {
+			return true
+		}
+	}
+	return false
 }
 
 // NotifyFinding records that a worker reported a finding on intentID (summary),
@@ -2131,5 +2165,6 @@ func (t *Task) drainTriggers() []agent.TriggerEvent {
 	defer t.trigMu.Unlock()
 	ev := t.pendingTriggers
 	t.pendingTriggers = nil
+	t.urgentNotify = false
 	return ev
 }

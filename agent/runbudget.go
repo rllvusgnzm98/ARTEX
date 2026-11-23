@@ -68,6 +68,7 @@ func (p *runBudgetProvider) postStopLossLimitReached() bool {
 
 func (p *runBudgetProvider) callContext(ctx context.Context) (context.Context, context.CancelFunc, time.Time) {
 	if p.loss != nil {
+		p.loss.BeginModelTurn()
 		ctx = WithModelRetryStop(ctx, p.loss)
 	}
 	if p.calls != nil {

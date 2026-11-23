@@ -42,6 +42,103 @@ func wrapConcurrentBash(t actool.CoreTool) actool.CoreTool {
 }
 
 func bashCommandReadOnly(command string) bool {
+	return bashCommandInAllowlist(command, true)
+}
+
+// isLocalReadOnlyBash reports whether command is a provably read-only local
+// inspection command (or simple `|` / `&&` pipeline of such commands, e.g.
+// `cat /tmp/out.txt | head -n 50` or `ls -la && grep foo bar`), excluding
+// network-facing recon commands (dig/host/nslookup/whois/getent/netstat).
+// Used by stop-loss so local output parsing does not burn the worker's
+// target-probe idle budget.
+func isLocalReadOnlyBash(command string) bool {
+	segs, ok := splitLocalReadOnlyPipeline(command)
+	if !ok || len(segs) == 0 {
+		return false
+	}
+	for _, seg := range segs {
+		if !bashCommandInAllowlist(seg, false) {
+			return false
+		}
+	}
+	return true
+}
+
+func splitLocalReadOnlyPipeline(command string) ([]string, bool) {
+	if strings.TrimSpace(command) == "" {
+		return nil, false
+	}
+	var segs []string
+	var cur strings.Builder
+	var quote byte
+	flush := func() bool {
+		s := strings.TrimSpace(cur.String())
+		cur.Reset()
+		if s == "" {
+			return false
+		}
+		segs = append(segs, s)
+		return true
+	}
+	for i := 0; i < len(command); i++ {
+		c := command[i]
+		if c == 0 {
+			return nil, false
+		}
+		if quote == '\'' {
+			cur.WriteByte(c)
+			if c == '\'' {
+				quote = 0
+			}
+			continue
+		}
+		if c == '\\' {
+			if i+1 == len(command) || command[i+1] == '\n' {
+				return nil, false
+			}
+			cur.WriteByte(c)
+			i++
+			cur.WriteByte(command[i])
+			continue
+		}
+		if quote == '"' {
+			cur.WriteByte(c)
+			if c == '"' {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			quote = c
+			cur.WriteByte(c)
+		case '|':
+			if i+1 < len(command) && (command[i+1] == '|' || command[i+1] == '&') {
+				return nil, false
+			}
+			if !flush() {
+				return nil, false
+			}
+		case '&':
+			if i+1 < len(command) && command[i+1] == '&' {
+				if !flush() {
+					return nil, false
+				}
+				i++
+				continue
+			}
+			return nil, false
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	if quote != 0 || !flush() {
+		return nil, false
+	}
+	return segs, true
+}
+
+func bashCommandInAllowlist(command string, allowNetworkRecon bool) bool {
 	words, ok := bashInspectionWords(command)
 	if !ok || len(words) == 0 || strings.ContainsAny(words[0].text, "/=") {
 		return false
@@ -54,8 +151,11 @@ func bashCommandReadOnly(command string) bool {
 		"readlink", "pwd", "echo", "printf", "whoami", "id", "uname", "arch", "uptime",
 		"printenv", "which", "type", "md5sum", "sha1sum", "sha256sum", "sha512sum",
 		"cksum", "b2sum", "od", "hexdump", "strings", "du", "df", "free", "lsblk",
-		"lscpu", "ps", "netstat", "dig", "host", "nslookup", "whois", "getent",
-		"seq", "true", "false", "locale", "tty":
+		"lscpu", "ps", "seq", "true", "false", "locale", "tty":
+	case "netstat", "dig", "host", "nslookup", "whois", "getent":
+		if !allowNetworkRecon {
+			return false
+		}
 	default:
 		return false
 	}

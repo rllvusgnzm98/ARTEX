@@ -802,7 +802,11 @@ func (s *Server) runTriggeredRun(item triggeredRun) {
 		}
 	}()
 	pg := s.m.pg
-	c, err := pg.CreateConversation(item.agentKey, firstLine(item.title, 60), nil)
+	var taskProfileID *int64
+	if item.taskID > 0 {
+		taskProfileID = s.taskActiveLLMProfileID(strconv.FormatInt(item.taskID, 10))
+	}
+	c, err := pg.CreateConversation(item.agentKey, firstLine(item.title, 60), taskProfileID)
 	if err != nil {
 		log.Printf("[trigger] create conversation for %s failed: %v", item.agentKey, err)
 		return

@@ -37,9 +37,10 @@ func buildIdentity() (commit string, dirty, ok bool) {
 // runtimeProvenance 组装「这一轮到底是什么在跑」的证据：真实二进制版本、Go 运行时与
 // 平台、生效的止损阈值，以及脱敏后的有效配置。
 //
-// 止损阈值是硬编码的（见 engine 里的 DefaultStopLossPolicy），配置文件里没有开关，
-// 所以只看 config.json 无法判断某一轮用的是哪套阈值——必须把当时生效的值一并记下，
-// 否则跑分对比没法区分「上下文优化生效」和「换了止损阈值」。
+// 止损阈值与重规划冷却默认内建并支持环境变量覆盖（见 agent.DefaultStopLossPolicy /
+// resolvePlanCooldown），配置文件里没有开关，所以只看 config.json 无法判断某一轮
+// 用的是哪套阈值——必须把当时生效的值一并记下，否则跑分对比没法区分「上下文优化生效」
+// 和「换了止损/冷却参数」。
 func (e *Engine) runtimeProvenance() map[string]any {
 	sl := agent.DefaultStopLossPolicy()
 	cfg := config.EffectiveSummary()
@@ -47,6 +48,10 @@ func (e *Engine) runtimeProvenance() map[string]any {
 	// config 侧只看得到启动默认值，生效值只有 Manager 知道——溯源必须记后者。
 	if e != nil && e.m != nil {
 		cfg["host_pace_rps"] = e.m.HostPace()
+	}
+	var cooldownSec int64
+	if e != nil {
+		cooldownSec = int64(e.PlanCooldown().Seconds())
 	}
 	out := map[string]any{
 		"build_version": BuildVersion,
@@ -58,7 +63,8 @@ func (e *Engine) runtimeProvenance() map[string]any {
 			"idle_probe_limit":       sl.IdleProbeLimit,
 			"repeat_command_limit":   sl.RepeatCommandLimit,
 		},
-		"config": cfg,
+		"planner_cooldown_seconds": cooldownSec,
+		"config":                   cfg,
 	}
 	// 提交身份与版本标签分开记：没有 VCS 证据时如实留空（go run 就是这种），不要让
 	// 一个 "dev" 冒充「记录过」。

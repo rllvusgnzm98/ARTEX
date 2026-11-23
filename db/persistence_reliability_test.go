@@ -304,6 +304,48 @@ func TestLegacyRanTaskStaysUnknownAfterUpgrade(t *testing.T) {
 	}
 }
 
+func TestLegacyCreatedNoTimeoutTaskWithActivityBackfilled(t *testing.T) {
+	d := reliabilityTestDB(t)
+	ranWithActivity := newReliabilityTask(t, d, "旧无超时运行中-activity-"+t.Name())
+	ranWithNode := newReliabilityTask(t, d, "旧无超时运行中-node-"+t.Name())
+	trulyFresh := newReliabilityTask(t, d, "真正未运行-"+t.Name())
+
+	for _, id := range []int64{ranWithActivity.ID, ranWithNode.ID, trulyFresh.ID} {
+		if _, err := d.Exec(`UPDATE tasks SET status='created', first_run_at=NULL, build_version='' WHERE id=$1`, id); err != nil {
+			t.Fatalf("重置任务 %d 失败: %v", id, err)
+		}
+	}
+	if _, err := d.Exploration(ranWithActivity.ExplorationID).AppendActivity(Activity{Worker: "planner", Kind: "round", Summary: "第 1 轮规划"}); err != nil {
+		t.Fatalf("写 activity 失败: %v", err)
+	}
+	if _, err := d.Exploration(ranWithNode.ExplorationID).AddIntent(map[string]any{"summary": "old intent"}, 0, nil, "planner"); err != nil {
+		t.Fatalf("写 intent 失败: %v", err)
+	}
+
+	// Re-apply full embedded schema.sql (idempotent) to verify the real backfill SQL.
+	if _, err := d.Exec(schemaSQL); err != nil {
+		t.Fatalf("重跑 schema.sql 失败: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		id   int64
+		want string
+	}{
+		{"activity task", ranWithActivity.ID, LegacyUnknownBuild},
+		{"intent node task", ranWithNode.ID, LegacyUnknownBuild},
+		{"truly fresh task", trulyFresh.ID, ""},
+	} {
+		prov, err := d.TaskProvenance(tc.id)
+		if err != nil {
+			t.Fatalf("%s 读溯源失败: %v", tc.name, err)
+		}
+		if prov.BuildVersion != tc.want {
+			t.Errorf("%s build_version=%q, want %q", tc.name, prov.BuildVersion, tc.want)
+		}
+	}
+}
+
 // TestAnchorWriteErrMapsFKViolation 不连库：去掉校验时的 FOR SHARE 后，校验与写入之间
 // 的并发清理由外键兜底，这里确认它被按**约束名**翻译成对应的一致性错误并登记健康表。
 // exploration_anchors 两列都有外键，只看 SQLSTATE 会把「owner 节点没了」误报成

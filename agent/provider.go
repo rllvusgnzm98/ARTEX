@@ -20,6 +20,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Autumn-27/artex/llmrec"
@@ -362,11 +363,82 @@ type quotaAwareTransport struct {
 	// carries; its value is the session id read from the request context. Empty
 	// disables it. See Config.SessionHeaderKey.
 	sessionHeaderKey string
+	// rawProxy is kept only to scrub credentials from transport errors at the
+	// source before they ever propagate to logs, DB, or SSE error messages.
+	rawProxy string
+	// streamIdleTimeout bounds how long an active response body Read may stay
+	// silent before being aborted as *StreamIdleTimeoutError (0 = disabled).
+	streamIdleTimeout time.Duration
 }
 
 // quotaProbeMaxBytes bounds how much of a 429 body is buffered for quota
 // classification.
 const quotaProbeMaxBytes = 64 << 10
+
+type redactedTransportError struct {
+	msg string
+	err error
+}
+
+func (e *redactedTransportError) Error() string { return e.msg }
+func (e *redactedTransportError) Unwrap() error { return e.err }
+
+// redactTransportErr scrubs credentials, paths, and query tokens from transport
+// errors (including nested *url.Error and schemeless proxy values) at the source
+// while preserving errors.Is/errors.As unwrapping semantics.
+func redactTransportErr(err error, rawProxy string) error {
+	if err == nil {
+		return nil
+	}
+	if ue, ok := err.(*url.Error); ok && ue != nil {
+		cleaned := &url.Error{
+			Op:  ue.Op,
+			URL: config.RedactURL(ue.URL),
+			Err: redactTransportErr(ue.Err, rawProxy),
+		}
+		orig := cleaned.Error()
+		msg := config.ScrubURLValue(config.RedactURLsInText(orig), rawProxy)
+		if msg == orig {
+			return cleaned
+		}
+		return &redactedTransportError{msg: msg, err: cleaned}
+	}
+	orig := err.Error()
+	msg := config.ScrubURLValue(config.RedactURLsInText(orig), rawProxy)
+	if msg == orig {
+		return err
+	}
+	return &redactedTransportError{msg: msg, err: err}
+}
+
+type idleTimeoutReadCloser struct {
+	rc       io.ReadCloser
+	idle     time.Duration
+	timedOut atomic.Bool
+}
+
+func (r *idleTimeoutReadCloser) Read(p []byte) (int, error) {
+	if r.idle <= 0 {
+		return r.rc.Read(p)
+	}
+	if r.timedOut.Load() {
+		return 0, &StreamIdleTimeoutError{Idle: r.idle}
+	}
+	timer := time.AfterFunc(r.idle, func() {
+		r.timedOut.Store(true)
+		_ = r.rc.Close()
+	})
+	n, err := r.rc.Read(p)
+	timer.Stop()
+	if r.timedOut.Load() {
+		return 0, &StreamIdleTimeoutError{Idle: r.idle}
+	}
+	return n, err
+}
+
+func (r *idleTimeoutReadCloser) Close() error {
+	return r.rc.Close()
+}
 
 func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Custom session-id header: name is user-configured, value is THIS run's
@@ -387,7 +459,10 @@ func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error
 
 	resp, err := t.base.RoundTrip(req)
 	if err != nil || resp == nil {
-		return resp, err
+		return resp, redactTransportErr(err, t.rawProxy)
+	}
+	if t.streamIdleTimeout > 0 && resp.Body != nil {
+		resp.Body = &idleTimeoutReadCloser{rc: resp.Body, idle: t.streamIdleTimeout}
 	}
 	// Tee rather than read: a 200 is an SSE stream that must keep streaming. The
 	// 429 branch below reads through this wrapper, so its body lands in the
@@ -441,6 +516,9 @@ func requestBodySnapshot(req *http.Request) string {
 
 func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if headerTimeout := headerTimeoutFromEnv(); headerTimeout > 0 {
+		transport.ResponseHeaderTimeout = headerTimeout
+	}
 	proxy = strings.TrimSpace(proxy)
 	if proxy == "" {
 		transport.Proxy = nil // 留空=直连,不回退 HTTP_PROXY/HTTPS_PROXY 环境变量
@@ -458,7 +536,12 @@ func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) 
 		}
 		transport.Proxy = http.ProxyURL(proxyURL)
 	}
-	return &http.Client{Transport: quotaAwareTransport{base: transport, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey)}}, nil
+	return &http.Client{Transport: quotaAwareTransport{
+		base:              transport,
+		sessionHeaderKey:  strings.TrimSpace(sessionHeaderKey),
+		rawProxy:          proxy,
+		streamIdleTimeout: streamIdleTimeoutFromEnv(),
+	}}, nil
 }
 
 // logTestConnection prints the raw HTTP status code(s) and response body of a

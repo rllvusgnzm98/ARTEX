@@ -91,12 +91,14 @@ func collectText(ctx context.Context, prov llm.Provider, system, user string, ma
 	return sb.String(), nil
 }
 
-// retroProvider resolves the LLM provider for a task's retro (task-pinned profile,
-// else global active), nil when none is configured.
+// retroProvider resolves the LLM provider for a task's retro (task's active/pinned
+// profile, else global active), nil when none is configured.
 func (s *Server) retroProvider(t *Task) llm.Provider {
-	if t != nil && t.LLMProfileID != nil {
-		if p, _, ok := s.providerForProfile(*t.LLMProfileID); ok {
-			return p
+	if t != nil {
+		if id := s.taskActiveLLMProfileID(t.ID); id != nil {
+			if p, _, ok := s.providerForProfile(*id); ok {
+				return p
+			}
 		}
 	}
 	return s.defaultProvider()

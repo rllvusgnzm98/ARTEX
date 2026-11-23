@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +18,11 @@ import (
 // not the primary "stop when the clock hits 20m" policy. Earlier stop-loss is
 // decided by progress signals (no new facts/assets, repeated commands).
 const DefaultSafetyCeiling = 20 * time.Minute
+
+const (
+	defaultIdleProbeLimit     = 8
+	defaultRepeatCommandLimit = 3
+)
 
 // StopLossMessagePrefix marks a harness-enforced stop-loss in the Stop hook
 // message. Engine settlement uses it only as a human-readable label; the
@@ -39,22 +46,35 @@ type StopLossPolicy struct {
 	// DefaultSafetyCeiling. A negative value disables the cap in Evaluate
 	// (the live run still has MaxDuration from run_seconds).
 	SafetyCeiling time.Duration
-	// IdleProbeLimit is how many probe (non-read, non-write-back) tool calls
-	// may run after the last graph write before a no-new-facts/no-new-assets
-	// stop fires. Zero uses the default (6).
+	// IdleProbeLimit is how many target-facing probe tool calls may run after
+	// the last graph write before a no-new-facts/no-new-assets stop fires.
+	// Zero uses the default (8, overridable via ARTEX_STOPLOSS_IDLE_PROBES).
 	IdleProbeLimit int
 	// RepeatCommandLimit is how many times the same command fingerprint may
-	// appear before a repeated-command stop fires. Zero uses the default (2),
-	// so the second identical probe is a repeat.
+	// appear within the current idle window before a repeated-command stop fires.
+	// Zero uses the default (3, overridable via ARTEX_STOPLOSS_REPEAT_LIMIT).
 	RepeatCommandLimit int
 }
 
-// DefaultStopLossPolicy returns the product defaults.
+func envPositiveInt(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+		return n
+	}
+	return fallback
+}
+
+// DefaultStopLossPolicy returns the product defaults, honoring optional
+// ARTEX_STOPLOSS_IDLE_PROBES and ARTEX_STOPLOSS_REPEAT_LIMIT env overrides so
+// operators can calibrate thresholds and capture effective values in provenance.
 func DefaultStopLossPolicy() StopLossPolicy {
 	return StopLossPolicy{
 		SafetyCeiling:      DefaultSafetyCeiling,
-		IdleProbeLimit:     6,
-		RepeatCommandLimit: 2,
+		IdleProbeLimit:     envPositiveInt("ARTEX_STOPLOSS_IDLE_PROBES", defaultIdleProbeLimit),
+		RepeatCommandLimit: envPositiveInt("ARTEX_STOPLOSS_REPEAT_LIMIT", defaultRepeatCommandLimit),
 	}
 }
 
@@ -72,14 +92,14 @@ func (p StopLossPolicy) idleLimit() int {
 	if p.IdleProbeLimit > 0 {
 		return p.IdleProbeLimit
 	}
-	return 6
+	return defaultIdleProbeLimit
 }
 
 func (p StopLossPolicy) repeatLimit() int {
 	if p.RepeatCommandLimit > 0 {
 		return p.RepeatCommandLimit
 	}
-	return 2
+	return defaultRepeatCommandLimit
 }
 
 // ProgressSignals is the observed run progress used by Evaluate.
@@ -197,9 +217,12 @@ type StopLossMonitor struct {
 	newAssets      int
 	newFinds       int
 	idle           int
+	inFlightProbes int
 	repeats        map[string]int
 	maxRepeat      int
 	preWriteNudged bool
+	turnSeq        int64
+	nudgedTurn     int64
 }
 
 // NewStopLossMonitor starts observing from now.
@@ -212,6 +235,29 @@ func NewStopLossMonitor(p StopLossPolicy) *StopLossMonitor {
 		cmdsOK:   true,
 		repeats:  map[string]int{},
 	}
+}
+
+// BeginModelTurn marks the start of a new LLM completion turn so same-turn
+// multi-tool write-back reminders can hold back remaining probes in that turn
+// while still letting the next turn proceed normally if the worker chooses not
+// to write back. Also resets inFlightProbes as a safety net for interrupted tools.
+func (m *StopLossMonitor) BeginModelTurn() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.turnSeq++
+	m.inFlightProbes = 0
+	m.mu.Unlock()
+}
+
+func (m *StopLossMonitor) noteProbeStarted() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.inFlightProbes++
+	m.mu.Unlock()
 }
 
 // SetWriteSnapshot optionally supplies ToolSet.Writes as a ground-truth
@@ -247,6 +293,9 @@ func (m *StopLossMonitor) ObserveTool(name string, input []byte, isErr bool) {
 		// Missing tool identity: do not increment idle or treat as a repeat.
 		return
 	}
+	if isCountableIdleProbe(name, input) && m.inFlightProbes > 0 {
+		m.inFlightProbes--
+	}
 	// A snapshot increase is a successful write even if the tool name is
 	// not one we classify as write-back. Catch it before counting this
 	// event so the new idle window starts cleanly.
@@ -263,10 +312,32 @@ func (m *StopLossMonitor) ObserveTool(name string, input []byte, isErr bool) {
 			// Missing command body: do not invent an idle or repeat signal.
 			return
 		}
-		m.idle++
+		if isCountableIdleProbe(name, input) {
+			m.idle++
+		}
 		m.repeats[fp]++
 		if m.repeats[fp] > m.maxRepeat {
 			m.maxRepeat = m.repeats[fp]
+		}
+		// A genuinely new local file edit (Write/Edit/MultiEdit) mutates scripts or
+		// payloads in the workspace, so re-running e.g. `python3 exploit.py` via Bash
+		// is not repeating an unchanged probe. Clear prior Bash repeat counts while
+		// preserving identical Write/Edit loop detection.
+		if isLocalEditTool(name) && !isErr && m.repeats[fp] == 1 {
+			m.clearBashRepeatsLocked()
+		}
+	}
+}
+
+func (m *StopLossMonitor) clearBashRepeatsLocked() {
+	m.maxRepeat = 0
+	for k, c := range m.repeats {
+		if strings.HasPrefix(k, "Bash\x00") {
+			delete(m.repeats, k)
+			continue
+		}
+		if c > m.maxRepeat {
+			m.maxRepeat = c
 		}
 	}
 }
@@ -278,6 +349,9 @@ func (m *StopLossMonitor) resetIdleWindowLocked() {
 	m.newAssets = 0
 	m.newFinds = 0
 	m.preWriteNudged = false
+	m.nudgedTurn = 0
+	m.repeats = map[string]int{}
+	m.maxRepeat = 0
 	if m.writes == nil {
 		return
 	}
@@ -412,7 +486,7 @@ func (m *StopLossMonitor) MarkSignalsUnknown(facts, assets, commands bool) {
 
 // StopLossWriteBackReminderPrefix marks the pre-latch write-back reminder in a
 // PreToolUse block message. It is NOT a stop-loss: the run continues, the idle
-// counter and the verdict are untouched, and the 6/2 thresholds are unchanged.
+// counter and the verdict are untouched, and the policy thresholds are unchanged.
 // The reminder only gives the worker a chance to persist what it already
 // observed before the idle window runs out, so a run that made real progress
 // records it instead of losing it to the latch.
@@ -423,16 +497,22 @@ const writeBackReminderBody = "你已连续多次探测但还没有把结果写�
 	"只写你本次【真实观察到】的，不要为了凑进展编造或把已有事实换措辞重记。" +
 	"若确实没有新发现，无需写回，直接继续你的下一步探测即可（连续无进展仍会按原策略止损，这不是目标失败）。"
 
+const sameTurnWriteBackHoldBody = "本回合已发出写回提醒，同回合剩余探测已暂停执行，避免在你看到提醒前直接触发止损。请先处理上面的写回提醒（如有已观察到的新资产/事实/漏洞请先写回），再继续下一步探测。"
+
+const stopLossPostBlockWriteHint = "（仍可在本轮收尾内调用 record_fact / insert_assets / report_finding 把已真实观察到的事实、资产或漏洞写回图谱，之后结束返回。）"
+
 // RemindWriteBack decides whether to interrupt a probe once, before the
 // no_progress latch, so the worker can persist observations it has already
-// made. It fires at most once per idle window, only for a probe tool, only
-// while the run is not latched, and only when the idle window is one probe away
-// from the no_progress limit with no new write in that window. It never changes
-// the idle counter, the verdict, or the policy thresholds: if the worker writes
-// nothing, the next probe still drives the window to the limit and no_progress
-// fires exactly as before. Returns the reminder message and true when the
-// caller should block this one tool call and hand the message to the model.
+// made. It fires at most once per idle window (holding back additional probes
+// emitted in the SAME model turn so they cannot latch before the model sees the
+// reminder), only for a target-facing probe tool, only while the run is not
+// latched, and only when the idle window (including concurrent in-flight probes)
+// is one probe away from the no_progress limit with no new write in that window.
 func (m *StopLossMonitor) RemindWriteBack(name string) (string, bool) {
+	return m.remindWriteBackFor(name, nil)
+}
+
+func (m *StopLossMonitor) remindWriteBackFor(name string, input []byte) (string, bool) {
 	if m == nil {
 		return "", false
 	}
@@ -441,10 +521,13 @@ func (m *StopLossMonitor) RemindWriteBack(name string) (string, bool) {
 	if m.verdict.Fired() {
 		return "", false
 	}
-	if !isProbeTool(name) {
+	if !isCountableIdleProbe(name, input) {
 		return "", false
 	}
 	if m.preWriteNudged {
+		if m.turnSeq > 0 && m.nudgedTurn == m.turnSeq {
+			return StopLossWriteBackReminderPrefix + sameTurnWriteBackHoldBody, true
+		}
 		return "", false
 	}
 	sig := m.signalsLocked()
@@ -460,10 +543,11 @@ func (m *StopLossMonitor) RemindWriteBack(name string) (string, bool) {
 	if threshold < 1 {
 		threshold = 1
 	}
-	if sig.IdleProbes < threshold {
+	if sig.IdleProbes+m.inFlightProbes < threshold {
 		return "", false
 	}
 	m.preWriteNudged = true
+	m.nudgedTurn = m.turnSeq
 	return StopLossWriteBackReminderPrefix + writeBackReminderBody, true
 }
 
@@ -509,18 +593,29 @@ func AttachStopLossWrites(hooks harness.HookRunner, fn func() (WriteCounts, bool
 
 func (h stopLossHooks) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
 	if verdict := h.mon.Verdict(); verdict.Fired() {
-		switch name {
-		case "record_fact":
-		default:
-			return true, verdict.Message(), nil
+		if !isWriteBackTool(name) {
+			return true, verdict.Message() + stopLossPostBlockWriteHint, nil
 		}
 	} else if !steerPending(h.inner) {
-		if msg, ok := h.mon.RemindWriteBack(name); ok {
+		if msg, ok := h.mon.remindWriteBackFor(name, input); ok {
 			return true, msg, nil
 		}
 	}
 	if h.inner != nil {
-		return h.inner.PreToolUse(ctx, name, input)
+		block, msg, updated := h.inner.PreToolUse(ctx, name, input)
+		if block {
+			return true, msg, updated
+		}
+		if len(updated) > 0 {
+			input = updated
+		}
+		if isCountableIdleProbe(name, input) {
+			h.mon.noteProbeStarted()
+		}
+		return false, msg, updated
+	}
+	if isCountableIdleProbe(name, input) {
+		h.mon.noteProbeStarted()
 	}
 	return false, "", nil
 }
@@ -557,6 +652,15 @@ func isWriteBackTool(name string) bool {
 	}
 }
 
+func isLocalEditTool(name string) bool {
+	switch name {
+	case "Write", "Edit", "MultiEdit":
+		return true
+	default:
+		return false
+	}
+}
+
 func isProbeTool(name string) bool {
 	if name == "" || IsGraphReadTool(name) || isWriteBackTool(name) {
 		return false
@@ -569,6 +673,25 @@ func isProbeTool(name string) bool {
 		// an idle/repeat signal from a name we cannot classify.
 		return false
 	}
+}
+
+// isCountableIdleProbe reports whether a tool call should consume the
+// no_progress idle probe budget. Local workspace edits (Write/Edit/MultiEdit)
+// and provably local read-only Bash inspections (e.g. cat/grep/ls on spill
+// output) are preparation/parsing, not target-facing probes.
+func isCountableIdleProbe(name string, input []byte) bool {
+	if !isProbeTool(name) || isLocalEditTool(name) {
+		return false
+	}
+	if name == "Bash" && len(input) > 0 {
+		var raw struct {
+			Command string `json:"command"`
+		}
+		if json.Unmarshal(input, &raw) == nil && isLocalReadOnlyBash(raw.Command) {
+			return false
+		}
+	}
+	return true
 }
 
 func commandFingerprint(name string, input []byte) (string, bool) {

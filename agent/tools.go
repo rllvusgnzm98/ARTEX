@@ -16,6 +16,22 @@ import (
 	actool "github.com/Autumn-27/norma/tool"
 )
 
+// intentSummaryMax caps an intent summary inside graph_overview lists so one
+// runaway summary cannot bloat every planner/worker prompt. Full payloads stay
+// available via node_detail(id).
+const intentSummaryMax = 240
+
+func clipPlainRunes(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes]) + "…"
+}
+
 // compactIntents distills intents to {id, summary, state, asset_ids, parents,
 // yields} so the planner sees both the direction and its LINEAGE — parents (the
 // upstream nodes it derived from: facts/intents/findings) and yields (the facts/
@@ -26,7 +42,11 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 	for _, n := range ns {
 		var p map[string]any
 		_ = json.Unmarshal(n.Payload, &p)
-		m := map[string]any{"id": n.ID, "summary": p["summary"], "state": n.State}
+		summary := p["summary"]
+		if s, ok := summary.(string); ok {
+			summary = clipPlainRunes(s, intentSummaryMax)
+		}
+		m := map[string]any{"id": n.ID, "summary": summary, "state": n.State}
 		if n.Inherited {
 			m["source_task_id"] = n.SourceTaskID
 			m["inherited"] = true
@@ -613,7 +633,7 @@ func (t *ToolSet) graphOverviewDataFrom(g *graphSnapshot) map[string]any {
 		if hidden(n.ID) {
 			continue // 已折进 digest 且仍冷 —— 见 cold_digests
 		}
-		m := compactNode(n)
+		m := compactFact(n)
 		if from := factFrom[n.ID]; from > 0 {
 			m["from_intent"] = from // 本事实由哪个意图产生
 		}
