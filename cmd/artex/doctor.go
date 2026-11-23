@@ -88,7 +88,7 @@ func runDoctor(args []string) int {
 	dsn, source, dsnErr := db.DSN()
 	profiles, dbOK, llmChecked := -1, false, false
 	if dsnErr != nil {
-		check(docFail, "PostgreSQL", dsnErr.Error())
+		check(docFail, "PostgreSQL", config.Redact(dsnErr.Error()))
 	} else if n, err := db.Probe(dsn); err != nil {
 		var qe *db.ProbeQueryError
 		if errors.As(err, &qe) {

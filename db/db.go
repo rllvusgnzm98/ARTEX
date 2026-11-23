@@ -93,6 +93,19 @@ func DSN() (dsn, source string, err error) {
 	return config.PostgresDSN()
 }
 
+// dsnSafeErr 抹掉底层错误里的口令。pgx 的解析错误会把整条 DSN 嵌进 message，而它只
+// 打码 URL userinfo 与 libpq 键值形态——实测 `?password=` / `?sslpassword=` 原样输出，
+// 再经 doctor 打印或 log.Fatalf 落进日志。连接路径的错误一律先过这里。
+func dsnSafeErr(dsn string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if safe := config.ScrubSecrets(dsn, err.Error()); safe != err.Error() {
+		return errors.New(safe)
+	}
+	return err
+}
+
 // Probe 轻量只读预检（artex doctor 用）：连接 + ping，通了就顺手只读统计
 // LLM profile 数。与 Open 不同，这里不做任何迁移/seed/写操作。
 // 返回 (llmProfiles, err)：
@@ -103,22 +116,46 @@ func DSN() (dsn, source string, err error) {
 func Probe(dsn string) (int, error) {
 	sqlDB, err := sql.Open("pgx", dsn)
 	if err != nil {
-		return -1, err
+		return -1, dsnSafeErr(dsn, err)
 	}
 	defer sqlDB.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := sqlDB.PingContext(ctx); err != nil {
-		return -1, err
+		return -1, dsnSafeErr(dsn, err)
 	}
 	var n int
 	if err := sqlDB.QueryRowContext(ctx, `SELECT count(*) FROM llm_profiles`).Scan(&n); err != nil {
 		if isUndefinedTable(err) {
 			return -1, nil
 		}
-		return -1, &ProbeQueryError{Err: err}
+		return -1, &ProbeQueryError{Err: dsnSafeErr(dsn, err)}
 	}
 	return n, nil
+}
+
+const (
+	anchorAssetFK = "exploration_anchors_asset_id_fkey"
+	anchorOwnerFK = "exploration_anchors_node_id_fkey"
+)
+
+// constraintName 取出违反的约束名（拿不到时为空串）。
+func constraintName(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.ConstraintName
+	}
+	return ""
+}
+
+const pgForeignKeyViolation = "23503"
+
+// isFKViolation 认出外键冲突。锚点写入一旦撞上它，说明引用的 asset 在本事务提交前就
+// 已经不在了：调用方应当把它翻译成明确的 DanglingAnchorError，而不是把裸的驱动错误
+// 抛出去。
+func isFKViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == pgForeignKeyViolation
 }
 
 const pgUndefinedTable = "42P01"
@@ -147,7 +184,22 @@ func (e *ProbeQueryError) Unwrap() error {
 
 // DB wraps the shared *sql.DB. PG handles its own connection pool + concurrency
 // (MVCC), so unlike the old SQLite store there is no process-wide write mutex.
-type DB struct{ *sql.DB }
+type DB struct {
+	*sql.DB
+	// health 记录本进程内的落库失败（丢弃的 activity、悬空锚点、写入失败），
+	// 让「执行成功但没落库」不再只存在于日志里。
+	health *PersistenceHealth
+}
+
+// Health 返回落库健康登记表。没有打开数据库时返回 nil —— PersistenceHealth 的每个
+// 方法都容忍 nil 接收者，所以调用方不必判空；这里不做惰性初始化，否则共享 *DB 会出
+// 现并发写字段的数据竞争。
+func (d *DB) Health() *PersistenceHealth {
+	if d == nil {
+		return nil
+	}
+	return d.health
+}
 
 // ensureDatabase connects to the postgres system database and creates the target
 // database if it does not exist. dsn must be a postgres:// URL.
@@ -184,11 +236,11 @@ func ensureDatabase(dsn string) error {
 // Open connects, applies the schema (idempotent), and seeds builtin rows.
 func Open(dsn string) (*DB, error) {
 	if err := ensureDatabase(dsn); err != nil {
-		return nil, err
+		return nil, dsnSafeErr(dsn, err)
 	}
 	sqlDB, err := sql.Open("pgx", dsn)
 	if err != nil {
-		return nil, err
+		return nil, dsnSafeErr(dsn, err)
 	}
 	// database/sql 默认不限制连接数：池里没有空闲连接时会无条件新建，一路顶到
 	// PostgreSQL 的 max_connections（默认 100）才被拒，于是高峰期的查询拿到的是
@@ -202,9 +254,9 @@ func Open(dsn string) (*DB, error) {
 	sqlDB.SetConnMaxIdleTime(5 * time.Minute)
 	if err := sqlDB.Ping(); err != nil {
 		sqlDB.Close()
-		return nil, fmt.Errorf("ping postgres (%s): %w", config.Redact(dsn), err)
+		return nil, fmt.Errorf("ping postgres (%s): %w", config.Redact(dsn), dsnSafeErr(dsn, err))
 	}
-	d := &DB{sqlDB}
+	d := &DB{DB: sqlDB, health: NewPersistenceHealth()}
 	// pgx runs multi-statement Exec via the simple protocol when there are no args.
 	// Keep the dedicated lock connection checked out until both DDL and seeding
 	// finish so concurrent application instances cannot initialize out of order.

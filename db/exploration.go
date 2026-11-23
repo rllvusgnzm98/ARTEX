@@ -214,6 +214,11 @@ func (s *ExplorationStore) addNodeCtx(ctx context.Context, kind string, payload 
 		return 0, err
 	}
 	defer tx.Rollback()
+	// 先校验锚点引用，再写节点：缺失的 asset 会让整个事务被 23503 拒绝，提前
+	// 查出来既能给出明确的一致性错误，也避免把「写失败」埋在节点插入之后。
+	if err := s.checkAnchorAssets(ctx, tx, anchors); err != nil {
+		return 0, err
+	}
 	var id int64
 	if err := tx.QueryRowContext(ctx, `
 INSERT INTO exploration_nodes(exploration_id, kind, payload, priority, state, origin)
@@ -223,7 +228,7 @@ VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
 	}
 	for _, a := range anchors {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_anchors(node_id, asset_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, id, a); err != nil {
-			return 0, err
+			return 0, anchorWriteErr(err, s.db.Health(), s.expID, id, []int64{a})
 		}
 	}
 	if intentID > 0 {
@@ -281,8 +286,18 @@ func (s *ExplorationStore) AnchorCtx(ctx context.Context, nodeID, assetID int64)
 	if nodeID <= 0 || assetID <= 0 {
 		return nil
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO exploration_anchors(node_id, asset_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, nodeID, assetID)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := s.checkAnchorAssets(ctx, tx, []int64{assetID}); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_anchors(node_id, asset_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, nodeID, assetID); err != nil {
+		return anchorWriteErr(err, s.db.Health(), s.expID, nodeID, []int64{assetID})
+	}
+	return tx.Commit()
 }
 
 // Link adds a typed exploration edge (idempotent).
@@ -2142,4 +2157,146 @@ func (s *ExplorationStore) ActivityByIDsForTerminalIntents(ids []int64) ([]Activ
 // exploration node is deleted). taskID and nodeID may be 0 (stored as NULL).
 func (s *ExplorationStore) AddStandaloneFinding(taskID, nodeID int64, vulnclass, name, severity, summary, evidence, worker string, assetIDs []int64) (int64, error) {
 	return s.db.AddFinding(taskID, nodeID, vulnclass, name, severity, summary, evidence, worker, assetIDs)
+}
+
+// ErrDanglingAnchor 表示锚点引用了已不存在的 asset。它是 23503 的真实根因：
+// asset 被删除（或从未落库）后仍被当作锚点写入，PostgreSQL 以外键冲突拒绝整个
+// 事务。约束本身是对的，所以这里不删约束，而是把它变成一个可识别、可定位的
+// 一致性错误——调用方能据此知道「写失败了，且是哪几个 asset 的问题」，而不是
+// 拿到一个笼统的驱动错误、或更糟地拿到一个看起来成功的节点。
+var ErrDanglingAnchor = errors.New("锚点引用的 asset 不存在")
+
+// DanglingAnchorError 带上具体缺失的 asset id，便于诊断与测试断言。
+type DanglingAnchorError struct {
+	ExplorationID int64
+	Missing       []int64
+}
+
+func (e *DanglingAnchorError) Error() string {
+	ids := make([]string, 0, len(e.Missing))
+	for _, id := range e.Missing {
+		ids = append(ids, strconv.FormatInt(id, 10))
+	}
+	return fmt.Sprintf("锚点引用的 asset 不存在: %s (exploration %d)", strings.Join(ids, ","), e.ExplorationID)
+}
+
+func (e *DanglingAnchorError) Unwrap() error { return ErrDanglingAnchor }
+
+// ErrMissingAnchorOwner 与悬空锚点相对：不见的是锚点挂靠的那个节点，不是 asset。
+// exploration_anchors 两列都有外键，只看 SQLSTATE 会把「owner 节点没了」误报成
+// 「asset 没了」，排查时指向错误的对象。
+var ErrMissingAnchorOwner = errors.New("锚点挂靠的节点不存在")
+
+type MissingAnchorOwnerError struct {
+	ExplorationID int64
+	NodeID        int64
+}
+
+func (e *MissingAnchorOwnerError) Error() string {
+	return fmt.Sprintf("锚点挂靠的节点不存在: #%d (exploration %d)", e.NodeID, e.ExplorationID)
+}
+
+func (e *MissingAnchorOwnerError) Unwrap() error { return ErrMissingAnchorOwner }
+
+// anchorQuerier 覆盖 *sql.Tx 与 *DB，让校验既能在事务内做，也能独立做。
+type anchorQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// checkAnchorAssets 在写入锚点之前，确认每个 asset 都还在，把常见情形报成明确的
+// *DanglingAnchorError（已排序去重的缺失 id）而不是裸的外键错误，并把事件记进落库
+// 健康表，让这种一致性问题在接口上可见而不是只进日志。
+//
+// 这里刻意不加 FOR SHARE：DeleteTaskCascadePrepared 会先拿 assets + exploration_anchors
+// 的 SHARE ROW EXCLUSIVE 表锁再删资产行，若本路径先锁住资产行、再去插锚点（需要
+// anchors 的 ROW EXCLUSIVE），两边加锁顺序正好相反，PostgreSQL 只能判一方死锁。
+// 因此校验只做读：真正保证「不留半成品」的是外键本身——校验到写入之间若被并发清理
+// 插空，FK 会拒绝并回滚整笔事务，再由 anchorWriteErr 翻译成同一个一致性错误。
+func (s *ExplorationStore) checkAnchorAssets(ctx context.Context, q anchorQuerier, anchors []int64) error {
+	return checkAnchorAssets(ctx, q, s.db.Health(), s.expID, anchors)
+}
+
+// checkAnchorAssets 是不依赖 ExplorationStore 的同一校验，供直接持有事务的写入
+// 路径（如流量证据绑定）复用。
+func checkAnchorAssets(ctx context.Context, q anchorQuerier, health *PersistenceHealth, expID int64, anchors []int64) error {
+	ids := dedupePositive(anchors)
+	if len(ids) == 0 {
+		return nil
+	}
+	rows, err := q.QueryContext(ctx, `SELECT id FROM assets WHERE id = ANY($1::bigint[])`, ids)
+	if err != nil {
+		return err
+	}
+	present := make(map[int64]struct{}, len(ids))
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		present[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	var missing []int64
+	for _, id := range ids {
+		if _, ok := present[id]; !ok {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	err = &DanglingAnchorError{ExplorationID: expID, Missing: missing}
+	health.RecordDanglingAnchors(expID, missing, err.Error())
+	return err
+}
+
+// anchorWriteErr 把锚点写入撞上的外键冲突翻译成明确的一致性错误，并按**约束名**区分
+// 到底是 asset 不在还是 owner 节点不在（两列都有外键，只看 SQLSTATE 会张冠李戴）。
+//
+// 校验（只读）到写入之间仍可能被并发的资产清理插空；此时外键会拒绝并回滚整笔事务，
+// 半成品不会落库，这里只负责让调用方看到 DanglingAnchorError 而不是裸驱动错误，并把
+// 事件同样记进落库健康表。
+func anchorWriteErr(err error, health *PersistenceHealth, expID, nodeID int64, assets []int64) error {
+	if err == nil || !isFKViolation(err) {
+		return err
+	}
+	switch constraintName(err) {
+	case anchorAssetFK:
+		out := &DanglingAnchorError{ExplorationID: expID, Missing: dedupePositive(assets)}
+		health.RecordDanglingAnchors(expID, out.Missing, out.Error())
+		return out
+	case anchorOwnerFK:
+		out := &MissingAnchorOwnerError{ExplorationID: expID, NodeID: nodeID}
+		health.RecordWriteFailure(expID, out.Error())
+		return out
+	}
+	// 约束名拿不到时不猜：错报成「asset 不存在」会把排查引向错误的对象。
+	health.RecordWriteFailure(expID, "anchor fk violation: "+err.Error())
+	return err
+}
+
+// dedupePositive 返回升序去重后的正数 id。
+func dedupePositive(ids []int64) []int64 {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := make(map[int64]struct{}, len(ids))
+	out := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }

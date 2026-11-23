@@ -5,6 +5,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -14,6 +15,8 @@ import (
 	"time"
 
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Database is the PostgreSQL connection config. Either set DSN directly, or set
@@ -217,16 +220,18 @@ func (d Database) buildDSN() string {
 	return u.String()
 }
 
-// keywordSecret 匹配 libpq 风格键值串里的口令键（长短优先），值可加引号。
-var keywordSecret = regexp.MustCompile(`(?i)(^|[\s])((?:password|passwd|pwd|pass)=)('[^']*'|"[^"]*"|[^\s]+)`)
+// keywordSecret 匹配 libpq 风格键值串里的口令键（长短优先，sslpassword 在前以免被
+// password 吃掉），`=` 两侧允许空白，值可加引号（含转义引号）。
+var keywordSecret = regexp.MustCompile(`(?i)(^|[\s])((?:sslpassword|password|passwd|pwd|pass)\s*=\s*)('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|[^\s]+)`)
 
 func redactKeywordSecrets(s string) string {
 	return keywordSecret.ReplaceAllString(s, "${1}${2}****")
 }
 
 // Redact 返回供日志使用的脱敏 DSN。URL 形态（postgres://user:pass@host/db）
-// 仍按原逻辑打码 User 中的口令；url.Parse 失败或没有 User 时，再处理
-// key=value（password/passwd/pwd/pass）里的口令。
+// 打码 User 中的口令，并打码查询串里的口令参数（?password=...）——keywordSecret 要求
+// 键前是行首或空白，`?`/`&` 都不匹配，单靠它会把 URL 查询串里的口令原样留下。
+// url.Parse 失败或没有 scheme 时，走 key=value（password/passwd/pwd/pass）打码。
 func Redact(dsn string) string {
 	u, err := url.Parse(dsn)
 	// 无 scheme 的 key=value 串会被 url.Parse 收成 Path 并把空格编成 %20，
@@ -239,7 +244,189 @@ func Redact(dsn string) string {
 			u.User = url.UserPassword(u.User.Username(), "****")
 		}
 	}
+	if q := u.Query(); len(q) > 0 {
+		masked := false
+		for k, vs := range q {
+			switch strings.ToLower(k) {
+			case "password", "passwd", "pwd", "pass", "sslpassword":
+				for i := range vs {
+					if vs[i] != "" {
+						vs[i] = "****"
+						masked = true
+					}
+				}
+				q[k] = vs
+			}
+		}
+		if masked {
+			u.RawQuery = q.Encode()
+		}
+	}
 	return redactKeywordSecrets(u.String())
+}
+
+// dsnSecretValues 取出 DSN 里真正的口令值：URL userinfo、URL 查询串、libpq 键值三种形态。
+// 按值抹除才治得了第三方诊断——pgx 的解析错误会把整条 DSN 原样嵌进 message，而它只打码
+// userinfo 与 libpq 键值，查询串里的 password/sslpassword 一概留原文。
+func dsnSecretValues(dsn string) []string {
+	var out []string
+	add := func(v string) {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	if u, err := url.Parse(dsn); err == nil && u.Scheme != "" {
+		if u.User != nil {
+			if pw, ok := u.User.Password(); ok {
+				add(pw)
+			}
+		}
+		for k, vs := range u.Query() {
+			switch strings.ToLower(k) {
+			case "password", "passwd", "pwd", "pass", "sslpassword":
+				for _, v := range vs {
+					add(v)
+				}
+			}
+		}
+	}
+	for _, m := range keywordSecret.FindAllStringSubmatch(dsn, -1) {
+		v := m[3]
+		if len(v) >= 2 && (v[0] == '\'' || v[0] == '"') && v[len(v)-1] == v[0] {
+			v = v[1 : len(v)-1]
+		}
+		add(v)
+	}
+	return out
+}
+
+// ScrubSecrets 把 dsn 里的口令值从任意诊断文本中抹掉（含 URL 转义形态）。给要把底层
+// 错误往日志/接口/落库送的调用方用：Redact 只管「打码一条 DSN」，这个管「别让口令搭着
+// 别人的错误信息漏出去」。
+func ScrubSecrets(dsn, s string) string {
+	if s == "" {
+		return s
+	}
+	for _, secret := range dsnSecretValues(dsn) {
+		s = strings.ReplaceAll(s, secret, "****")
+		if esc := url.QueryEscape(secret); esc != secret {
+			s = strings.ReplaceAll(s, esc, "****")
+		}
+	}
+	return s
+}
+
+// 这里刻意不记「是否配了客户端私钥口令（sslpassword）」。pgx 把它消化进 TLS 配置、不留
+// 在 ConnConfig 的任何字段里，想记就只能自己按 libpq 语义去读 DSN——而那套语义（单引号
+// 转义、双引号是字面量、引号内空白保留、显式空值压过 PGSSLPASSWORD、service 文件）复现
+// 起来极易出错：两轮评审分别抓到我把显式留空算成「配了」、又把 `sslpassword=""` 和纯空白
+// 值算成「没配」，方向正好相反。与其让快照给一个时对时错的布尔，不如不给：登录口令由
+// pgx 的 ConnConfig.Password 权威回答（见下），私钥口令的状态交给运维自己的配置来源。
+
+// isSocketHost 判断候选端点是不是 Unix 域套接字（libpq 以 "/" 开头的路径表示）。
+func isSocketHost(host string) bool { return strings.HasPrefix(host, "/") }
+
+// tlsPolicy 把 pgx 解析后的连接意图还原成一句话。只记「主连接有没有 TLS」会把 prefer
+// 说成和 require 一样，而 prefer 允许明文回退——实测 pgx 对 prefer 给的是「主连接带
+// TLS + 同主机明文回退」，对 require 则没有任何明文回退。两者的安全含义完全不同，快照
+// 必须分得开（libpq 默认即 prefer，keyword DSN 不写 sslmode 时也落在这里）。
+//
+// 只看 TCP 候选：Unix 域套接字上本来就不做 TLS，实测 `host=/var/run/postgresql,h2
+// sslmode=require` 会给出「socket 主连接(无 TLS) + h2 带 TLS」，把 socket 当成明文回退
+// 就会记成 allowed，而实际上每一次 TCP 尝试都强制 TLS。
+func tlsPolicy(cfg *pgconn.Config) string {
+	var tcpTLS []bool
+	if !isSocketHost(cfg.Host) {
+		tcpTLS = append(tcpTLS, cfg.TLSConfig != nil)
+	}
+	for _, f := range cfg.Fallbacks {
+		if !isSocketHost(f.Host) {
+			tcpTLS = append(tcpTLS, f.TLSConfig != nil)
+		}
+	}
+	if len(tcpTLS) == 0 {
+		return "socket" // 只走 Unix 套接字，谈不上 TLS 策略
+	}
+	withTLS, plaintext := false, false
+	for _, hasTLS := range tcpTLS {
+		if hasTLS {
+			withTLS = true
+		} else {
+			plaintext = true
+		}
+	}
+	switch {
+	case withTLS && !plaintext:
+		return "required"
+	case withTLS && plaintext:
+		// 顺序即语义：TLS 候选在前是 prefer，明文在前是 allow。
+		if tcpTLS[0] {
+			return "preferred"
+		}
+		return "allowed"
+	}
+	return "disabled"
+}
+
+// connectionEndpoints 返回所有候选端点（主 + 回退），按出现顺序去重。多主机 DSN 里真正
+// 服务某一轮的可能是备用端点，只记第一个会让溯源指名错误的库；回退项里还混着同主机的
+// TLS/明文变体，所以按 host:port 去重。
+func connectionEndpoints(cfg *pgconn.Config) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	add := func(host string, port uint16) {
+		if host == "" {
+			return
+		}
+		// JoinHostPort 而不是 "%s:%d"：IPv6 字面量必须带方括号，否则 net.SplitHostPort
+		// 一类的解析器会直接拒绝，运维拿它复核连通性都用不了。
+		ep := net.JoinHostPort(host, strconv.Itoa(int(port)))
+		if _, dup := seen[ep]; dup {
+			return
+		}
+		seen[ep] = struct{}{}
+		out = append(out, ep)
+	}
+	add(cfg.Host, cfg.Port)
+	for _, f := range cfg.Fallbacks {
+		add(f.Host, f.Port)
+	}
+	return out
+}
+
+// connectionIdentity 从 DSN 里只取「连的是哪台库」这类非机密身份字段。做运行溯源时记
+// 这些，而不是记一整条（几乎完整的）DSN——后者只要有一处打码遗漏就是凭据泄漏。
+//
+// 解析一律交给 pgconn.ParseConfig，不自己切字符串：libpq 键值串允许带引号的值（口令里
+// 可以含空格甚至 "dbname=" 字样）、`=` 两侧可以有空白，URL 的查询串还能用 host/port/
+// dbname 覆盖前面的值。实测手写的 Fields+Cut 会把引号内的片段当成字段（口令碎片因此
+// 进了快照）、把 `host = h` 整条丢掉、并忽略查询串覆盖，三种都会让溯源指向错误的库。
+//
+// 解析失败（例如 sslmode 非法）时不猜：此时连接本来也建不起来，而错误文本里还带着整条
+// DSN，绝不能顺手落库。
+func connectionIdentity(dsn string) map[string]any {
+	cfg, err := pgconn.ParseConfig(dsn)
+	if err != nil {
+		return map[string]any{
+			"db_identity_parsed": false,
+			"db_password_set":    len(dsnSecretValues(dsn)) > 0,
+		}
+	}
+	out := map[string]any{
+		"db_identity_parsed": true,
+		// db_host/db_port 是主端点；候选不止一个时另见 db_endpoints。
+		"db_host":         cfg.Host,
+		"db_port":         cfg.Port,
+		"db_name":         cfg.Database,
+		"db_user":         cfg.User,
+		"db_tls_policy":   tlsPolicy(cfg),
+		"db_password_set": cfg.Password != "",
+		// 私钥口令与登录口令是两样东西，分开记，别让证书认证的部署显示成「没配口令」。
+	}
+	if eps := connectionEndpoints(cfg); len(eps) > 1 {
+		out["db_endpoints"] = eps
+	}
+	return out
 }
 
 // CallbackAddr resolves the platform callback address:
@@ -434,4 +621,71 @@ func TaskProxyPortRange() string {
 		return v
 	}
 	return "21100-21199"
+}
+
+// Summary 返回可安全落库/上报的「有效配置」摘要。任务溯源需要知道当时跑的是哪套
+// 配置，但配置里混着凭据（DSN、库口令、JWT 相关、emp3r0r 密钥），所以这里按白名单
+// 取值：只收行为相关的开关与范围，凭据一律只记「是否配置」这一个布尔，绝不记原文。
+// 新增配置字段默认不进摘要——必须显式加进来，避免哪天把新的密钥顺手带出去。
+// EffectiveSummary 组装「这个进程实际在用的那套取值」的脱敏摘要。
+//
+// 与 Config.Summary() 的区别是来源：Summary 描述一份 Config 结构体（即配置文件内容），
+// 而运行时各处读的是 SkillDir()/CallbackAddr()/PostgresDSN() 这些访问器——它们在文件之上
+// 还叠了环境变量、默认值归一化，以及 SetListenAddr 这类运行期写入。做运行溯源必须记后者，
+// 否则快照可能显示一份进程从未使用过的端口区间或 DSN 来源。
+//
+// 凭据只记「是否配置」与来源，DSN 一律经 Redact 打码后再记，绝不落原文口令。
+//
+// 刻意不含 host_pace_rps：每主机限速可由 Settings 在运行期改写（Manager.SetHostPace），
+// 生效值只有 Manager 知道，这里给出的只会是启动默认值。该字段由 server 侧补上生效值。
+func EffectiveSummary() map[string]any {
+	dsn, source, err := PostgresDSN()
+	out := map[string]any{
+		"skill_dir":             SkillDir(),
+		"callback_addr":         CallbackAddr(),
+		"tunnel_port_range":     TunnelPortRange(),
+		"task_proxy_enabled":    TaskProxyEnabled(),
+		"task_proxy_port_range": TaskProxyPortRange(),
+		"own_infra_hosts":       len(OwnInfraHosts()),
+		"own_infra_port":        OwnInfraPort(),
+		"jwt_ttl":               JWTTTL().String(),
+		"jwt_rotation_period":   JWTRotationPeriod().String(),
+		"jwt_grace":             JWTGrace().String(),
+		"emp3r0r_enabled":       Emp3r0rConfig().Enabled,
+		// gate 的最终判定要读库里的 settings（见 ResolveGate），进程层面没有「生效值」，
+		// 所以这里如实记为配置值而不是冒充生效值。
+		"gate_mode_configured": Load().GateMode,
+		// 只记「连的是哪台库」这类非机密身份字段，不记 DSN 本身：一条（即便打过码的）
+		// DSN 几乎就是完整凭据，任何一处遗漏都会随溯源落库并从 stats 读出去。
+		"db_dsn_set":    strings.TrimSpace(dsn) != "",
+		"db_dsn_source": source,
+	}
+	for k, v := range connectionIdentity(dsn) {
+		out[k] = v
+	}
+	if err != nil {
+		out["db_dsn_error"] = ScrubSecrets(dsn, err.Error())
+	}
+	return out
+}
+
+func (c Config) Summary() map[string]any {
+	return map[string]any{
+		"skill_dir":             c.SkillDir,
+		"callback_addr":         c.CallbackAddr,
+		"tunnel_port_range":     c.TunnelPortRange,
+		"task_proxy_port_range": c.TaskProxyPortRange,
+		"own_infra_hosts":       len(c.OwnInfraHosts),
+		"gate_mode":             c.GateMode,
+		"jwt_ttl":               c.JWTTTL,
+		"jwt_rotation_period":   c.JWTRotationPeriod,
+		"jwt_grace":             c.JWTGrace,
+		"db_host":               c.Database.Host,
+		"db_port":               c.Database.Port,
+		"db_name":               c.Database.DBName,
+		"db_sslmode":            c.Database.SSLMode,
+		"db_password_set":       c.Database.Password != "",
+		"db_dsn_set":            c.Database.DSN != "",
+		"emp3r0r_enabled":       c.Emp3r0r.Enabled,
+	}
 }

@@ -32,6 +32,24 @@ func isFKViolation(err error) bool {
 
 // dropReason classifies why an activity write was dropped, so the log can be
 // grouped/analysed by cause rather than by raw error text.
+// nonRetryableWrite 判断一次写入失败是否重试也不可能成功：完整性约束（23xxx，含
+// 23503 悬空锚点）、数据异常（22xxx，如非法 UTF-8/NUL）以及磁盘写满（53100）都属于
+// 此类。对这些错误立刻停手，既不浪费重试预算，也让失败更快变成可见的丢弃记录，
+// 而不是把 3 秒超时耗在注定失败的重试上。
+func nonRetryableWrite(err error) bool {
+	if errors.Is(err, db.ErrDanglingAnchor) {
+		return true
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	if pgErr.Code == "53100" {
+		return true
+	}
+	return strings.HasPrefix(pgErr.Code, "23") || strings.HasPrefix(pgErr.Code, "22")
+}
+
 func dropReason(err error) string {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
@@ -40,6 +58,8 @@ func dropReason(err error) string {
 			return "fk_violation(23503,父exploration不存在)"
 		case "23505":
 			return "unique_violation(23505)"
+		case "53100":
+			return "disk_full(53100,磁盘写满)"
 		default:
 			return "pg_error(" + pgErr.Code + ")"
 		}
@@ -111,6 +131,9 @@ type Engine struct {
 	paused   sync.Map // taskID -> bool, user-paused (planner + workers idle but loops alive)
 	deleting sync.Map // taskID -> bool, delete barrier (no new task-owned writes)
 	dropCnt  sync.Map // taskID -> *int64, running count of dropped (unpersistable) activity records
+	// provStamped tracks which tasks already had their run provenance (build
+	// version + effective config) stamped in this process.
+	provStamped sync.Map // taskID -> true
 
 	lastLLMStart  atomic.Int64
 	lastLLMFinish atomic.Int64
@@ -292,6 +315,7 @@ func (e *Engine) StopTask(taskID string) {
 	e.llmCalls.Delete(taskID)
 	e.paused.Delete(taskID)
 	e.dropCnt.Delete(taskID)
+	e.provStamped.Delete(taskID)
 	e.plannerRound.Delete(taskID)
 	e.settling.Delete(taskID)
 	e.deadline.Delete(taskID)
@@ -686,6 +710,9 @@ func (e *Engine) emitActivity(t *Task, r db.Activity) db.Activity {
 		// summary preview, running drop count for this task, and — on the FK case — a
 		// live probe of WHY the parent exploration is unreachable.
 		n := e.bumpDrop(t.ID)
+		// 同时登记到落库健康表：日志只能事后翻查，而判定「执行成功但没落库」需要
+		// 接口上能直接读到这次探索丢了多少条、最后一次为什么丢。
+		e.m.pg.Health().RecordDroppedActivity(t.Store.ID(), dropReason(err))
 		diag := ""
 		// On the FK-parent failure (23503) probe the live DB so the log records WHY the
 		// exploration is unreachable (row gone / wrong expID) instead of just that it is.
@@ -736,6 +763,9 @@ func (e *Engine) appendActivityCtx(ctx context.Context, t *Task, r db.Activity) 
 		}
 		log.Printf("[activity] task %s 写入失败 (第 %d/3 次, worker=%s kind=%s tool=%s expID=%d): %v",
 			t.ID, attempt, r.Worker, r.Kind, r.Tool, t.Store.ID(), err)
+		if nonRetryableWrite(err) {
+			return 0, err
+		}
 		timer := time.NewTimer(time.Duration(attempt) * 25 * time.Millisecond)
 		select {
 		case <-timer.C:
@@ -925,6 +955,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		if ectx.Err() != nil || e.IsDeleting(t.ID) {
 			return
 		}
+		// 过了取消/删除这道最终准入才算「真的跑了」：在它之前盖章，会给一次根本没执行
+		// 的尝试留下运行证据。
+		e.stampRunProvenance(t)
 		log.Printf("[planner] task %s 规划中…(%s 触发)", t.ID, src)
 		// round marker: each Plan() is one planner round; emit a boundary so the
 		// UI can separate rounds in the transcript (kind='round').
@@ -1070,6 +1103,8 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		}
 		return true
 	}
+	// 同上：过了取消/删除的最终准入才盖章，避免给没真正执行的尝试留证据。
+	e.stampRunProvenance(t)
 	// per-work child context so the planner's kill_work can stop just this work.
 	workCtx, workCancel := context.WithCancelCause(ectx)
 	workCtx = llmrec.WithAttribution(workCtx, intent.ID, name, 0)
