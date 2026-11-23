@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/norma/llm"
 )
 
@@ -15,7 +16,7 @@ type runBudgetKey struct{}
 type modelRetryStopKey struct{}
 
 func WithModelRetryStop(ctx context.Context, monitor *StopLossMonitor) context.Context {
-	return context.WithValue(ctx, modelRetryStopKey{}, monitor)
+	return llmpool.WithFailoverStop(context.WithValue(ctx, modelRetryStopKey{}, monitor), monitor.Fired)
 }
 
 func ModelRetriesStopped(ctx context.Context) bool {

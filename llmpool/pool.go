@@ -51,6 +51,17 @@ type Pool struct {
 	rr      atomic.Uint64 // rotates the starting point within an equal-priority group
 }
 
+type failoverStopKey struct{}
+
+func WithFailoverStop(ctx context.Context, stop func() bool) context.Context {
+	return context.WithValue(ctx, failoverStopKey{}, stop)
+}
+
+func failoverStopped(ctx context.Context) bool {
+	stop, _ := ctx.Value(failoverStopKey{}).(func() bool)
+	return stop != nil && stop()
+}
+
 // New builds a Pool over members (already in chain order). Returns nil when the
 // chain is empty. A single-member chain is still a valid Pool — it just behaves
 // exactly like the bare provider.
@@ -84,6 +95,10 @@ func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[
 	return func(yield func(llm.StreamEvent, error) bool) {
 		var lastErr error
 		for i, m := range order {
+			if i > 0 && failoverStopped(ctx) {
+				yield(llm.StreamEvent{}, lastErr)
+				return
+			}
 			emitted := false
 			var failed error
 			for ev, err := range m.Prov.Stream(ctx, req) {
@@ -108,6 +123,10 @@ func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[
 			if p.health.Trip(m.ID, trimErr(failed), hard) {
 				log.Printf("[llmpool] 配置 %q(%s) 已熔断：%s", m.Name, m.Model, trimErr(failed))
 			}
+			if failoverStopped(ctx) {
+				yield(llm.StreamEvent{}, failed)
+				return
+			}
 			if i+1 < len(order) {
 				n := order[i+1]
 				log.Printf("[llmpool] LLM 故障转移：%q(%s) → %q(%s)，原因：%s",
@@ -131,6 +150,9 @@ func (p *Pool) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Mes
 	order := p.order(req)
 	var lastErr error
 	for i, m := range order {
+		if i > 0 && failoverStopped(ctx) {
+			return llm.Message{}, "", llm.Usage{}, lastErr
+		}
 		msg, sr, usage, err := m.Prov.Complete(ctx, req)
 		if err == nil {
 			p.health.Pass(m.ID)
@@ -146,6 +168,9 @@ func (p *Pool) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Mes
 		hard := isHardFailure(err)
 		if p.health.Trip(m.ID, trimErr(err), hard) {
 			log.Printf("[llmpool] 配置 %q(%s) 已熔断：%s", m.Name, m.Model, trimErr(err))
+		}
+		if failoverStopped(ctx) {
+			return llm.Message{}, "", llm.Usage{}, err
 		}
 		if i+1 < len(order) {
 			n := order[i+1]

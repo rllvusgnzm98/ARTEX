@@ -9,6 +9,37 @@ import (
 	"github.com/Autumn-27/norma/llm"
 )
 
+func TestTaskLLMStopLossCommittedQuotaDoesNotAdvance(t *testing.T) {
+	policy := agent.DefaultStopLossPolicy()
+	policy.IdleProbeLimit = 1
+	loss := agent.NewStopLossMonitor(policy)
+	loss.ObserveTool("Bash", []byte(`{"command":"fixture"}`), false)
+	if !loss.Recompute().Fired() {
+		t.Fatal("fixture did not latch")
+	}
+	ctx := agent.WithModelRetryStop(t.Context(), loss)
+	quota := errors.New("openai: status 402: insufficient_quota")
+	provider := &scriptedLLMProvider{events: []llm.StreamEvent{{Type: llm.SETextDelta, Text: "partial"}}, err: quota}
+	selections, exhausts, transitions := 0, 0, 0
+	hooks := taskLLMStreamHooks{
+		current: func() (taskLLMSelection, error) {
+			selections++
+			return taskLLMSelection{profileID: 11, provider: provider}, nil
+		},
+		exhaust: func(taskLLMSelection, error) (db.TaskLLMTransition, error) {
+			exhausts++
+			next := int64(22)
+			return db.TaskLLMTransition{PreviousProfileID: 11, NextProfileID: &next, Advanced: true}, nil
+		},
+		transition: func(taskLLMSelection, db.TaskLLMTransition, error) { transitions++ },
+	}
+	events, err := collectTaskLLMStream(streamTaskLLM(ctx, "7", llm.CompletionRequest{}, hooks))
+	if err != quota || len(events) != 1 || events[0].Text != "partial" || selections != 1 ||
+		provider.calls != 1 || exhausts != 0 || transitions != 0 {
+		t.Fatalf("events=%+v err=%v selections=%d calls=%d exhausts=%d transitions=%d", events, err, selections, provider.calls, exhausts, transitions)
+	}
+}
+
 func TestTaskLLMStopLossQuotaBooksFailoverWithoutReplay(t *testing.T) {
 	policy := agent.DefaultStopLossPolicy()
 	policy.IdleProbeLimit = 1
