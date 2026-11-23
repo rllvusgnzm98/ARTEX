@@ -315,6 +315,70 @@ func ScrubSecrets(dsn, s string) string {
 	return s
 }
 
+// sslPasswordSet 判断是否配了客户端私钥口令（sslpassword）。pgx 把它消化进 TLS 配置，
+// 不会留在 ConnConfig.Password 里，所以证书认证 + 加密私钥的部署单看登录口令会显示
+// 「没配口令」。
+func sslPasswordSet(dsn string) bool {
+	if u, err := url.Parse(dsn); err == nil && u.Scheme != "" {
+		return strings.TrimSpace(u.Query().Get("sslpassword")) != ""
+	}
+	for _, m := range keywordSecret.FindAllStringSubmatch(dsn, -1) {
+		if strings.EqualFold(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(m[2]), "=")), "sslpassword") {
+			return true
+		}
+	}
+	return false
+}
+
+// tlsPolicy 把 pgx 解析后的连接意图还原成一句话。只记「主连接有没有 TLS」会把 prefer
+// 说成和 require 一样，而 prefer 允许明文回退——实测 pgx 对 prefer 给的是「主连接带
+// TLS + 同主机明文回退」，对 require 则没有任何明文回退。两者的安全含义完全不同，快照
+// 必须分得开（libpq 默认即 prefer，keyword DSN 不写 sslmode 时也落在这里）。
+func tlsPolicy(cfg *pgconn.Config) string {
+	plaintextFallback, tlsFallback := false, false
+	for _, f := range cfg.Fallbacks {
+		if f.TLSConfig == nil {
+			plaintextFallback = true
+		} else {
+			tlsFallback = true
+		}
+	}
+	if cfg.TLSConfig != nil {
+		if plaintextFallback {
+			return "preferred" // 先试 TLS，服务端不支持就明文（sslmode=prefer）
+		}
+		return "required"
+	}
+	if tlsFallback {
+		return "allowed" // 先试明文，再试 TLS（sslmode=allow）
+	}
+	return "disabled"
+}
+
+// connectionEndpoints 返回所有候选端点（主 + 回退），按出现顺序去重。多主机 DSN 里真正
+// 服务某一轮的可能是备用端点，只记第一个会让溯源指名错误的库；回退项里还混着同主机的
+// TLS/明文变体，所以按 host:port 去重。
+func connectionEndpoints(cfg *pgconn.Config) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	add := func(host string, port uint16) {
+		if host == "" {
+			return
+		}
+		ep := fmt.Sprintf("%s:%d", host, port)
+		if _, dup := seen[ep]; dup {
+			return
+		}
+		seen[ep] = struct{}{}
+		out = append(out, ep)
+	}
+	add(cfg.Host, cfg.Port)
+	for _, f := range cfg.Fallbacks {
+		add(f.Host, f.Port)
+	}
+	return out
+}
+
 // connectionIdentity 从 DSN 里只取「连的是哪台库」这类非机密身份字段。做运行溯源时记
 // 这些，而不是记一整条（几乎完整的）DSN——后者只要有一处打码遗漏就是凭据泄漏。
 //
@@ -329,21 +393,27 @@ func connectionIdentity(dsn string) map[string]any {
 	cfg, err := pgconn.ParseConfig(dsn)
 	if err != nil {
 		return map[string]any{
-			"db_identity_parsed": false,
-			"db_password_set":    len(dsnSecretValues(dsn)) > 0,
+			"db_identity_parsed":    false,
+			"db_password_set":       len(dsnSecretValues(dsn)) > 0,
+			"db_key_passphrase_set": sslPasswordSet(dsn),
 		}
 	}
-	return map[string]any{
+	out := map[string]any{
 		"db_identity_parsed": true,
-		"db_host":            cfg.Host,
-		"db_port":            cfg.Port,
-		"db_name":            cfg.Database,
-		"db_user":            cfg.User,
-		// sslmode 被 ParseConfig 解析成 TLS 配置后不再保留原字符串；记「最终有没有启用
-		// TLS」比回抄一个可能没生效的 sslmode 更诚实。
-		"db_tls_enabled":  cfg.TLSConfig != nil,
+		// db_host/db_port 是主端点；候选不止一个时另见 db_endpoints。
+		"db_host":         cfg.Host,
+		"db_port":         cfg.Port,
+		"db_name":         cfg.Database,
+		"db_user":         cfg.User,
+		"db_tls_policy":   tlsPolicy(cfg),
 		"db_password_set": cfg.Password != "",
+		// 私钥口令与登录口令是两样东西，分开记，别让证书认证的部署显示成「没配口令」。
+		"db_key_passphrase_set": sslPasswordSet(dsn),
 	}
+	if eps := connectionEndpoints(cfg); len(eps) > 1 {
+		out["db_endpoints"] = eps
+	}
+	return out
 }
 
 // CallbackAddr resolves the platform callback address:

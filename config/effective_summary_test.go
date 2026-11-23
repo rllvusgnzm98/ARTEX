@@ -115,8 +115,8 @@ func TestEffectiveSummaryKeepsNoDSN(t *testing.T) {
 	if port, _ := sum["db_port"].(uint16); port != 5432 {
 		t.Fatalf("db_port 该是 5432，实际 %v", sum["db_port"])
 	}
-	if tls, _ := sum["db_tls_enabled"].(bool); !tls {
-		t.Fatal("sslmode=require 该记成启用了 TLS")
+	if policy, _ := sum["db_tls_policy"].(string); policy != "required" {
+		t.Fatalf("sslmode=require 该记成 required，实际 %q", policy)
 	}
 	if set, _ := sum["db_password_set"].(bool); !set {
 		t.Fatal("该如实记下「配了口令」这一事实")
@@ -179,4 +179,67 @@ func TestConnectionIdentityUsesRealParser(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestTLSPolicyDistinguishesPreferFromRequire 覆盖评审指出的「明文被记成 TLS」：只记
+// 主连接有没有 TLS 会把 prefer 说得和 require 一样，而 prefer 允许明文回退——服务端只
+// 收明文时连接照样建立，快照却显示 TLS。实测 pgx 对 prefer 给「TLS 主连接 + 同主机明文
+// 回退」，对 require 不给任何明文回退，据此还原策略。
+func TestTLSPolicyDistinguishesPreferFromRequire(t *testing.T) {
+	for _, c := range []struct{ dsn, want string }{
+		{"postgres://u:pw@h:5432/db?sslmode=require", "required"},
+		{"postgres://u:pw@h:5432/db?sslmode=prefer", "preferred"},
+		{"postgres://u:pw@h:5432/db?sslmode=allow", "allowed"},
+		{"postgres://u:pw@h:5432/db?sslmode=disable", "disabled"},
+		{"host=h user=u dbname=d", "preferred"}, // libpq 默认即 prefer
+	} {
+		id := connectionIdentity(c.dsn)
+		if got, _ := id["db_tls_policy"].(string); got != c.want {
+			t.Fatalf("%s 该记成 %q，实际 %q", c.dsn, c.want, got)
+		}
+	}
+}
+
+// TestIdentityKeepsFailoverEndpoints 覆盖多主机 DSN：真正服务某一轮的可能是备用端点，
+// 只记第一个会让溯源指名错误的库。
+func TestIdentityKeepsFailoverEndpoints(t *testing.T) {
+	id := connectionIdentity("postgres://u:pw@h1:5432,h2:5433/db?sslmode=prefer")
+	eps, _ := id["db_endpoints"].([]string)
+	if len(eps) != 2 || eps[0] != "h1:5432" || eps[1] != "h2:5433" {
+		t.Fatalf("该记下全部候选端点并按 host:port 去重，实际 %v", eps)
+	}
+
+	// 单端点时不必冗余列出。
+	single := connectionIdentity("postgres://u:pw@h:5432/db?sslmode=prefer")
+	if _, ok := single["db_endpoints"]; ok {
+		t.Fatalf("只有一个端点时不该多记一份: %v", single["db_endpoints"])
+	}
+}
+
+// TestKeyPassphraseIsRecordedSeparately 覆盖证书认证 + 加密私钥：pgx 把 sslpassword
+// 消化进 TLS 配置、不留在登录口令里，单看 db_password_set 会显示「没配口令」。
+func TestKeyPassphraseIsRecordedSeparately(t *testing.T) {
+	for _, dsn := range []string{
+		"postgres://u@h:5432/db?sslmode=disable&sslpassword=KEYPASS",
+		"host=h user=u dbname=d sslpassword='KEY PASS'",
+	} {
+		id := connectionIdentity(dsn)
+		if set, _ := id["db_key_passphrase_set"].(bool); !set {
+			t.Fatalf("%s 该认出配了私钥口令: %v", dsn, id)
+		}
+		for k, v := range id {
+			if sv, ok := v.(string); ok && strings.Contains(sv, "KEY") {
+				t.Fatalf("键 %q 带出了私钥口令: %v", k, sv)
+			}
+		}
+	}
+
+	// 没配时不得误报。
+	id := connectionIdentity("postgres://u:pw@h:5432/db?sslmode=disable")
+	if set, _ := id["db_key_passphrase_set"].(bool); set {
+		t.Fatalf("没配 sslpassword 不该误报: %v", id)
+	}
+	if set, _ := id["db_password_set"].(bool); !set {
+		t.Fatalf("登录口令仍该被认出: %v", id)
+	}
 }
