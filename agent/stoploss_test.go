@@ -350,3 +350,122 @@ func TestDefaultPolicyTreatsTwentyMinutesAsCeiling(t *testing.T) {
 func jsonCmd(s string) ([]byte, []byte) {
 	return []byte(s), []byte(s)
 }
+
+func TestStopLossRemindsBeforeLatch(t *testing.T) {
+	// A write-back reminder appears one probe before the no_progress latch,
+	// blocking that probe and handing a message to the model — but it is not a
+	// stop-loss (verdict stays clear) and it fires only once per idle window.
+	mon := NewStopLossMonitor(tightPolicy()) // idle limit 2 → remind at 1
+	hooks := WrapStopLoss(nil, mon)
+	a, _ := jsonCmd(`{"command":"probe edge.example.test:443"}`)
+	hooks.PostToolUse(context.Background(), "Bash", a, []byte("ok"), false)
+	if mon.Fired() {
+		t.Fatal("one idle probe must not latch yet")
+	}
+	block, msg, _ := hooks.PreToolUse(context.Background(), "Bash", []byte(`{"command":"probe app.example.test:443"}`))
+	if !block || !strings.Contains(msg, StopLossWriteBackReminderPrefix) {
+		t.Fatalf("expected a write-back reminder before the latch, got block=%v msg=%q", block, msg)
+	}
+	if mon.Fired() {
+		t.Fatalf("the reminder must not be a stop-loss, got %+v", mon.Verdict())
+	}
+	// One-shot: the same idle window does not remind again.
+	block2, _, _ := hooks.PreToolUse(context.Background(), "Bash", []byte(`{"command":"probe other.example.test:443"}`))
+	if block2 {
+		t.Fatal("reminder must fire at most once per idle window")
+	}
+}
+
+func TestStopLossReminderDoesNotFireOnFreshWindow(t *testing.T) {
+	// With no idle probes yet, a probe must run untouched (no reminder).
+	mon := NewStopLossMonitor(DefaultStopLossPolicy())
+	hooks := WrapStopLoss(nil, mon)
+	block, _, _ := hooks.PreToolUse(context.Background(), "Bash", []byte(`{"command":"probe edge.example.test:443"}`))
+	if block {
+		t.Fatal("a fresh idle window must not trigger a write-back reminder")
+	}
+}
+
+func TestStopLossReminderResetsAfterWriteBack(t *testing.T) {
+	// A real write-back resets the idle window, so the reminder can fire again
+	// in the next window — and a worker that keeps writing never latches.
+	mon := NewStopLossMonitor(tightPolicy())
+	hooks := WrapStopLoss(nil, mon)
+	a, _ := jsonCmd(`{"command":"probe edge.example.test:443"}`)
+	hooks.PostToolUse(context.Background(), "Bash", a, []byte("ok"), false)
+	block, _, _ := hooks.PreToolUse(context.Background(), "Bash", []byte(`{"command":"probe app.example.test:443"}`))
+	if !block {
+		t.Fatal("expected first-window reminder")
+	}
+	// Worker heeds it and writes a fact: window resets, nudge flag clears.
+	hooks.PostToolUse(context.Background(), "record_fact", []byte(`{"summary":"edge reachable"}`), []byte(`{"id":1}`), false)
+	if mon.Fired() {
+		t.Fatalf("a write-back must not latch, got %+v", mon.Verdict())
+	}
+	b, _ := jsonCmd(`{"command":"probe app.example.test:443"}`)
+	hooks.PostToolUse(context.Background(), "Bash", b, []byte("ok"), false)
+	block2, msg2, _ := hooks.PreToolUse(context.Background(), "Bash", []byte(`{"command":"probe deep.example.test:443"}`))
+	if !block2 || !strings.Contains(msg2, StopLossWriteBackReminderPrefix) {
+		t.Fatalf("reminder must fire again in a fresh idle window, got block=%v", block2)
+	}
+}
+
+func TestStopLossReminderDoesNotAlterLatch(t *testing.T) {
+	// If the worker ignores the reminder and keeps probing with nothing new,
+	// no_progress still fires at exactly the idle limit — the reminder only
+	// inserted one blocked round, it did not move the threshold.
+	mon := NewStopLossMonitor(tightPolicy()) // limit 2
+	hooks := WrapStopLoss(nil, mon)
+	a, _ := jsonCmd(`{"command":"probe edge.example.test:443"}`)
+	hooks.PostToolUse(context.Background(), "Bash", a, []byte("ok"), false) // idle 1
+	block, _, _ := hooks.PreToolUse(context.Background(), "Bash", []byte(`{"command":"probe app.example.test:443"}`))
+	if !block {
+		t.Fatal("expected reminder at idle limit-1")
+	}
+	// Blocked call did not execute, so idle is still 1 and nothing latched.
+	if mon.Fired() {
+		t.Fatalf("blocked reminder must not latch, got %+v", mon.Verdict())
+	}
+	b, _ := jsonCmd(`{"command":"probe app.example.test:443"}`)
+	hooks.PostToolUse(context.Background(), "Bash", b, []byte("ok"), false) // idle 2 → latch
+	if !mon.Fired() || mon.Verdict().Kind != StopLossNoProgress {
+		t.Fatalf("no_progress must still fire at the idle limit, got %+v", mon.Verdict())
+	}
+	// Once latched, the reminder path yields to the stop-loss block.
+	_, msg, _ := hooks.PreToolUse(context.Background(), "Bash", []byte(`{"command":"probe x"}`))
+	if !strings.Contains(msg, StopLossMessagePrefix) {
+		t.Fatalf("after latch, a probe must get the stop-loss message, got %q", msg)
+	}
+}
+
+type pendingSteerHooks struct{ pending bool }
+
+func (h pendingSteerHooks) PreToolUse(context.Context, string, []byte) (bool, string, []byte) {
+	if h.pending {
+		return true, "steer", nil
+	}
+	return false, "", nil
+}
+func (pendingSteerHooks) PostToolUse(context.Context, string, []byte, []byte, bool) {}
+func (pendingSteerHooks) Stop(context.Context, []llm.Message) (bool, []string, string) {
+	return false, nil, ""
+}
+func (h pendingSteerHooks) SteerPending() bool { return h.pending }
+
+func TestStopLossReminderYieldsToPendingSteer(t *testing.T) {
+	// A queued operator correction wins over the write-back reminder, and the
+	// reminder stays available for the next call in the same window.
+	mon := NewStopLossMonitor(tightPolicy())
+	a, _ := jsonCmd(`{"command":"probe edge.example.test:443"}`)
+	steered := WrapStopLoss(pendingSteerHooks{pending: true}, mon)
+	steered.PostToolUse(context.Background(), "Bash", a, []byte("ok"), false)
+	block, msg, _ := steered.PreToolUse(context.Background(), "Bash", []byte(`{"command":"probe app.example.test:443"}`))
+	if !block || msg != "steer" {
+		t.Fatalf("expected the pending steer to be delivered, got block=%v msg=%q", block, msg)
+	}
+	plain := WrapStopLoss(pendingSteerHooks{}, mon)
+	block, msg, _ = plain.PreToolUse(context.Background(), "Bash", []byte(`{"command":"probe app.example.test:443"}`))
+	if !block || !strings.Contains(msg, StopLossWriteBackReminderPrefix) {
+		t.Fatalf("reminder must still fire after the steer is gone, got block=%v msg=%q", block, msg)
+	}
+}
