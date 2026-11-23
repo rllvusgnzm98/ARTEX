@@ -95,6 +95,11 @@ type Engine struct {
 	m        *Manager
 	debounce time.Duration
 
+	// retroHook, when set by the server, fires once per task when all goals are met
+	// (task 收官) so a structured retro can distill reusable TTP from the run.
+	retroHook  func(taskID string)
+	retroFired sync.Map // taskID -> true, so the retro fires at most once per task
+
 	bc *Broadcaster // live activity pub/sub (SSE)
 
 	started  sync.Map // taskID -> bool, so Run is idempotent per task
@@ -952,6 +957,12 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			// 下一轮 worker 循环撞终态门就不再领新意图;被取消的这批走下方"任务已完成"分支
 			// 归为 stopped(而非 blocked)。
 			e.cancelExec(t.ID, agent.AbortGoalMet)
+			// 结构化复盘:任务收官触发一次,蒸馏本次经验为待审 TTP(best-effort,异步)。
+			if e.retroHook != nil {
+				if _, fired := e.retroFired.LoadOrStore(t.ID, true); !fired {
+					e.retroHook(t.ID)
+				}
+			}
 		default:
 			log.Printf("[planner] task %s 规划完成", t.ID)
 		}
