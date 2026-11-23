@@ -107,7 +107,7 @@ func (s *Server) pollEmp3r0rAgents() {
 			_, known := rt.seen[a.Tag]
 			rt.mu.Unlock()
 			if !known {
-				s.registerEmp3r0rAgent(a)
+				s.registerEmp3r0rAgent(a, 0, 0)
 			} else {
 				s.reconcileEmp3r0rStatus(a.Tag)
 			}
@@ -186,18 +186,25 @@ func (s *Server) reconcileEmp3r0rStatus(tag string) {
 	log.Printf("[emp3r0r] agent %s 在线且探活通过但库内标 dead → 复活 session %d", tag, id)
 }
 
-// registerEmp3r0rAgent 把新上线 agent 落库（kind=emp3r0r）并注册进 Registry。
-// 重启竞态防重：库里已有同 tag 的 alive emp3r0r 行则收养（用既有 id），
-// 不再 Create 第二行；落库失败只记日志（下一轮还会再试）。
-func (s *Server) registerEmp3r0rAgent(a session.CCAgent) {
+// registerEmp3r0rAgent 把新上线 agent 落库（kind=emp3r0r）并注册进 Registry，
+// 是唯一登记入口（后台轮询与 deploy_emp3r0r 共用）。rt.mu 覆盖 seen 检查、
+// 既有行收养与 Create 全程——并发登记同一 tag 不会产生两条会话行。
+// 返回 session id；失败返回 0（下一轮轮询/调用会再试）。
+func (s *Server) registerEmp3r0rAgent(a session.CCAgent, taskID, intentID int64) int64 {
 	if s.sessStore == nil || s.sessReg == nil || s.emp3r0r == nil || s.emp3r0r.client == nil {
-		return
+		return 0
+	}
+	rt := s.emp3r0r
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if id, ok := rt.seen[a.Tag]; ok {
+		return id // 已登记（轮询或并发 deploy 抢先）
 	}
 	host := empHostLabel(a)
-	e, err := session.NewEmp3r0r(a.Tag, host, s.emp3r0r.client)
+	e, err := session.NewEmp3r0r(a.Tag, host, rt.client)
 	if err != nil {
 		log.Printf("[emp3r0r] agent %s 会话构造失败: %v", a.Tag, err)
-		return
+		return 0
 	}
 	// 收养既有行：initSessions 恢复与轮询竞态下 tag 可能已落库。
 	if recs, lerr := s.sessStore.List(s.ctx, db.SessionAlive); lerr == nil {
@@ -211,32 +218,49 @@ func (s *Server) registerEmp3r0rAgent(a session.CCAgent) {
 			}
 			e.SetID(rec.ID)
 			s.sessReg.Add(e)
-			s.emp3r0r.mu.Lock()
-			s.emp3r0r.seen[a.Tag] = rec.ID
-			s.emp3r0r.mu.Unlock()
+			rt.seen[a.Tag] = rec.ID
 			log.Printf("[emp3r0r] agent 上线收养既有会话：%s (%s) → session %d", a.Tag, host, rec.ID)
-			return
+			return rec.ID
 		}
 	}
 	secret, _ := json.Marshal(e.Secret())
 	rec := &db.SessionRecord{
-		Kind:   e.Kind(),
-		URL:    e.Secret().URL,
-		Secret: secret,
-		Status: db.SessionAlive,
+		Kind:            e.Kind(),
+		URL:             e.Secret().URL,
+		Secret:          secret,
+		Status:          db.SessionAlive,
+		CreatedByTask:   taskID,
+		CreatedByIntent: intentID,
 	}
 	id, err := s.sessStore.Create(s.ctx, rec)
 	if err != nil {
 		log.Printf("[emp3r0r] agent %s 落库失败: %v", a.Tag, err)
-		return
+		return 0
 	}
 	e.SetID(id)
 	s.sessReg.Add(e)
-	s.emp3r0r.mu.Lock()
-	s.emp3r0r.seen[a.Tag] = id
-	s.emp3r0r.mu.Unlock()
+	rt.seen[a.Tag] = id
 	log.Printf("[emp3r0r] agent 上线：%s (%s, %s/%s, user=%s) → session %d",
 		a.Tag, host, a.OS, a.GOOS, a.User, id)
+	return id
+}
+
+// emp3r0rAgentOnHost 校验 agent 归属：回连 agent 应与部署落点同主机。
+// 比对 hostname 与各接口 IP（大小写不敏感）；无匹配则不属于本次部署。
+func emp3r0rAgentOnHost(a session.CCAgent, host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return false
+	}
+	if strings.ToLower(strings.TrimSpace(a.Hostname)) == host {
+		return true
+	}
+	for _, ip := range a.IPs {
+		if strings.ToLower(strings.TrimSpace(ip)) == host {
+			return true
+		}
+	}
+	return false
 }
 
 // markEmp3r0rDead 把下线 agent 的会话标 dead 并从注册表移除。
@@ -337,6 +361,18 @@ func (s *Server) deployEmp3r0rTool() actool.CoreTool {
 			if err != nil {
 				return actool.Errorf(withRoEWarn(roeWarn, "agent 暂存投递失败："+err.Error())), nil
 			}
+			// 部署前快照：回连归属判定基线。若先启动再读基线，后台轮询可能
+			// 已登记本 agent（超时误报）；反过来其他新上线 agent 也不能归给本任务。
+			baseline := map[string]bool{}
+			preAgents, perr := s.emp3r0r.client.Agents(ctx)
+			if perr != nil {
+				return actool.Errorf(withRoEWarn(roeWarn, "部署前 cc 快照失败："+perr.Error())), nil
+			}
+			for _, ag := range preAgents {
+				if ag.Tag != "" {
+					baseline[ag.Tag] = true
+				}
+			}
 			drop := strings.TrimSpace(a.DropPath)
 			if drop == "" {
 				drop = session.WorkerTmpPrefix(ri.TaskID, ri.IntentID) +
@@ -355,17 +391,11 @@ func (s *Server) deployEmp3r0rTool() actool.CoreTool {
 					"投递启动未确认（哨兵未回显；可能 curl 失败/agent 立即退出）。目标侧输出："+
 						strings.TrimSpace(out))), nil
 			}
-			// 等回连：轮询 cc agent 列表，找新增 tag。
+			// 等回连：新增 tag + 主机归属（部署落点主机名/IP）双重校验后才认领。
 			wait := s.emp3r0r.cfg.AgentWait()
 			if a.WaitSeconds > 0 {
 				wait = time.Duration(a.WaitSeconds) * time.Second
 			}
-			baseline := map[string]bool{}
-			s.emp3r0r.mu.Lock()
-			for tag := range s.emp3r0r.seen {
-				baseline[tag] = true
-			}
-			s.emp3r0r.mu.Unlock()
 			deadline := time.Now().Add(wait)
 			for {
 				if time.Now().After(deadline) {
@@ -377,38 +407,19 @@ func (s *Server) deployEmp3r0rTool() actool.CoreTool {
 					return actool.Errorf(withRoEWarn(roeWarn, "cc 轮询失败："+aerr.Error())), nil
 				}
 				for _, ag := range agents {
-					if ag.Tag == "" || baseline[ag.Tag] {
+					if ag.Tag == "" || baseline[ag.Tag] || !emp3r0rAgentOnHost(ag, host) {
 						continue
 					}
-					// 新上线：registerEmp3r0rAgent 由轮询也会登记；这里直接登记拿 id。
-					host := empHostLabel(ag)
-					e, cerr := session.NewEmp3r0r(ag.Tag, host, s.emp3r0r.client)
-					if cerr != nil {
-						return actool.Errorf(withRoEWarn(roeWarn, "会话构造失败："+cerr.Error())), nil
+					// 统一登记入口：轮询并发先登记时收养其 id，不产生双行。
+					id := s.registerEmp3r0rAgent(ag, ri.TaskID, ri.IntentID)
+					if id == 0 {
+						return actool.Errorf(withRoEWarn(roeWarn, "会话登记失败（详见日志）")), nil
 					}
-					secret, _ := json.Marshal(e.Secret())
-					srec := &db.SessionRecord{
-						Kind:            e.Kind(),
-						URL:             e.Secret().URL,
-						Secret:          secret,
-						Status:          db.SessionAlive,
-						CreatedByTask:   ri.TaskID,
-						CreatedByIntent: ri.IntentID,
-					}
-					id, cerr := s.sessStore.Create(ctx, srec)
-					if cerr != nil {
-						return actool.Errorf(withRoEWarn(roeWarn, "会话落库失败："+cerr.Error())), nil
-					}
-					e.SetID(id)
-					s.sessReg.Add(e)
-					s.emp3r0r.mu.Lock()
-					s.emp3r0r.seen[ag.Tag] = id
-					s.emp3r0r.mu.Unlock()
 					res := map[string]any{
 						"session_id": id,
-						"kind":       e.Kind(),
+						"kind":       "emp3r0r",
 						"agent_tag":  ag.Tag,
-						"host":       host,
+						"host":       empHostLabel(ag),
 						"os":         ag.OS,
 						"user":       ag.User,
 						"has_root":   ag.HasRoot,

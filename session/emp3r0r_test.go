@@ -4,7 +4,10 @@ package session
 
 import (
 	"context"
+	"crypto/md5"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -30,9 +33,11 @@ type mockCC struct {
 	forgotten []string
 	jobDelay  time.Duration
 	failHTTP  bool // 整体返回 500（模拟 cc 故障）
+	failWrite bool // fileWrite 静默失败（模拟远端写入失败：哨兵缺失、文件未变）
 
 	upgrader websocket.Upgrader
 	tunConns chan *websocket.Conn
+	tunWrite sync.Mutex // 串行化 ws 写入（gorilla 不允许并发写）
 }
 
 func newMockCC(t *testing.T) (*mockCC, *CCClient) {
@@ -90,7 +95,9 @@ func (m *mockCC) handle(w http.ResponseWriter, r *http.Request) {
 				out := m.exec(*op.Command)
 				msg := CCOperatorMsg{JobID: *op.JobID, Response: []byte(out)}
 				b, _ := cbor.Marshal(msg)
+				m.tunWrite.Lock()
 				_ = conn.WriteMessage(websocket.BinaryMessage, b)
+				m.tunWrite.Unlock()
 				// 连接可复用：放回供后续命令。
 				select {
 				case m.tunConns <- conn:
@@ -139,10 +146,67 @@ func (m *mockCC) exec(cmd string) string {
 	case strings.HasPrefix(cmd, "dd if="):
 		return m.fileChunk(cmd)
 	case strings.Contains(cmd, "| base64 -d"):
-		return m.fileWrite(cmd)
+		m.mu.Lock()
+		fail := m.failWrite
+		m.mu.Unlock()
+		out, ok := "", false
+		if !fail {
+			out, ok = m.fileWrite(cmd)
+		}
+		// `&& echo <sent>` 尾哨兵：写入成功才回显；解码失败 = 远端命令失败。
+		if i := strings.LastIndex(cmd, "&& echo "); i >= 0 && ok {
+			return out + strings.TrimSpace(cmd[i+8:]) + "\n"
+		}
+		return out
+	case strings.HasPrefix(cmd, "sha256sum") || strings.HasPrefix(cmd, "md5sum"):
+		return m.fileHash(cmd)
+	case strings.Contains(cmd, "kill_tunnel"):
+		m.killTunnel()
+		return ""
 	default:
 		return ""
 	}
+}
+
+// killTunnel 关闭当前 msg_tunnel 服务端连接（模拟断线）。
+func (m *mockCC) killTunnel() {
+	for {
+		select {
+		case conn := <-m.tunConns:
+			_ = conn.Close()
+		default:
+			return
+		}
+	}
+}
+
+func (m *mockCC) fileHash(cmd string) string {
+	// sha256sum 'p' || md5sum 'p'
+	algo := "sha256"
+	p := strings.TrimPrefix(cmd, "sha256sum ")
+	if strings.HasPrefix(cmd, "md5sum") {
+		algo = "md5"
+		p = strings.TrimPrefix(cmd, "md5sum ")
+	}
+	if i := strings.Index(p, "||"); i >= 0 {
+		p = strings.TrimSpace(p[:i])
+	}
+	if i := strings.Index(p, "2>/"); i >= 0 {
+		p = strings.TrimSpace(p[:i])
+	}
+	p = strings.Trim(p, "'")
+	mockFiles.Lock()
+	defer mockFiles.Unlock()
+	data, ok := mockFiles.files[p]
+	if !ok {
+		return ""
+	}
+	if algo == "md5" {
+		sum := md5.Sum(data)
+		return fmt.Sprintf("%s  %s\n", hex.EncodeToString(sum[:]), p)
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%s  %s\n", hex.EncodeToString(sum[:]), p)
 }
 
 // 简单 in-memory 目标文件表（path → bytes），供 write/read 链路断言。
@@ -181,18 +245,18 @@ func (m *mockCC) fileChunk(cmd string) string {
 	return string(data[off:end])
 }
 
-func (m *mockCC) fileWrite(cmd string) string {
+func (m *mockCC) fileWrite(cmd string) (string, bool) {
 	// printf '%s' '<b64>' | base64 -d (>|>>) 'path'
 	// 按 ' 切分： [ "printf ", "%s", " ", "<b64>", " | base64 -d > ", "<path>" ]
 	parts := strings.Split(cmd, "'")
 	if len(parts) < 6 {
-		return ""
+		return "", false
 	}
 	b64, path := parts[3], parts[5]
 	appendMode := strings.Contains(parts[4], ">>")
 	raw, err := base64Decode(b64)
 	if err != nil {
-		return ""
+		return "", false
 	}
 	mockFiles.Lock()
 	defer mockFiles.Unlock()
@@ -201,7 +265,7 @@ func (m *mockCC) fileWrite(cmd string) string {
 	} else {
 		mockFiles.files[path] = raw
 	}
-	return ""
+	return "", true
 }
 
 func base64Decode(s string) ([]byte, error) {
@@ -351,5 +415,208 @@ func TestEmp3r0rNewRequiresTagAndClient(t *testing.T) {
 	}
 	if _, err := NewEmp3r0r("t", "h", nil); err == nil {
 		t.Fatal("nil client 应报错")
+	}
+}
+
+// waitTunnelDead 等读循环把当前连接判死（tunAlive=false）。
+func waitTunnelDead(t *testing.T, cc *CCClient) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		cc.tunMu.Lock()
+		dead := !cc.tunAlive
+		cc.tunMu.Unlock()
+		if dead {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("断线未被读循环判死")
+}
+
+// TestEmp3r0rTunnelReconnect 断线后重连：旧连接滞留 job 判死，新命令走新连接。
+func TestEmp3r0rTunnelReconnect(t *testing.T) {
+	m, cc := newMockCC(t)
+	e, _ := NewEmp3r0r("tag-1", "10.0.0.5", cc)
+	if _, _, err := e.Exec(context.Background(), "echo first", 10*time.Second); err != nil {
+		t.Fatalf("首次 Exec: %v", err)
+	}
+	m.killTunnel()
+	waitTunnelDead(t, cc)
+	// 断线后新命令经重连通道照常回结果。
+	out, _, err := e.Exec(context.Background(), "echo second", 10*time.Second)
+	if err != nil {
+		t.Fatalf("重连后 Exec: %v", err)
+	}
+	if !strings.Contains(out, "second") {
+		t.Fatalf("out=%q", out)
+	}
+}
+
+// TestEmp3r0rTunnelDeadJobKilled 断线时滞留 job 收到断线语义而非无限等。
+func TestEmp3r0rTunnelDeadJobKilled(t *testing.T) {
+	m, cc := newMockCC(t)
+	m.jobDelay = 3 * time.Second // 结果慢于断线
+	e, _ := NewEmp3r0r("tag-1", "10.0.0.5", cc)
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := e.Exec(context.Background(), "echo slow", 30*time.Second)
+		done <- err
+	}()
+	// 等 send_command 发出后断线。
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		m.mu.Lock()
+		n := len(m.commands)
+		m.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	m.killTunnel()
+	waitTunnelDead(t, cc)
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("滞留 job 应上报断线错误")
+		}
+		if !strings.Contains(err.Error(), "msg_tunnel") && !strings.Contains(err.Error(), "断线") {
+			t.Fatalf("错误应说明回流通道断线: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("滞留 job 未被及时判死")
+	}
+}
+
+// TestEmp3r0rOldLoopDoesNotKillNewJobs 旧读循环退出不得清掉新连接的 job：
+// conn1 死 → conn2 重连 → 新命令在其上挂 job → conn1 的清理不得误杀。
+func TestEmp3r0rOldLoopDoesNotKillNewJobs(t *testing.T) {
+	m, cc := newMockCC(t)
+	e, _ := NewEmp3r0r("tag-1", "10.0.0.5", cc)
+	if _, _, err := e.Exec(context.Background(), "echo warm", 10*time.Second); err != nil {
+		t.Fatalf("warm Exec: %v", err)
+	}
+	m.killTunnel()
+	waitTunnelDead(t, cc)
+	out, _, err := e.Exec(context.Background(), "echo fresh", 10*time.Second)
+	if err != nil {
+		t.Fatalf("重连 Exec: %v", err)
+	}
+	if !strings.Contains(out, "fresh") {
+		t.Fatalf("out=%q", out)
+	}
+}
+
+// TestEmp3r0rConcurrentSend 并发 SendCommand/ensureTunnel 竞态（-race 下验证）。
+func TestEmp3r0rConcurrentSend(t *testing.T) {
+	_, cc := newMockCC(t)
+	e, _ := NewEmp3r0r("tag-1", "10.0.0.5", cc)
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, _, err := e.Exec(context.Background(),
+				fmt.Sprintf("echo c%d", i), 15*time.Second)
+			errs <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("并发 Exec: %v", err)
+		}
+	}
+}
+
+// TestEmp3r0rWgDialConcurrent 并发首次拨号竞态：wgOnce 一次性拉起，
+// 坏配置下并发调用都拿到同一错误且不改写共享拨号器（-race）。
+func TestEmp3r0rWgDialConcurrent(t *testing.T) {
+	cc, err := NewCCClient(Emp3r0rConfig{Endpoint: "127.0.0.1:1", ServerIP: "172.16.254.1"})
+	if err != nil {
+		t.Fatalf("NewCCClient: %v", err)
+	}
+	defer cc.Close()
+	var wg sync.WaitGroup
+	errs := make(chan error, 16)
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, derr := cc.dial(context.Background(), "tcp", "172.16.254.1:13378")
+			errs <- derr
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	var first error
+	for err := range errs {
+		if err == nil {
+			t.Fatal("缺 WG 凭据应报错")
+		}
+		if first == nil {
+			first = err
+		} else if err.Error() != first.Error() {
+			t.Fatalf("并发拨号错误不一致: %v vs %v", first, err)
+		}
+	}
+}
+
+// TestEmp3r0rWriteFileChunkVerified 分块写入每块哨兵确认 + sha256 内容校验。
+func TestEmp3r0rWriteFileChunkVerified(t *testing.T) {
+	mockFiles.Lock()
+	mockFiles.files = map[string][]byte{}
+	mockFiles.Unlock()
+
+	m, cc := newMockCC(t)
+	e, _ := NewEmp3r0r("tag-1", "10.0.0.5", cc)
+	payload := make([]byte, empWriteChunk+7) // 跨块
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	path := "/tmp/artex_emp_chunk.bin"
+	if err := e.WriteFile(context.Background(), path, payload); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	m.mu.Lock()
+	cmds := append([]string(nil), m.commands...)
+	m.mu.Unlock()
+	sents := 0
+	for _, c := range cmds {
+		if strings.Contains(c, "&& echo ARTEX_W_") {
+			sents++
+		}
+	}
+	if sents != 2 {
+		t.Fatalf("应为每块一条哨兵命令（2 块），实 %d", sents)
+	}
+	mockFiles.Lock()
+	got := mockFiles.files[path]
+	mockFiles.Unlock()
+	if len(got) != len(payload) || string(got) != string(payload) {
+		t.Fatalf("写入内容不一致: %d vs %d", len(got), len(payload))
+	}
+}
+
+// TestEmp3r0rWriteFileFailedChunk 远端命令失败（哨兵缺失）必须报错而非只看大小。
+func TestEmp3r0rWriteFileFailedChunk(t *testing.T) {
+	mockFiles.Lock()
+	// 预置等长旧文件：若只校验大小会误判成功。
+	old := []byte("ARTEX-emp3r0r-payload-\x00\x01\x02-binary-safe")
+	mockFiles.files = map[string][]byte{"/tmp/artex_emp_stale.bin": old}
+	mockFiles.Unlock()
+
+	m, cc := newMockCC(t)
+	// 破坏写入：让 fileWrite 路径静默失败（注入非法 b64 不可行——直接拦截 mock）。
+	m.mu.Lock()
+	m.failWrite = true
+	m.mu.Unlock()
+	e, _ := NewEmp3r0r("tag-1", "10.0.0.5", cc)
+	err := e.WriteFile(context.Background(), "/tmp/artex_emp_stale.bin", []byte("new-content-same-length-0123456789ab"))
+	if err == nil {
+		t.Fatal("远端写入失败必须报错（等长旧文件不得判成功）")
 	}
 }

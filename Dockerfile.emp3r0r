@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1
+# emp3r0r cc sidecar 镜像（server 模式最小集）。
+#
+# 上游 release 不发布预编译二进制（release-please 只发 tag），故从 pinned tag
+# 源码构建。server 运行自检要求 $EMP3R0R_PREFIX/lib/emp3r0r/emp3r0r-cat 存在
+# （cmd/cat），构建两件套即可：cmd/cc（emp3r0r 主程序）+ cmd/cat。
+# EMP3R0R_VERSION 锁 tag；EMP3R0R_COMMIT 非空时校验 HEAD commit（可选完整性钉）。
+FROM golang:1.26-bookworm AS build
+ARG EMP3R0R_VERSION=v5.12.0
+ARG EMP3R0R_COMMIT=
+ARG EMP3R0R_REPO=https://github.com/jm33-m0/emp3r0r.git
+RUN set -eux; \
+    git clone --depth 1 --branch "${EMP3R0R_VERSION}" "${EMP3R0R_REPO}" /src; \
+    if [ -n "${EMP3R0R_COMMIT}" ]; then \
+        test "$(git -C /src rev-parse HEAD)" = "${EMP3R0R_COMMIT}"; \
+    fi; \
+    cd /src/core; \
+    CGO_ENABLED=0 go build -o /out/emp3r0r ./cmd/cc; \
+    CGO_ENABLED=0 go build -o /out/emp3r0r-cat ./cmd/cat
+
+FROM alpine:3.20
+# server 自检：$PREFIX/lib/emp3r0r/ 与 emp3r0r-cat 必须存在；build/ 为 stub 目录。
+RUN mkdir -p /usr/local/lib/emp3r0r/build /root/.emp3r0r
+COPY --from=build /out/emp3r0r /usr/local/bin/emp3r0r
+COPY --from=build /out/emp3r0r-cat /usr/local/lib/emp3r0r/emp3r0r-cat
+ENTRYPOINT ["emp3r0r"]
