@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/Autumn-27/artex/agent"
@@ -129,49 +130,37 @@ func TestLateSupplyFailureDoesNotRefreezeReplacedChain(t *testing.T) {
 	}
 }
 
-func TestStaleSupplyRollbackKeepsReplacementChainFreeze(t *testing.T) {
+func TestStaleSupplyFailuresAfterReplacementLeaveTaskUnfrozen(t *testing.T) {
 	t.Cleanup(releaseAllTaskSupply)
-	t.Cleanup(func() { afterSupplyHoldSwap = nil })
-	task := &Task{ID: "task-rollback", LLMChainRevision: 4}
-	afterSupplyHoldSwap = func() {
-		afterSupplyHoldSwap = nil
-		// Operator replaces the chain, then a worker on the new chain freezes.
-		task.llmMu.Lock()
-		task.LLMChainRevision = 5
-		task.llmMu.Unlock()
-		releaseTaskSupply(task.ID)
-		if !applySupplyHoldAt(task, 5) {
-			t.Error("current-revision failure did not freeze")
+	for round := 0; round < 200; round++ {
+		task := &Task{ID: "task-race", LLMChainRevision: 4}
+		var wg sync.WaitGroup
+		replaced := make(chan struct{})
+		for i := 0; i < 4; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				applySupplyHoldAt(task, 4)
+			}()
 		}
-	}
-	if applySupplyHoldAt(task, 4) {
-		t.Fatal("stale failure froze the replaced chain")
-	}
-	if !taskSupplyFrozen(task) {
-		t.Fatal("stale rollback cleared the replacement chain's freeze")
-	}
-}
-
-func TestTwoStaleSupplyFailuresDoNotRefreezeReplacedChain(t *testing.T) {
-	t.Cleanup(releaseAllTaskSupply)
-	t.Cleanup(func() { afterSupplyHoldSwap = nil })
-	task := &Task{ID: "task-two-stale", LLMChainRevision: 4}
-	afterSupplyHoldSwap = func() {
-		// Second stale worker swaps in after the first, then the chain is replaced.
-		afterSupplyHoldSwap = func() {
-			afterSupplyHoldSwap = nil
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			task.llmMu.Lock()
 			task.LLMChainRevision = 5
 			task.llmMu.Unlock()
+			releaseTaskSupply(task.ID)
+			close(replaced)
+		}()
+		<-replaced
+		wg.Wait()
+		// Every stale hold either preceded the release or saw revision 5.
+		if taskSupplyFrozen(task) {
+			t.Fatalf("round %d: stale failure refroze the replaced chain", round)
 		}
-		if applySupplyHoldAt(task, 4) {
-			t.Error("second stale failure froze the replaced chain")
+		if !applySupplyHoldAt(task, 5) || !taskSupplyFrozen(task) {
+			t.Fatalf("round %d: current-revision failure did not freeze", round)
 		}
-	}
-	if applySupplyHoldAt(task, 4) {
-		t.Fatal("first stale failure froze the replaced chain")
-	}
-	if taskSupplyFrozen(task) {
-		t.Fatal("stale holds left the replacement chain frozen")
+		releaseTaskSupply(task.ID)
 	}
 }

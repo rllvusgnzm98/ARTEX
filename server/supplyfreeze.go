@@ -12,23 +12,27 @@ import (
 // persisted LLMFailoverState of "chain_exhausted" is frozen even after a
 // restart; this map covers the no-explicit-chain path (global / single
 // profile) until an operator resets health or edits the chain.
-var supplyHolds sync.Map // taskID -> *supplyHold
+var supplyHolds sync.Map // taskID -> struct{}
 
-// supplyHold is a distinct token per hold, so a rollback removes only its own.
-// revision is the chain revision it was set for (0 = unknown).
-type supplyHold struct{ revision int64 }
+// supplyMu orders a revision-checked hold against the release a chain
+// replacement issues after publishing its new revision.
+var supplyMu sync.Mutex
 
 func holdTaskSupply(taskID string) {
 	if taskID == "" {
 		return
 	}
-	supplyHolds.Store(taskID, &supplyHold{})
+	supplyMu.Lock()
+	defer supplyMu.Unlock()
+	supplyHolds.Store(taskID, struct{}{})
 }
 
 func releaseTaskSupply(taskID string) {
 	if taskID == "" {
 		return
 	}
+	supplyMu.Lock()
+	defer supplyMu.Unlock()
 	supplyHolds.Delete(taskID)
 }
 
@@ -67,32 +71,18 @@ func applySupplyHold(t *Task) {
 
 // applySupplyHoldAt freezes dispatch for a supply failure observed at chain
 // revision (0 = unknown). A chain replaced since then already released the
-// hold, so a late failure must not restore it; the re-check after holding
-// closes the race with a concurrent replacement.
-var afterSupplyHoldSwap func() // test hook
-
+// hold, so a late failure must not restore it. Replacement publishes the new
+// revision before releaseTaskSupply, so checking under supplyMu is enough.
 func applySupplyHoldAt(t *Task, revision int64) bool {
-	if t == nil {
+	if t == nil || t.ID == "" {
 		return false
 	}
-	replaced := func() bool { return revision > 0 && t.llmStateSnapshot().ChainRevision > revision }
-	if replaced() {
+	supplyMu.Lock()
+	defer supplyMu.Unlock()
+	if revision > 0 && t.llmStateSnapshot().ChainRevision > revision {
 		return false
 	}
-	own := &supplyHold{revision: revision}
-	prev, held := supplyHolds.Swap(t.ID, own)
-	if afterSupplyHoldSwap != nil {
-		afterSupplyHoldSwap()
-	}
-	if replaced() {
-		cur := t.llmStateSnapshot().ChainRevision
-		if p, ok := prev.(*supplyHold); held && ok && (p.revision == 0 || p.revision >= cur) {
-			supplyHolds.CompareAndSwap(t.ID, own, prev)
-		} else {
-			supplyHolds.CompareAndDelete(t.ID, own)
-		}
-		return false
-	}
+	supplyHolds.Store(t.ID, struct{}{})
 	return true
 }
 
