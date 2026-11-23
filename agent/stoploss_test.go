@@ -437,3 +437,35 @@ func TestStopLossReminderDoesNotAlterLatch(t *testing.T) {
 		t.Fatalf("after latch, a probe must get the stop-loss message, got %q", msg)
 	}
 }
+
+type pendingSteerHooks struct{ pending bool }
+
+func (h pendingSteerHooks) PreToolUse(context.Context, string, []byte) (bool, string, []byte) {
+	if h.pending {
+		return true, "steer", nil
+	}
+	return false, "", nil
+}
+func (pendingSteerHooks) PostToolUse(context.Context, string, []byte, []byte, bool) {}
+func (pendingSteerHooks) Stop(context.Context, []llm.Message) (bool, []string, string) {
+	return false, nil, ""
+}
+func (h pendingSteerHooks) SteerPending() bool { return h.pending }
+
+func TestStopLossReminderYieldsToPendingSteer(t *testing.T) {
+	// A queued operator correction wins over the write-back reminder, and the
+	// reminder stays available for the next call in the same window.
+	mon := NewStopLossMonitor(tightPolicy())
+	a, _ := jsonCmd(`{"command":"probe edge.example.test:443"}`)
+	steered := WrapStopLoss(pendingSteerHooks{pending: true}, mon)
+	steered.PostToolUse(context.Background(), "Bash", a, []byte("ok"), false)
+	block, msg, _ := steered.PreToolUse(context.Background(), "Bash", []byte(`{"command":"probe app.example.test:443"}`))
+	if !block || msg != "steer" {
+		t.Fatalf("expected the pending steer to be delivered, got block=%v msg=%q", block, msg)
+	}
+	plain := WrapStopLoss(pendingSteerHooks{}, mon)
+	block, msg, _ = plain.PreToolUse(context.Background(), "Bash", []byte(`{"command":"probe app.example.test:443"}`))
+	if !block || !strings.Contains(msg, StopLossWriteBackReminderPrefix) {
+		t.Fatalf("reminder must still fire after the steer is gone, got block=%v msg=%q", block, msg)
+	}
+}

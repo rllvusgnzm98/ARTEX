@@ -467,6 +467,18 @@ func (m *StopLossMonitor) RemindWriteBack(name string) (string, bool) {
 	return StopLossWriteBackReminderPrefix + writeBackReminderBody, true
 }
 
+// SteerPender is implemented by an inner HookRunner that can hold a queued
+// operator course-correction. The write-back reminder yields to it, so the
+// correction is delivered on this call instead of being shadowed.
+type SteerPender interface {
+	SteerPending() bool
+}
+
+func steerPending(inner harness.HookRunner) bool {
+	p, ok := inner.(SteerPender)
+	return ok && p.SteerPending()
+}
+
 // stopLossHooks wraps an inner HookRunner and enforces stop-loss in the
 // harness (PreToolUse blocks further probes; Stop prevents continuation).
 type stopLossHooks struct {
@@ -502,8 +514,10 @@ func (h stopLossHooks) PreToolUse(ctx context.Context, name string, input []byte
 		default:
 			return true, verdict.Message(), nil
 		}
-	} else if msg, ok := h.mon.RemindWriteBack(name); ok {
-		return true, msg, nil
+	} else if !steerPending(h.inner) {
+		if msg, ok := h.mon.RemindWriteBack(name); ok {
+			return true, msg, nil
+		}
 	}
 	if h.inner != nil {
 		return h.inner.PreToolUse(ctx, name, input)

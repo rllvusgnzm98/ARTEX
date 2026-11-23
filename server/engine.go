@@ -561,6 +561,13 @@ func (e *Engine) SteerWork(intentID int64, msg string) error {
 	return nil
 }
 
+// hasSteer reports whether intentID has a queued steering message, without popping it.
+func (e *Engine) hasSteer(intentID int64) bool {
+	e.steerMu.Lock()
+	defer e.steerMu.Unlock()
+	return len(e.steerBox[intentID]) > 0
+}
+
 // drainSteer pops the oldest queued steering message for intentID (FIFO), if any.
 func (e *Engine) drainSteer(intentID int64) (string, bool) {
 	e.steerMu.Lock()
@@ -586,6 +593,8 @@ func (e *Engine) drainSteer(intentID int64) (string, bool) {
 type steerHooks struct {
 	inner harness.HookRunner
 	drain func() (string, bool)
+	// pending 只查看是否有排队的纠偏、不出队；止损写回提醒据此让路。
+	pending func() bool
 	// nudges 是本条意图已注入的空转续跑次数，上限 limit。指针:harness 持有的是
 	// steerHooks 的值拷贝，计数必须共享同一份。
 	nudges *atomic.Int64
@@ -639,6 +648,11 @@ func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (
 		return h.inner.PreToolUse(ctx, name, input)
 	}
 	return false, "", nil
+}
+
+// SteerPending implements agent.SteerPender.
+func (h steerHooks) SteerPending() bool {
+	return h.pending != nil && h.pending()
 }
 
 func (h steerHooks) PostToolUse(ctx context.Context, name string, input, result []byte, isErr bool) {
@@ -1123,11 +1137,12 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// 重跑一轮不该把额度清零重来。
 	loss := agent.NewStopLossMonitor(agent.DefaultStopLossPolicy())
 	hooks := agent.WrapStopLoss(steerHooks{
-		inner:  t.Guard.Hooks(),
-		drain:  func() (string, bool) { return e.drainSteer(iid) },
-		nudges: &atomic.Int64{},
-		limit:  e.emptyTurnNudgeLimit(),
-		label:  label,
+		inner:   t.Guard.Hooks(),
+		drain:   func() (string, bool) { return e.drainSteer(iid) },
+		pending: func() bool { return e.hasSteer(iid) },
+		nudges:  &atomic.Int64{},
+		limit:   e.emptyTurnNudgeLimit(),
+		label:   label,
 	}, loss)
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)
