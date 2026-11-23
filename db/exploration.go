@@ -877,6 +877,18 @@ func (s *ExplorationStore) CountByKind(kind string) (int, error) {
 	return s.countByKindFiltered(kind, "")
 }
 
+// CountWorkerFacts counts this exploration's facts excluding the task-root origin
+// fact (kind='fact', state='origin', seeded at task creation). That leaves the
+// facts workers actually produced, which is what the planner's probe boundary
+// keys off: once any worker fact exists the planner must plan from the graph
+// instead of probing the target itself.
+func (s *ExplorationStore) CountWorkerFacts() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM exploration_nodes
+WHERE exploration_id=$1 AND kind=$2 AND state<>'origin'`, s.expID, KindFact).Scan(&n)
+	return n, err
+}
+
 func (s *ExplorationStore) RunningIntents() ([]*Node, error) {
 	rows, err := s.db.Query(`SELECT `+nodeCols+` FROM exploration_nodes
 WHERE exploration_id=$1 AND kind='intent' AND state='running' ORDER BY id DESC`, s.expID)
