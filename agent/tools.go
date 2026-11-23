@@ -147,6 +147,7 @@ type WriteCounts struct {
 	Facts    int
 	Assets   int
 	Findings int
+	Failures int
 }
 
 // Total is every node persisted this run, regardless of kind — the
@@ -1355,6 +1356,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			recorded, err = t.ts.RecordFinding(ctx, input)
 		}
 		if err != nil {
+			t.writes.Failures++
 			return actool.Errorf(err.Error()), nil
 		}
 		if t.notifyFinding != nil {
@@ -1450,10 +1452,13 @@ func (t *ToolSet) recordOneFactCtx(ctx context.Context, it factItem, defaultInte
 	// a fact is its OWN node kind (distinct from a vuln finding).
 	id, err := t.ts.AddNodeCtx(ctx, db.KindFact, payload, 5, "confirmed", t.worker, pidList(it.AssetIDs))
 	if err != nil {
+		t.writes.Failures++
 		return 0, err
 	}
 	if intent > 0 {
-		_ = t.ts.LinkCtx(ctx, intent, db.RelYields, id) // chain: intent -> fact
+		if err := t.ts.LinkCtx(ctx, intent, db.RelYields, id); err != nil {
+			t.writes.Failures++
+		}
 	}
 	t.writes.Facts++
 	return id, nil

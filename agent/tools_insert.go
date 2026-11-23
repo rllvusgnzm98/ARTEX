@@ -348,6 +348,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 				}
 
 				if err != nil {
+					t.writes.Failures++
 					errs = append(errs, errEntry{Index: i, Error: err.Error()})
 					continue
 				}
@@ -364,7 +365,9 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 					if t.ownerNode > 0 {
 						summary = fmt.Sprintf("Worker 意图 #%d 通过 insert_assets 登记", t.ownerNode)
 					}
-					_ = t.as.SetTaskAssetSourceCtx(ctx, taskID, id, "agent", summary, sourceNodeID)
+					if err := t.as.SetTaskAssetSourceCtx(ctx, taskID, id, "agent", summary, sourceNodeID); err != nil {
+						t.writes.Failures++
+					}
 				}
 				// 自动入测试范围(source='auto')：只对 worker 顶层显式插入的这一项，按其
 				// 类型加保守范围；side-effect 派生的资产不经此处，故范围不盲目扩大。taskID=0 时无操作。
@@ -375,7 +378,9 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 					if svcIP == "" {
 						svcIP = item.IP
 					}
-					_ = t.as.AddAutoScopeCtx(ctx, taskID, typ, item.Domain, item.URL, svcIP)
+					if err := t.as.AddAutoScopeCtx(ctx, taskID, typ, item.Domain, item.URL, svcIP); err != nil {
+						t.writes.Failures++
+					}
 				}
 			}
 
