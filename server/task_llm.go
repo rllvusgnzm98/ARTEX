@@ -388,7 +388,7 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 			// profileID=0 means the explicit chain was cleared while this stable task
 			// bundle was still in use. Agent/global fallback errors follow the legacy
 			// behavior and never mutate task failover state.
-			if (committed && agent.ModelRetriesStopped(ctx)) || selection.profileID == 0 || !isQuotaExhaustedError(streamErr) {
+			if selection.profileID == 0 || !isQuotaExhaustedError(streamErr) {
 				for _, buffered := range pending {
 					if !yield(buffered, nil) {
 						return
@@ -413,7 +413,7 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 			if transition.Advanced && !transition.Stale && hooks.transition != nil {
 				hooks.transition(selection, transition, streamErr)
 			}
-			if !committed && agent.ModelRetriesStopped(ctx) {
+			if agent.ModelRetriesStopped(ctx) {
 				for _, buffered := range pending {
 					if !yield(buffered, nil) {
 						return
