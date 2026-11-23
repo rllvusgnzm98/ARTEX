@@ -590,7 +590,7 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 		if err != nil {
 			return out, err
 		}
-		res, err := tx.Exec(`DELETE FROM activity WHERE exploration_id=$1 AND node_id=$2`, s.expID, iid)
+		res, err := tx.Exec(`DELETE FROM activity WHERE exploration_id=$1 AND node_id=$2 AND kind IS DISTINCT FROM 'termination'`, s.expID, iid)
 		if err != nil {
 			return out, err
 		}
@@ -1303,8 +1303,13 @@ func (s *ExplorationStore) AppendActivityCtx(ctx context.Context, a Activity) (i
 	err := s.db.QueryRowContext(ctx, `
 INSERT INTO activity(exploration_id, node_id, worker, kind, tool, tool_use_id, is_error, summary, detail, metadata, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, main_seg)
 VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),$7,NULLIF($8,''),NULLIF($9,''),$10,$11,$12,$13,$14,$15)
+ON CONFLICT (exploration_id, (metadata->>'run_id')) WHERE kind='termination' DO NOTHING
 RETURNING id`, s.expID, a.NodeID, utf8Clean(a.Worker), utf8Clean(a.Kind), utf8Clean(a.Tool), utf8Clean(a.ToolUseID), a.IsError, utf8Clean(a.Summary), utf8Clean(a.Detail),
 		metadata, a.InputTokens, a.OutputTokens, a.CacheReadTokens, a.CacheWriteTokens, a.MainSeg).Scan(&id)
+	if err == sql.ErrNoRows && a.Kind == "termination" {
+		err = s.db.QueryRowContext(ctx, `SELECT id FROM activity WHERE exploration_id=$1 AND kind='termination'
+AND metadata->>'run_id' = $2::jsonb->>'run_id'`, s.expID, metadata).Scan(&id)
+	}
 	return id, err
 }
 

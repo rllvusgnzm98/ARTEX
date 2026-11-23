@@ -4,13 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
@@ -58,7 +61,7 @@ func TestDetachedWorkCompletionReportsOnce(t *testing.T) {
 }
 
 func TestEnginePostStopLossRecordsOneTermination(t *testing.T) {
-	for _, mode := range []string{"denied", "cancelled"} {
+	for _, mode := range []string{"denied", "cancelled", "link_timeout", "retry_writes"} {
 		t.Run(mode, func(t *testing.T) {
 			pg := openTestPG(t)
 			row, err := pg.CreateTask("stop-loss fixture", "", nil, 0, 0)
@@ -71,6 +74,26 @@ func TestEnginePostStopLossRecordsOneTermination(t *testing.T) {
 				}
 			})
 			store := pg.Exploration(row.ExplorationID)
+			if mode == "link_timeout" || mode == "retry_writes" {
+				dsn, _, err := db.DSN()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if parsed, err := url.Parse(dsn); err == nil && parsed.Scheme != "" {
+					q := parsed.Query()
+					q.Set("lock_timeout", "300ms")
+					parsed.RawQuery = q.Encode()
+					dsn = parsed.String()
+				} else {
+					dsn += " lock_timeout=300ms"
+				}
+				writer, err := db.Open(dsn)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer writer.Close()
+				store = writer.Exploration(row.ExplorationID)
+			}
 			iid, err := store.AddIntent(map[string]any{"summary": "local fixture"}, 0, nil, "test")
 			if err != nil {
 				t.Fatal(err)
@@ -86,14 +109,55 @@ func TestEnginePostStopLossRecordsOneTermination(t *testing.T) {
 			defer cancel()
 			dir := t.TempDir()
 			fixture, blocked := filepath.Join(dir, "fixture.txt"), filepath.Join(dir, "blocked.txt")
+			lock, err := pg.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lock.Rollback()
+			if mode == "link_timeout" {
+				if _, err := lock.Exec("LOCK TABLE exploration_edges IN EXCLUSIVE MODE"); err != nil {
+					t.Fatal(err)
+				}
+			}
 			calls := 0
 			provider := retestProvider{complete: func(ctx context.Context, _ llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
 				calls++
+				if mode == "retry_writes" {
+					switch calls {
+					case 1, 2, 4:
+						if calls == 2 {
+							if _, err := lock.ExecContext(ctx, "LOCK TABLE exploration_edges IN EXCLUSIVE MODE"); err != nil {
+								t.Errorf("lock exploration_edges: %v", err)
+								return llm.Message{}, "", llm.Usage{}, err
+							}
+						}
+						input, _ := json.Marshal(map[string]any{"summary": "checkpoint", "intent_id": iid})
+						return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
+							{Type: llm.BlockToolUse, ID: strconv.Itoa(calls), Name: "record_fact", Input: input},
+						}}, "tool_use", llm.Usage{}, nil
+					case 3:
+						if err := lock.Rollback(); err != nil {
+							t.Errorf("unlock exploration_edges: %v", err)
+						}
+						return llm.Message{}, "", llm.Usage{}, errors.New("fixture transient model failure")
+					default:
+						return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("done")}}, "end_turn", llm.Usage{}, nil
+					}
+				}
 				path := fixture
 				if calls > 2 {
 					if mode == "cancelled" {
 						cancel()
 						return llm.Message{}, "", llm.Usage{}, ctx.Err()
+					}
+					if mode == "link_timeout" {
+						if calls > 3 {
+							return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("done")}}, "end_turn", llm.Usage{}, nil
+						}
+						input, _ := json.Marshal(map[string]any{"summary": "checkpoint", "intent_id": iid})
+						return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
+							{Type: llm.BlockToolUse, ID: "fact", Name: "record_fact", Input: input},
+						}}, "tool_use", llm.Usage{}, nil
 					}
 					path = blocked
 				}
@@ -108,8 +172,10 @@ func TestEnginePostStopLossRecordsOneTermination(t *testing.T) {
 			task := &Task{ID: strconv.FormatInt(row.ID, 10), ExpID: row.ExplorationID, Guard: guard.New(), Store: store}
 			engine := NewEngine(&Manager{})
 			engine.runIntent(ctx, task, "test", worker, intent, "", "")
-			if _, err := os.Stat(fixture); err != nil {
-				t.Fatalf("trigger fixture was not executed: %v", err)
+			if mode != "retry_writes" {
+				if _, err := os.Stat(fixture); err != nil {
+					t.Fatalf("trigger fixture was not executed: %v", err)
+				}
 			}
 			if _, err := os.Stat(blocked); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("post-latch operation was not blocked: %v", err)
@@ -120,26 +186,67 @@ func TestEnginePostStopLossRecordsOneTermination(t *testing.T) {
 				t.Fatal(err)
 			}
 			wantClass, wantCalls := "stop_loss", 5
+			wantKind := "repeated_command"
+			wantWrites := agent.WriteCounts{}
 			if mode == "cancelled" {
 				wantClass, wantCalls = "cancelled", 3
 			}
+			if mode == "link_timeout" {
+				wantClass, wantCalls = "persistence_failed", 4
+				wantWrites.Failures = 1
+				triggers := task.drainTriggers()
+				if len(triggers) != 1 || triggers[0].Kind != "done" || triggers[0].IntentID != iid {
+					t.Fatalf("NotifyDone triggers=%+v", triggers)
+				}
+			}
+			if mode == "retry_writes" {
+				wantClass, wantKind = "persistence_failed", ""
+				wantWrites = agent.WriteCounts{Facts: 2, Failures: 1}
+			}
 			terminations := 0
+			toolOutcomes := 0
+			var audit db.Activity
 			for _, a := range rows {
+				if a.Kind == "tool_result" && strings.Contains(string(a.Metadata), "policy_blocked") {
+					if a.IsError {
+						t.Fatal("stored policy denial is an error")
+					}
+					toolOutcomes++
+				}
+				if mode == "link_timeout" && a.Kind == "tool_result" && a.Tool == "record_fact" {
+					if !a.IsError || !strings.Contains(string(a.Metadata), "tool_error") || !strings.Contains(a.Summary, "link fact to intent") || !strings.Contains(a.Summary, "55P03") {
+						t.Fatalf("record_fact did not report the link timeout: %+v", a)
+					}
+					toolOutcomes++
+				}
 				if a.Kind != "termination" {
 					continue
 				}
+				audit = a
 				terminations++
 				var terminal struct {
-					Class string `json:"outcome_class"`
-					RunID string `json:"run_id"`
-					Kind  string `json:"stop_loss_kind"`
+					Class  string            `json:"outcome_class"`
+					RunID  string            `json:"run_id"`
+					Kind   string            `json:"stop_loss_kind"`
+					Writes agent.WriteCounts `json:"evidence_counts"`
 				}
-				if err := json.Unmarshal(a.Metadata, &terminal); err != nil || terminal.Class != wantClass || terminal.RunID == "" || terminal.Kind != "repeated_command" {
+				if err := json.Unmarshal(a.Metadata, &terminal); err != nil || terminal.Class != wantClass || terminal.RunID == "" || terminal.Kind != wantKind || terminal.Writes != wantWrites {
 					t.Fatalf("termination metadata = %s, error = %v", a.Metadata, err)
 				}
 			}
 			if terminations != 1 || calls != wantCalls {
 				t.Fatalf("persisted terminations=%d, calls=%d; want 1 termination and %d calls", terminations, calls, wantCalls)
+			}
+			if mode == "denied" && toolOutcomes != 3 || mode == "link_timeout" && toolOutcomes != 1 {
+				t.Fatalf("persisted tool outcomes=%d", toolOutcomes)
+			}
+			if mode == "cancelled" {
+				if _, err := store.CancelIntent(iid); err != nil {
+					t.Fatal(err)
+				}
+				if id, err := store.AppendActivity(audit); err != nil || id != audit.ID {
+					t.Fatalf("hard cancellation or retry lost the original audit record: got id=%d err=%v want id=%d", id, err, audit.ID)
+				}
 			}
 		})
 	}

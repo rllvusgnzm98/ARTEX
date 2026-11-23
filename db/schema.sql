@@ -331,6 +331,8 @@ ALTER TABLE activity ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{
 ALTER TABLE activity ADD COLUMN IF NOT EXISTS main_seg INTEGER;
 CREATE INDEX IF NOT EXISTS idx_act_node  ON activity(exploration_id, node_id, id);
 CREATE INDEX IF NOT EXISTS idx_act_since ON activity(exploration_id, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_act_termination_run ON activity(exploration_id, (metadata->>'run_id'))
+  WHERE kind='termination';
 CREATE INDEX IF NOT EXISTS idx_act_tool_call ON activity(exploration_id, tool_use_id, id)
   WHERE kind IN ('tool_use', 'tool_result');
 -- Main/Plan history pages filter by worker (both carry NULL node_id, so idx_act_node
