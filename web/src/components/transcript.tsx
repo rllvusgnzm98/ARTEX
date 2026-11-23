@@ -373,17 +373,18 @@ function ToolBlock({
   const toolName = use?.tool || result?.tool || "工具";
   const ToolIcon = toolName === "Bash" ? Terminal : Wrench;
   const running = !result;
-  const ok = !!result && !result.is_error;
-  const statusTone = running
+  const blocked = result?.metadata?.outcome_class === "policy_blocked";
+  const failed = result?.metadata?.outcome_class === "tool_error" || (!blocked && !!result?.is_error);
+  const statusTone = running || blocked
     ? "text-muted-foreground"
-    : ok
+    : !failed
       ? "text-emerald-600 dark:text-emerald-400"
       : "text-red-600 dark:text-red-400";
   const rawCmd =
     use && use.summary.startsWith(toolName) ? use.summary.slice(toolName.length).trimStart() : (use?.summary ?? "");
   const cmd = toolInputText(toolName, rawCmd);
   // status only — the full result lives behind the expand (【输出】), not previewed inline
-  const statusText = running ? "执行中…" : ok ? "✓" : "✕ 失败";
+  const statusText = running ? "执行中…" : blocked ? "已拦截" : failed ? "✕ 失败" : "✓";
 
   // key over the seqs we'd load; changes when the result (or command) arrives.
   const detailKey = `${use?.seq ?? ""}:${result?.seq ?? ""}`;
@@ -392,7 +393,7 @@ function ToolBlock({
     let live = true;
     const segs: { label: string; seq: number }[] = [];
     if (use) segs.push({ label: "命令", seq: use.seq });
-    if (result) segs.push({ label: "输出" + (result.is_error ? " ✕" : " ✓"), seq: result.seq });
+    if (result) segs.push({ label: "输出" + (blocked ? "（已拦截）" : failed ? " ✕" : " ✓"), seq: result.seq });
     void Promise.all(
       segs.map((x) =>
         getDetail(x.seq)
@@ -411,7 +412,7 @@ function ToolBlock({
     return () => {
       live = false;
     };
-  }, [open, detailKey, use, result, getDetail, toolName]);
+  }, [open, detailKey, use, result, getDetail, toolName, blocked, failed]);
 
   const scrolledRef = React.useRef(false);
   React.useEffect(() => {
