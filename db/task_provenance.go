@@ -6,6 +6,11 @@ import (
 	"errors"
 )
 
+// LegacyUnknownBuild 标记「升级前就已经跑过、build 已无从考证」的任务（见 schema.sql
+// 的回填）。它与空串的区别是：空串表示任务还没真正跑过，之后第一次跑时应当如实盖章；
+// 这个哨兵表示任务跑过但证据缺失，必须一直上报「构建未知」，绝不被当前 build 回填。
+const LegacyUnknownBuild = "legacy-unknown"
+
 // TaskProvenance 是一次任务运行的溯源证据：当时真正在跑的二进制版本，以及脱敏后的
 // 有效配置快照。
 type TaskProvenance struct {
@@ -55,7 +60,7 @@ func (d *DB) TaskProvenance(id int64) (TaskProvenance, error) {
 	if err != nil {
 		return TaskProvenance{}, err
 	}
-	out := TaskProvenance{BuildVersion: version, Recorded: version != ""}
+	out := TaskProvenance{BuildVersion: version, Recorded: version != "" && version != LegacyUnknownBuild}
 	if len(raw) > 0 {
 		_ = json.Unmarshal(raw, &out.Runtime)
 	}

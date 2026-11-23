@@ -586,6 +586,12 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
 -- 旧任务没有这些证据，保持空值（接口上报「构建未知」），绝不回填为当前版本。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS build_version TEXT NOT NULL DEFAULT '';
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS runtime_provenance JSONB NOT NULL DEFAULT '{}';
+-- 旧库回填：升级前就已经跑过的任务，其 build 已无从考证。若留空，StampRunProvenance
+-- 的「build_version 为空才写」会把升级后的新 build 当成它的第一次运行，把旧证据归因到
+-- 新版本；因此显式标记为「跑过但版本未知」，接口照旧上报「构建未知」，且不再被回填。
+-- 只认已经跑过的任务：status 仍是 created 且没盖过 first_run_at 的任务确实还没跑过。
+UPDATE tasks SET build_version = 'legacy-unknown'
+ WHERE build_version = '' AND (first_run_at IS NOT NULL OR status <> 'created');
 CREATE INDEX IF NOT EXISTS idx_tasks_category ON tasks(category_id, created_at DESC)
     WHERE deleted_at IS NULL AND category_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_pinned ON tasks(pinned_at DESC)
