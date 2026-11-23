@@ -21,6 +21,95 @@ func budgetToolMessage(name string) llm.Message {
 	return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{Type: llm.BlockToolUse, ID: "budget-write", Name: name, Input: json.RawMessage(`{"summary":"settlement evidence","confidence":"observed"}`)}}}
 }
 
+func TestWorkerPostStopLossBound(t *testing.T) {
+	for _, mode := range []string{"denied_stream", "denied_complete", "record_fact_loop", "hard_deadline", "parent_deadline", "cancel"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if mode == "parent_deadline" {
+				var cancelParent context.CancelFunc
+				ctx, cancelParent = context.WithTimeout(ctx, 200*time.Millisecond)
+				defer cancelParent()
+			}
+			duration := 3 * time.Second
+			if mode == "hard_deadline" {
+				duration = 200 * time.Millisecond
+			}
+			ctx, work := withRunBudget(ctx, time.Now(), duration, duration/4)
+			policy := tightPolicy()
+			policy.IdleProbeLimit = 1
+			loss := NewStopLossMonitor(policy)
+			probes, facts, calls, blocked, results := 0, 0, 0, 0, 0
+			mockTool := func(name string, runs *int) actool.CoreTool {
+				return actool.Build(actool.Spec{Name: name, Schema: obj(map[string]any{}), RawInput: true,
+					Run: func(context.Context, json.RawMessage, *actool.ToolContext) (actool.Result, error) {
+						*runs++
+						return actool.Text("fixture"), nil
+					}})
+			}
+			fake := budgetFakeProvider{complete: func(call context.Context, _ llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+				calls++
+				if calls == 1 {
+					msg := budgetToolMessage("Bash")
+					msg.Content[0].Input = json.RawMessage(`{"command":"fixture"}`)
+					return msg, "tool_use", llm.Usage{}, nil
+				}
+				switch mode {
+				case "hard_deadline", "parent_deadline", "cancel":
+					if mode == "cancel" {
+						cancel()
+					}
+					<-call.Done()
+					return llm.Message{}, "", llm.Usage{}, call.Err()
+				case "record_fact_loop":
+					return budgetToolMessage("record_fact"), "tool_use", llm.Usage{}, nil
+				default:
+					return budgetToolMessage("Bash"), "tool_use", llm.Usage{}, nil
+				}
+			}}
+			opts := agentcore.Options{Provider: &runBudgetProvider{inner: fake, loss: loss}, Hooks: WrapStopLoss(nil, loss),
+				Tools:          []actool.CoreTool{mockTool("Bash", &probes), mockTool("record_fact", &facts)},
+				PermissionMode: permission.ModeBypass, NonStreaming: mode != "denied_stream", MaxDuration: work, DisableBackgroundTasks: true}
+			session := agentcore.NewSession(opts)
+			defer session.Close()
+			start := time.Now()
+			reason, err := captureWorkerSession(ctx, session, "fixture", func(a db.Activity) {
+				if a.Kind == "result" {
+					results++
+				}
+				if a.Kind == "tool_result" && strings.Contains(string(a.Metadata), "policy_blocked") {
+					blocked++
+				}
+			})
+			if !loss.Fired() || probes != 1 || results != 1 {
+				t.Fatalf("verdict=%v probes=%d results=%d reason=%s err=%v", loss.Verdict(), probes, results, reason, err)
+			}
+			switch mode {
+			case "hard_deadline":
+				if !isRunBudgetError(err) || reason != harness.ReasonTimeout || calls != 2 || time.Since(start) > time.Second {
+					t.Fatalf("hard deadline: reason=%s calls=%d elapsed=%s err=%v", reason, calls, time.Since(start), err)
+				}
+			case "parent_deadline":
+				if !errors.Is(err, context.DeadlineExceeded) || isRunBudgetError(err) || calls != 2 || time.Since(start) > time.Second {
+					t.Fatalf("parent deadline: calls=%d elapsed=%s err=%v", calls, time.Since(start), err)
+				}
+			case "cancel":
+				if !errors.Is(err, context.Canceled) || calls != 2 || time.Since(start) > time.Second {
+					t.Fatalf("cancel: calls=%d elapsed=%s err=%v", calls, time.Since(start), err)
+				}
+			default:
+				wantFacts, wantBlocked := 0, maxPostStopLossTurns
+				if mode == "record_fact_loop" {
+					wantFacts, wantBlocked = maxPostStopLossTurns, 0
+				}
+				if err != nil || reason != harness.ReasonStopHookPrevented || calls != 1+maxPostStopLossTurns || facts != wantFacts || blocked != wantBlocked {
+					t.Fatalf("reason=%s calls=%d facts=%d blocked=%d err=%v", reason, calls, facts, blocked, err)
+				}
+			}
+		})
+	}
+}
+
 func TestWorkerRecoverySettlement(t *testing.T) {
 	for _, mode := range []string{"work", "work_stream", "hard", "call_timeout", "zero", "short", "unlimited", "cancel", "no_transcript", "turn_cap", "recovery_error"} {
 		t.Run(mode, func(t *testing.T) {
