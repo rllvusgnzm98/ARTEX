@@ -217,8 +217,9 @@ func (d Database) buildDSN() string {
 	return u.String()
 }
 
-// keywordSecret 匹配 libpq 风格键值串里的口令键（长短优先），值可加引号。
-var keywordSecret = regexp.MustCompile(`(?i)(^|[\s])((?:password|passwd|pwd|pass)=)('[^']*'|"[^"]*"|[^\s]+)`)
+// keywordSecret 匹配 libpq 风格键值串里的口令键（长短优先，sslpassword 在前以免被
+// password 吃掉），`=` 两侧允许空白，值可加引号（含转义引号）。
+var keywordSecret = regexp.MustCompile(`(?i)(^|[\s])((?:sslpassword|password|passwd|pwd|pass)\s*=\s*)('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|[^\s]+)`)
 
 func redactKeywordSecrets(s string) string {
 	return keywordSecret.ReplaceAllString(s, "${1}${2}****")
@@ -244,7 +245,7 @@ func Redact(dsn string) string {
 		masked := false
 		for k, vs := range q {
 			switch strings.ToLower(k) {
-			case "password", "passwd", "pwd", "pass":
+			case "password", "passwd", "pwd", "pass", "sslpassword":
 				for i := range vs {
 					if vs[i] != "" {
 						vs[i] = "****"
@@ -259,6 +260,97 @@ func Redact(dsn string) string {
 		}
 	}
 	return redactKeywordSecrets(u.String())
+}
+
+// dsnSecretValues 取出 DSN 里真正的口令值：URL userinfo、URL 查询串、libpq 键值三种形态。
+// 按值抹除才治得了第三方诊断——pgx 的解析错误会把整条 DSN 原样嵌进 message，而它只打码
+// userinfo 与 libpq 键值，查询串里的 password/sslpassword 一概留原文。
+func dsnSecretValues(dsn string) []string {
+	var out []string
+	add := func(v string) {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	if u, err := url.Parse(dsn); err == nil && u.Scheme != "" {
+		if u.User != nil {
+			if pw, ok := u.User.Password(); ok {
+				add(pw)
+			}
+		}
+		for k, vs := range u.Query() {
+			switch strings.ToLower(k) {
+			case "password", "passwd", "pwd", "pass", "sslpassword":
+				for _, v := range vs {
+					add(v)
+				}
+			}
+		}
+	}
+	for _, m := range keywordSecret.FindAllStringSubmatch(dsn, -1) {
+		v := m[3]
+		if len(v) >= 2 && (v[0] == '\'' || v[0] == '"') && v[len(v)-1] == v[0] {
+			v = v[1 : len(v)-1]
+		}
+		add(v)
+	}
+	return out
+}
+
+// ScrubSecrets 把 dsn 里的口令值从任意诊断文本中抹掉（含 URL 转义形态）。给要把底层
+// 错误往日志/接口/落库送的调用方用：Redact 只管「打码一条 DSN」，这个管「别让口令搭着
+// 别人的错误信息漏出去」。
+func ScrubSecrets(dsn, s string) string {
+	if s == "" {
+		return s
+	}
+	for _, secret := range dsnSecretValues(dsn) {
+		s = strings.ReplaceAll(s, secret, "****")
+		if esc := url.QueryEscape(secret); esc != secret {
+			s = strings.ReplaceAll(s, esc, "****")
+		}
+	}
+	return s
+}
+
+// connectionIdentity 从 DSN 里只取「连的是哪台库」这类非机密身份字段。做运行溯源时记
+// 这些，而不是记一整条（几乎完整的）DSN——后者只要有一处打码遗漏就是凭据泄漏。
+func connectionIdentity(dsn string) map[string]any {
+	out := map[string]any{}
+	put := func(k, v string) {
+		if v = strings.TrimSpace(v); v != "" {
+			out[k] = v
+		}
+	}
+	if u, err := url.Parse(dsn); err == nil && u.Scheme != "" {
+		put("db_host", u.Hostname())
+		put("db_port", u.Port())
+		put("db_name", strings.TrimPrefix(u.Path, "/"))
+		if u.User != nil {
+			put("db_user", u.User.Username())
+		}
+		put("db_sslmode", u.Query().Get("sslmode"))
+		return out
+	}
+	for _, field := range strings.Fields(dsn) {
+		k, v, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(k)) {
+		case "host":
+			put("db_host", v)
+		case "port":
+			put("db_port", v)
+		case "dbname":
+			put("db_name", v)
+		case "user":
+			put("db_user", v)
+		case "sslmode":
+			put("db_sslmode", v)
+		}
+	}
+	return out
 }
 
 // CallbackAddr resolves the platform callback address:
@@ -487,12 +579,17 @@ func EffectiveSummary() map[string]any {
 		// gate 的最终判定要读库里的 settings（见 ResolveGate），进程层面没有「生效值」，
 		// 所以这里如实记为配置值而不是冒充生效值。
 		"gate_mode_configured": Load().GateMode,
-		"db_dsn_set":           strings.TrimSpace(dsn) != "",
-		"db_dsn_source":        source,
-		"db_dsn_redacted":      Redact(dsn),
+		// 只记「连的是哪台库」这类非机密身份字段，不记 DSN 本身：一条（即便打过码的）
+		// DSN 几乎就是完整凭据，任何一处遗漏都会随溯源落库并从 stats 读出去。
+		"db_dsn_set":    strings.TrimSpace(dsn) != "",
+		"db_dsn_source": source,
 	}
+	for k, v := range connectionIdentity(dsn) {
+		out[k] = v
+	}
+	out["db_password_set"] = len(dsnSecretValues(dsn)) > 0
 	if err != nil {
-		out["db_dsn_error"] = err.Error()
+		out["db_dsn_error"] = ScrubSecrets(dsn, err.Error())
 	}
 	return out
 }

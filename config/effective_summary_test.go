@@ -19,12 +19,10 @@ func TestEffectiveSummaryUsesEffectiveValuesAndRedacts(t *testing.T) {
 	if src, _ := sum["db_dsn_source"].(string); !strings.Contains(src, "ARTEX_PG_DSN") {
 		t.Fatalf("该如实记下生效来源，实际 %q", src)
 	}
-	red, _ := sum["db_dsn_redacted"].(string)
-	if strings.Contains(red, secret) {
-		t.Fatal("脱敏 DSN 里出现了口令原文")
-	}
-	if !strings.Contains(red, "db.internal") {
-		t.Fatalf("脱敏后仍该看得出连的是哪台库，实际 %q", red)
+	// DSN 串本身已不再落库（见 TestEffectiveSummaryKeepsNoDSN）；这里只校验「连的是
+	// 哪台库」仍能从身份白名单里看出来。
+	if host, _ := sum["db_host"].(string); host != "db.internal" {
+		t.Fatalf("仍该看得出连的是哪台库，实际 %q", host)
 	}
 
 	// 整个摘要里不得出现口令原文（任何键）。
@@ -65,5 +63,57 @@ func TestRedactMasksQueryStringPassword(t *testing.T) {
 func TestEffectiveSummaryOmitsHostPace(t *testing.T) {
 	if _, ok := EffectiveSummary()["host_pace_rps"]; ok {
 		t.Fatal("config 摘要不该带 host_pace_rps（那只会是启动默认值）")
+	}
+}
+
+// TestScrubSecretsCoversPgxDiagnostics 覆盖评审第 1 条确认的泄漏：pgx 的解析错误会把
+// 整条 DSN 嵌进 message，而它只打码 URL userinfo 与 libpq 键值，查询串里的 password /
+// sslpassword 一概留原文。按值抹除必须把这些形态都盖住。
+func TestScrubSecretsCoversPgxDiagnostics(t *testing.T) {
+	cases := []struct{ name, dsn, secret string }{
+		{"查询串口令", "postgres://artex@h:5432/artex?password=QS-PW&sslmode=bogus", "QS-PW"},
+		{"sslpassword", "postgres://artex@h:5432/artex?sslpassword=SSL-PW&sslmode=bogus", "SSL-PW"},
+		{"userinfo", "postgres://artex:UI-PW@h:5432/artex?sslmode=bogus", "UI-PW"},
+		{"键值带空格", "host=h user=artex password = KV-PW sslmode=bogus", "KV-PW"},
+		{"键值引号转义", `host=h user=artex password='KV\'QPW' sslmode=bogus`, `KV\'QPW`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// 模拟 pgx 的原文诊断（实测形如 cannot parse `<整条 DSN>`: ...）。
+			diag := "cannot parse `" + c.dsn + "`: failed to configure TLS (sslmode is invalid)"
+			got := ScrubSecrets(c.dsn, diag)
+			if strings.Contains(got, c.secret) {
+				t.Fatalf("诊断文本里仍有口令原文:\n  %s", got)
+			}
+			if !strings.Contains(got, "sslmode is invalid") {
+				t.Fatalf("诊断信息本身不该被抹掉: %s", got)
+			}
+		})
+	}
+}
+
+// TestEffectiveSummaryKeepsNoDSN 确认落库的是连接身份白名单，而不是一条（几乎完整的）DSN。
+func TestEffectiveSummaryKeepsNoDSN(t *testing.T) {
+	t.Setenv("ARTEX_PG_DSN", "postgres://artex:PW-NOPE@db.internal:5432/artexdb?sslmode=require")
+	sum := EffectiveSummary()
+
+	if _, ok := sum["db_dsn_redacted"]; ok {
+		t.Fatal("不该再落 DSN 串（打码与否都不该）")
+	}
+	for k, v := range sum {
+		if s, ok := v.(string); ok && strings.Contains(s, "PW-NOPE") {
+			t.Fatalf("键 %q 泄露了口令", k)
+		}
+	}
+	for _, want := range []struct{ k, v string }{
+		{"db_host", "db.internal"}, {"db_port", "5432"},
+		{"db_name", "artexdb"}, {"db_user", "artex"}, {"db_sslmode", "require"},
+	} {
+		if got, _ := sum[want.k].(string); got != want.v {
+			t.Fatalf("身份字段 %s 该是 %q，实际 %q", want.k, want.v, got)
+		}
+	}
+	if set, _ := sum["db_password_set"].(bool); !set {
+		t.Fatal("该如实记下「配了口令」这一事实")
 	}
 }
