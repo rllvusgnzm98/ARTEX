@@ -5,6 +5,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -318,39 +319,78 @@ func ScrubSecrets(dsn, s string) string {
 // sslPasswordSet 判断是否配了客户端私钥口令（sslpassword）。pgx 把它消化进 TLS 配置，
 // 不会留在 ConnConfig.Password 里，所以证书认证 + 加密私钥的部署单看登录口令会显示
 // 「没配口令」。
+//
+// 空值不算配了（`sslpassword=”` 是显式留空），环境变量 PGSSLPASSWORD 同样算。libpq 的
+// service 文件（PGSERVICE/pg_service.conf）里的 sslpassword 这里认不出来——要认得重写
+// 一遍 libpq 的 service 解析，不值当；那种部署会少记这一个布尔，但不会记错别的字段。
 func sslPasswordSet(dsn string) bool {
+	if strings.TrimSpace(os.Getenv("PGSSLPASSWORD")) != "" {
+		return true
+	}
 	if u, err := url.Parse(dsn); err == nil && u.Scheme != "" {
 		return strings.TrimSpace(u.Query().Get("sslpassword")) != ""
 	}
 	for _, m := range keywordSecret.FindAllStringSubmatch(dsn, -1) {
-		if strings.EqualFold(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(m[2]), "=")), "sslpassword") {
+		key := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(m[2]), "="))
+		if !strings.EqualFold(key, "sslpassword") {
+			continue
+		}
+		if strings.TrimSpace(unquoteDSNValue(m[3])) != "" {
 			return true
 		}
 	}
 	return false
 }
 
+// unquoteDSNValue 去掉 libpq 键值串里成对的引号。
+func unquoteDSNValue(v string) string {
+	if len(v) >= 2 && (v[0] == '\'' || v[0] == '"') && v[len(v)-1] == v[0] {
+		return v[1 : len(v)-1]
+	}
+	return v
+}
+
+// isSocketHost 判断候选端点是不是 Unix 域套接字（libpq 以 "/" 开头的路径表示）。
+func isSocketHost(host string) bool { return strings.HasPrefix(host, "/") }
+
 // tlsPolicy 把 pgx 解析后的连接意图还原成一句话。只记「主连接有没有 TLS」会把 prefer
 // 说成和 require 一样，而 prefer 允许明文回退——实测 pgx 对 prefer 给的是「主连接带
 // TLS + 同主机明文回退」，对 require 则没有任何明文回退。两者的安全含义完全不同，快照
 // 必须分得开（libpq 默认即 prefer，keyword DSN 不写 sslmode 时也落在这里）。
+//
+// 只看 TCP 候选：Unix 域套接字上本来就不做 TLS，实测 `host=/var/run/postgresql,h2
+// sslmode=require` 会给出「socket 主连接(无 TLS) + h2 带 TLS」，把 socket 当成明文回退
+// 就会记成 allowed，而实际上每一次 TCP 尝试都强制 TLS。
 func tlsPolicy(cfg *pgconn.Config) string {
-	plaintextFallback, tlsFallback := false, false
+	var tcpTLS []bool
+	if !isSocketHost(cfg.Host) {
+		tcpTLS = append(tcpTLS, cfg.TLSConfig != nil)
+	}
 	for _, f := range cfg.Fallbacks {
-		if f.TLSConfig == nil {
-			plaintextFallback = true
+		if !isSocketHost(f.Host) {
+			tcpTLS = append(tcpTLS, f.TLSConfig != nil)
+		}
+	}
+	if len(tcpTLS) == 0 {
+		return "socket" // 只走 Unix 套接字，谈不上 TLS 策略
+	}
+	withTLS, plaintext := false, false
+	for _, hasTLS := range tcpTLS {
+		if hasTLS {
+			withTLS = true
 		} else {
-			tlsFallback = true
+			plaintext = true
 		}
 	}
-	if cfg.TLSConfig != nil {
-		if plaintextFallback {
-			return "preferred" // 先试 TLS，服务端不支持就明文（sslmode=prefer）
-		}
+	switch {
+	case withTLS && !plaintext:
 		return "required"
-	}
-	if tlsFallback {
-		return "allowed" // 先试明文，再试 TLS（sslmode=allow）
+	case withTLS && plaintext:
+		// 顺序即语义：TLS 候选在前是 prefer，明文在前是 allow。
+		if tcpTLS[0] {
+			return "preferred"
+		}
+		return "allowed"
 	}
 	return "disabled"
 }
@@ -365,7 +405,9 @@ func connectionEndpoints(cfg *pgconn.Config) []string {
 		if host == "" {
 			return
 		}
-		ep := fmt.Sprintf("%s:%d", host, port)
+		// JoinHostPort 而不是 "%s:%d"：IPv6 字面量必须带方括号，否则 net.SplitHostPort
+		// 一类的解析器会直接拒绝，运维拿它复核连通性都用不了。
+		ep := net.JoinHostPort(host, strconv.Itoa(int(port)))
 		if _, dup := seen[ep]; dup {
 			return
 		}

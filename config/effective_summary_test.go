@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net"
 	"strings"
 	"testing"
 )
@@ -241,5 +242,69 @@ func TestKeyPassphraseIsRecordedSeparately(t *testing.T) {
 	}
 	if set, _ := id["db_password_set"].(bool); !set {
 		t.Fatalf("登录口令仍该被认出: %v", id)
+	}
+}
+
+// TestKeyPassphraseEdgeCases 覆盖评审指出的两处误判：显式留空的 sslpassword 不算配了，
+// 而 PGSSLPASSWORD 环境变量算（libpq service 文件里的认不出来，见函数注释）。
+func TestKeyPassphraseEdgeCases(t *testing.T) {
+	for _, dsn := range []string{
+		"host=h user=u sslpassword=''",
+		`host=h user=u sslpassword=""`,
+		"postgres://u@h:5432/db?sslpassword=&sslmode=disable",
+	} {
+		if sslPasswordSet(dsn) {
+			t.Fatalf("显式留空不该算配了私钥口令: %s", dsn)
+		}
+	}
+
+	t.Run("环境变量", func(t *testing.T) {
+		t.Setenv("PGSSLPASSWORD", "ENVKEYPASS")
+		if !sslPasswordSet("host=h user=u dbname=d") {
+			t.Fatal("PGSSLPASSWORD 里的私钥口令该被认出")
+		}
+		id := connectionIdentity("host=h user=u dbname=d")
+		if set, _ := id["db_key_passphrase_set"].(bool); !set {
+			t.Fatalf("身份快照该如实记下: %v", id)
+		}
+		for k, v := range id {
+			if sv, ok := v.(string); ok && strings.Contains(sv, "ENVKEYPASS") {
+				t.Fatalf("键 %q 带出了私钥口令", k)
+			}
+		}
+	})
+}
+
+// TestTLSPolicyIgnoresSocketCandidates 覆盖混合 socket/TCP 部署：Unix 套接字上本来就不
+// 做 TLS，把它当成明文回退会把「每次 TCP 尝试都强制 TLS」记成 allowed。
+func TestTLSPolicyIgnoresSocketCandidates(t *testing.T) {
+	for _, c := range []struct{ dsn, want string }{
+		{"host=/var/run/postgresql,h2 user=u dbname=d sslmode=require", "required"},
+		{"host=/var/run/postgresql,h2 user=u dbname=d sslmode=prefer", "preferred"},
+		{"host=/var/run/postgresql user=u dbname=d sslmode=require", "socket"},
+		{"host=h2 user=u dbname=d sslmode=require", "required"},
+	} {
+		id := connectionIdentity(c.dsn)
+		if got, _ := id["db_tls_policy"].(string); got != c.want {
+			t.Fatalf("%s 该记成 %q，实际 %q", c.dsn, c.want, got)
+		}
+	}
+}
+
+// TestEndpointsAreReusable 确认端点串可被标准解析器再解析：IPv6 必须带方括号。
+func TestEndpointsAreReusable(t *testing.T) {
+	id := connectionIdentity("host=::1,2001:db8::2 port=5432,5433 user=u dbname=d sslmode=disable")
+	eps, _ := id["db_endpoints"].([]string)
+	if len(eps) < 2 {
+		t.Skipf("该 DSN 形态未产生多端点（pgx 行为），跳过: %v", id)
+	}
+	for _, ep := range eps {
+		host, port, err := net.SplitHostPort(ep)
+		if err != nil {
+			t.Fatalf("端点 %q 无法被 SplitHostPort 解析: %v", ep, err)
+		}
+		if host == "" || port == "" {
+			t.Fatalf("端点 %q 解析出空字段", ep)
+		}
 	}
 }
