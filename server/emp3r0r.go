@@ -318,13 +318,16 @@ func (s *Server) deployEmp3r0rTool() actool.CoreTool {
 			}
 			// RoE：部署目标 = via 会话目标主机（同 tunnel_deploy 等级）。
 			rec, rerr := s.sessStore.Get(ctx, a.SessionID)
-			var roeWarn string
-			if rerr == nil && rec != nil {
-				warn, roeErr := s.roeCheckHost(ctx, hostFromURL(rec.URL), "emp3r0r agent 部署目标")
-				if roeErr != nil {
-					return actool.Errorf(roeErr.Error()), nil
-				}
-				roeWarn = warn
+			if rerr != nil || rec == nil || rec.Status != db.SessionAlive {
+				return actool.Errorf("RoE scope check: session record unavailable; deployment denied"), nil
+			}
+			host := hostFromURL(rec.URL)
+			if strings.TrimSpace(host) == "" {
+				return actool.Errorf("RoE scope check: target host unknown; deployment denied"), nil
+			}
+			roeWarn, roeErr := s.roeCheckHost(ctx, host, "emp3r0r agent 部署目标")
+			if roeErr != nil {
+				return actool.Errorf(roeErr.Error()), nil
 			}
 			ri := agent.RunInfoFrom(ctx)
 			entry, err := s.stage.PutFile(s.emp3r0r.cfg.AgentBinary, stage.PutOpts{

@@ -141,3 +141,34 @@ func TestDeployEmp3r0rInScopeAllowed(t *testing.T) {
 		t.Fatalf("cc 不可达应报错: %s", text)
 	}
 }
+
+func TestDeployEmp3r0rRejectsUnknownTarget(t *testing.T) {
+	cases := []struct {
+		name      string
+		url       string
+		deleteRow bool
+		want      string
+	}{
+		{"missing database record", "http://10.255.255.9/shell.php", true, "session record unavailable"},
+		{"missing target host", "not-a-url", false, "target host unknown"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, task, viaID := emp3r0rDeployFixture(t, "strict", tc.url)
+			if tc.deleteRow {
+				if err := s.sessStore.Delete(context.Background(), viaID); err != nil {
+					t.Fatalf("delete session row: %v", err)
+				}
+			}
+			in, _ := json.Marshal(map[string]any{"session_id": viaID})
+			ctx := agent.WithRunInfo(context.Background(), agent.RunInfo{TaskID: task.ID})
+			res, err := s.deployEmp3r0rTool().Call(ctx, in, &actool.ToolContext{})
+			if err != nil {
+				t.Fatalf("Call: %v", err)
+			}
+			if !res.IsError || !strings.Contains(res.Flatten(), tc.want) {
+				t.Fatalf("expected refusal %q, got %s", tc.want, res.Flatten())
+			}
+		})
+	}
+}
