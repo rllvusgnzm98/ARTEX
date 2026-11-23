@@ -87,3 +87,34 @@ func TestRedactURLsInTextScrubsEmbeddedURLs(t *testing.T) {
 		t.Errorf("RedactURLsInText changed URL-free text: %q", got)
 	}
 }
+
+// Go 以最后一个 @ 为 userinfo 分隔符,口令里允许字面量 @;代理地址也常不带 scheme。
+func TestRedactURLUserinfoEdgeForms(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"at in password", "https://user:SEC@RETPW@api.example.com/v1", "https://****@api.example.com/v1"},
+		{"at in password no scheme", "u:SEC@RETPW@127.0.0.1:7890", "****@127.0.0.1:7890"},
+		{"scheme-less query", "127.0.0.1:7890?token=SECRETTOK", "127.0.0.1:7890?****"},
+		{"scheme-less plain", "127.0.0.1:7890", "127.0.0.1:7890"},
+		{"at only in path", "https://api.example.com/v1/a@b", "https://api.example.com/v1/a@b"},
+	}
+	for _, c := range cases {
+		if got := RedactURL(c.in); got != c.want {
+			t.Errorf("%s: RedactURL(%q) = %q, want %q", c.name, c.in, got, c.want)
+		}
+	}
+}
+
+func TestScrubURLValueCatchesSchemelessConfig(t *testing.T) {
+	raw := "u:SECRETPW@127.0.0.1:7890?token=SECRETTOK"
+	msg := `llm: invalid proxy "` + raw + `": parse "` + raw + `": first path segment in URL cannot contain colon`
+	got := ScrubURLValue(msg, raw)
+	if strings.Contains(got, "SECRET") {
+		t.Fatalf("ScrubURLValue leaked: %q", got)
+	}
+	if !strings.Contains(got, "127.0.0.1:7890") || !strings.Contains(got, "cannot contain colon") {
+		t.Fatalf("ScrubURLValue lost context: %q", got)
+	}
+	if got := ScrubURLValue("no proxy here", raw); got != "no proxy here" {
+		t.Fatalf("ScrubURLValue changed unrelated text: %q", got)
+	}
+}

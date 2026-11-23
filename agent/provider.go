@@ -447,12 +447,12 @@ func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) 
 	} else {
 		proxyURL, err := url.Parse(proxy)
 		if err != nil {
-			return nil, fmt.Errorf("llm: invalid proxy %q: %w", proxy, err)
+			return nil, fmt.Errorf("llm: invalid proxy %q: %s", config.RedactURL(proxy), config.ScrubURLValue(err.Error(), proxy))
 		}
 		switch proxyURL.Scheme {
 		case "http", "https", "socks5":
 		case "":
-			return nil, fmt.Errorf("llm: proxy %q missing scheme (use http://, https:// or socks5://)", proxy)
+			return nil, fmt.Errorf("llm: proxy %q missing scheme (use http://, https:// or socks5://)", config.RedactURL(proxy))
 		default:
 			return nil, fmt.Errorf("llm: unsupported proxy scheme %q (use http, https or socks5)", proxyURL.Scheme)
 		}

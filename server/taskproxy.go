@@ -254,7 +254,7 @@ func (m *taskProxyManager) refreshLocked(ctx context.Context, taskID int64, inst
 		return
 	}
 	if err := inst.tr.SetUpstreamProxy(up); err != nil {
-		log.Printf("[taskproxy] 任务 %d 上游 %q 无效,保持 %q: %s", taskID, config.RedactURL(up), config.RedactURL(inst.upstream), config.RedactURLsInText(err.Error()))
+		log.Printf("[taskproxy] 任务 %d 上游 %q 无效,保持 %q: %s", taskID, config.RedactURL(up), config.RedactURL(inst.upstream), config.RedactURLsInText(config.ScrubURLValue(err.Error(), up)))
 		return
 	}
 	log.Printf("[taskproxy] 任务 %d 上游热切换: %q → %q", taskID, config.RedactURL(inst.upstream), config.RedactURL(up))

@@ -19,7 +19,12 @@ var urlInText = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s"]*`)
 
 // userinfoSegment 框出 scheme 与 @ 之间的 userinfo。只有用户名的形态也常就是令牌本身
 // （https://TOKEN@host），所以整段盖掉而不是只盖口令。
-var userinfoSegment = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://)[^/\s@]*@`)
+var schemeUserinfo = regexp.MustCompile(`(?i)^([a-z][a-z0-9+.-]*://)[^/\s]*@`)
+
+// bareUserinfo 处理没有 scheme 的配置值(代理常被写成 u:pw@host:port)。两者都贪婪匹配
+// 到第一个 `/` 之前的最后一个 `@`:Go 以最后一个 @ 为 userinfo 分隔符,口令里允许含
+// 字面量 @,只盖到第一个 @ 会把后半截口令留在日志里。
+var bareUserinfo = regexp.MustCompile(`^[^/\s]*@`)
 
 // RedactURL 打码一条 URL 里的凭据：userinfo 整段与整条查询串，保留 scheme、主机、
 // 端口与路径。
@@ -32,7 +37,30 @@ func RedactURL(raw string) string {
 	if i := strings.IndexByte(masked, '?'); i >= 0 {
 		masked = masked[:i] + "?****"
 	}
-	return userinfoSegment.ReplaceAllString(masked, "${1}****@")
+	if schemeUserinfo.MatchString(masked) {
+		return schemeUserinfo.ReplaceAllString(masked, "${1}****@")
+	}
+	if !strings.Contains(masked, "://") {
+		return bareUserinfo.ReplaceAllString(masked, "****@")
+	}
+	return masked
+}
+
+// ScrubURLValue 把文本里出现的 raw 原样换成它的打码形态。
+//
+// 用于第三方错误把配置值整条嵌进 message 的情形:RedactURLsInText 只认 scheme:// 开头
+// 的 URL,而配置里的代理地址可以没有 scheme(127.0.0.1:7890?token=...),文本扫描认不出
+// 它。此处按值替换,不依赖任何形态判断。
+func ScrubURLValue(text, raw string) string {
+	raw = strings.TrimSpace(raw)
+	if text == "" || raw == "" {
+		return text
+	}
+	masked := RedactURL(raw)
+	if masked == raw {
+		return text
+	}
+	return strings.ReplaceAll(text, raw, masked)
 }
 
 // RedactURLsInText 把文本里出现的每条 URL 都按 RedactURL 打码，其余内容原样保留。

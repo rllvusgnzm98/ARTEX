@@ -454,7 +454,7 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	}
 	if m.traffic != nil {
 		if err := m.traffic.SetUpstreamProxy(m.globalProxy); err != nil {
-			log.Printf("[proxy] 全局代理 %q 无效，已忽略: %s", config.RedactURL(m.globalProxy), config.RedactURLsInText(err.Error()))
+			log.Printf("[proxy] 全局代理 %q 无效，已忽略: %s", config.RedactURL(m.globalProxy), config.RedactURLsInText(config.ScrubURLValue(err.Error(), m.globalProxy)))
 		}
 	}
 	// Polite per-host pacing: the persisted setting wins once chosen; otherwise the
@@ -478,7 +478,7 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	} else {
 		pp.SetHostPacer(m.pacer)
 		if err := pp.SetUpstreamProxy(m.globalProxy); err != nil {
-			log.Printf("[pace] 全局代理 %q 无效,限速代理改为直连: %s", config.RedactURL(m.globalProxy), config.RedactURLsInText(err.Error()))
+			log.Printf("[pace] 全局代理 %q 无效,限速代理改为直连: %s", config.RedactURL(m.globalProxy), config.RedactURLsInText(config.ScrubURLValue(err.Error(), m.globalProxy)))
 		}
 		go func() {
 			if err := pp.Start(); err != nil {
@@ -900,7 +900,7 @@ func (m *Manager) SetGlobalProxy(raw string) error {
 	}
 	if m.paceProxy != nil {
 		if err := m.paceProxy.SetUpstreamProxy(raw); err != nil {
-			log.Printf("[pace] 全局代理 %q 无效,限速代理上游保持不变: %s", config.RedactURL(raw), config.RedactURLsInText(err.Error()))
+			log.Printf("[pace] 全局代理 %q 无效,限速代理上游保持不变: %s", config.RedactURL(raw), config.RedactURLsInText(config.ScrubURLValue(err.Error(), raw)))
 		}
 	}
 	// 无隧道任务的 MITM 实例以全局代理为回落上游——全局代理变了它们一起换。
