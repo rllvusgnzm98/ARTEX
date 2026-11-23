@@ -215,7 +215,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 			if !t.beginEvidenceWrite(ctx) {
 				return actool.Errorf("evidence write interrupted"), nil
 			}
-			defer t.writeWG.Done()
+			defer t.endEvidenceWrite()
 			var a struct {
 				Assets []assetInputItem `json:"assets"`
 			}
@@ -320,9 +320,6 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 							IP:            svcIP,
 							TaskID:        taskID,
 						})
-						if err == nil {
-							t.evaluateHoneypot(id, serviceViewFromItem(item, true))
-						}
 					} else {
 						id, err = t.as.UpsertOtherServiceCtx(ctx, db.UpsertOtherServiceReq{
 							Domain:      item.Domain,
@@ -332,9 +329,6 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 							Auth:        item.Auth,
 							TaskID:      taskID,
 						})
-						if err == nil {
-							t.evaluateHoneypot(id, serviceViewFromItem(item, false))
-						}
 					}
 
 				case "endpoint":
@@ -358,6 +352,9 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 				}
 				results = append(results, result{Index: i, ID: id, Type: typ})
 				t.countWrites(WriteCounts{Assets: 1})
+				if typ == "service" {
+					t.evaluateHoneypot(id, serviceViewFromItem(item, item.URL != ""))
+				}
 				if t.ts != nil && t.ownerNode > 0 && id > 0 {
 					_ = t.ts.AnchorCtx(ctx, t.ownerNode, id)
 				}

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Autumn-27/artex/agent/chainskel"
 	"github.com/Autumn-27/artex/db"
@@ -70,13 +71,13 @@ type ToolSet struct {
 	// ownerNode is the exploration node that writes attach to: assets this run
 	// touches get anchored to it as lineage/provenance (NOT visibility — the asset
 	// graph is global and shared). Worker = its claimed intent; planner = begin root.
-	ownerNode int64
-	GoalMet   bool
-	Reason    string
-	writes    WriteCounts
-	writeMu   sync.Mutex
-	writeWG   sync.WaitGroup
-	writeDone bool
+	ownerNode    int64
+	GoalMet      bool
+	Reason       string
+	writes       WriteCounts
+	writeMu      sync.Mutex
+	writeActive  int
+	writeDrained chan struct{}
 	// killWork, if set, terminates a running work by intent id (engine callback,
 	// wired by the planner). nil = the kill_work tool reports unavailable.
 	killWork func(context.Context, int64) error
@@ -148,10 +149,11 @@ type EnrichTrigger interface {
 // findings under "facts" (record_fact → Facts, insert_assets → Assets,
 // report_finding → Findings; each element of a batch counts once).
 type WriteCounts struct {
-	Facts    int
-	Assets   int
-	Findings int
-	Failures int
+	Facts      int
+	Assets     int
+	Findings   int
+	Failures   int
+	Incomplete bool `json:"incomplete,omitempty"`
 }
 
 // Total is every node persisted this run, regardless of kind — the
@@ -182,25 +184,53 @@ func (w WriteCounts) Add(delta WriteCounts) WriteCounts {
 	return WriteCounts{
 		Facts: w.Facts + delta.Facts, Assets: w.Assets + delta.Assets,
 		Findings: w.Findings + delta.Findings, Failures: w.Failures + delta.Failures,
+		Incomplete: w.Incomplete || delta.Incomplete,
 	}
 }
 
 func (t *ToolSet) beginEvidenceWrite(ctx context.Context) bool {
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
-	if t.writeDone || ctx.Err() != nil {
+	if t.writeDrained != nil || ctx.Err() != nil {
 		return false
 	}
-	t.writeWG.Add(1)
+	t.writeActive++
 	return true
 }
 
+func (t *ToolSet) endEvidenceWrite() {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	t.writeActive--
+	if t.writeActive == 0 && t.writeDrained != nil {
+		close(t.writeDrained)
+	}
+}
+
+const evidenceDrainTimeout = 250 * time.Millisecond
+
 func (t *ToolSet) finishEvidenceWrites() WriteCounts {
 	t.writeMu.Lock()
-	t.writeDone = true
+	if t.writeDrained == nil {
+		t.writeDrained = make(chan struct{})
+		if t.writeActive == 0 {
+			close(t.writeDrained)
+		}
+	}
+	drained := t.writeDrained
 	t.writeMu.Unlock()
-	t.writeWG.Wait()
-	return t.Writes()
+
+	timer := time.NewTimer(evidenceDrainTimeout)
+	defer timer.Stop()
+	select {
+	case <-drained:
+	case <-timer.C:
+	}
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	writes := t.writes
+	writes.Incomplete = t.writeActive != 0
+	return writes
 }
 
 func NewToolSet(ts *db.ExplorationStore, worker string) *ToolSet {
@@ -1380,7 +1410,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if !t.beginEvidenceWrite(ctx) {
 			return actool.Errorf("evidence write interrupted"), nil
 		}
-		defer t.writeWG.Done()
+		defer t.endEvidenceWrite()
 		var recorded *db.RecordedFinding
 		if t.findingRecorder != nil {
 			recorded, err = t.findingRecorder.Record(ctx, input, refs)
@@ -1393,6 +1423,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			t.countWrites(WriteCounts{Failures: 1})
 			return actool.Errorf(err.Error()), nil
 		}
+		t.countWrites(WriteCounts{Findings: 1})
 		if t.notifyFinding != nil {
 			iid := input.IntentID
 			if iid <= 0 {
@@ -1402,7 +1433,6 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		} else if t.notify != nil {
 			t.notify()
 		}
-		t.countWrites(WriteCounts{Findings: 1})
 		// Keep the first line's node-ID contract for existing reporter triggers.
 		for i := range recorded.Traffic.Bindings {
 			recorded.Traffic.Bindings[i].Snapshot.ReqHead = ""
@@ -1539,7 +1569,7 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 			if !t.beginEvidenceWrite(ctx) {
 				return actool.Errorf("evidence write interrupted"), nil
 			}
-			defer t.writeWG.Done()
+			defer t.endEvidenceWrite()
 
 			ids := make([]int64, len(items))
 			errs := map[string]string{}
