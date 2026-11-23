@@ -6,6 +6,7 @@ package llmrec
 import (
 	"context"
 	"encoding/json"
+	"github.com/Autumn-27/artex/config"
 	"iter"
 	"log"
 	"strings"
@@ -307,7 +308,8 @@ func (r *Recorder) record(ctx context.Context, req llm.CompletionRequest, sessio
 	errMsg := ""
 	if streamErr != nil {
 		status = "error"
-		errMsg = streamErr.Error()
+		// 错误文本会落库并在 UI 展示；HTTP 客户端只盖 userinfo 口令，查询串里的 key= 会原样留下。
+		errMsg = config.RedactURLsInText(streamErr.Error())
 	}
 
 	// Build response body JSON.

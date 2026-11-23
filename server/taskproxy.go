@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/Autumn-27/artex/config"
 	"log"
 	"net"
 	"path/filepath"
@@ -246,17 +247,17 @@ func (m *taskProxyManager) buildLocked(ctx context.Context, taskID int64) (*task
 func (m *taskProxyManager) refreshLocked(ctx context.Context, taskID int64, inst *taskProxyInst) {
 	up, err := m.resolveUpstream(ctx, taskID)
 	if err != nil {
-		log.Printf("[taskproxy] 任务 %d 台账读取失败,上游保持 %q: %v", taskID, inst.upstream, err)
+		log.Printf("[taskproxy] 任务 %d 台账读取失败,上游保持 %q: %v", taskID, config.RedactURL(inst.upstream), err)
 		return
 	}
 	if up == inst.upstream {
 		return
 	}
 	if err := inst.tr.SetUpstreamProxy(up); err != nil {
-		log.Printf("[taskproxy] 任务 %d 上游 %q 无效,保持 %q: %v", taskID, up, inst.upstream, err)
+		log.Printf("[taskproxy] 任务 %d 上游 %q 无效,保持 %q: %s", taskID, config.RedactURL(up), config.RedactURL(inst.upstream), config.RedactURLsInText(err.Error()))
 		return
 	}
-	log.Printf("[taskproxy] 任务 %d 上游热切换: %q → %q", taskID, inst.upstream, up)
+	log.Printf("[taskproxy] 任务 %d 上游热切换: %q → %q", taskID, config.RedactURL(inst.upstream), config.RedactURL(up))
 	inst.upstream = up
 }
 
