@@ -45,13 +45,25 @@ func RedactURL(raw string) string {
 	if i := strings.IndexByte(rest, '/'); i >= 0 {
 		authority, tail = rest[:i], rest[i:]
 	}
-	// Go 以第一个 `/` 之前的最后一个 @ 为 userinfo 分隔符；只有用户名的形态也常就是令牌。
-	if at := strings.LastIndexByte(authority, '@'); at >= 0 {
-		authority = "****@" + authority[at+1:]
-	}
-	if i := strings.IndexAny(authority, "?#"); i >= 0 {
-		authority = authority[:i+1] + "****"
+	q := strings.IndexAny(authority, "?#")
+	at := strings.LastIndexByte(authority, '@')
+	switch {
+	case q >= 0 && at > q:
+		// `?`/`#` 在最后一个 @ 之前：分不清是口令里的字面量 ?（u:p?x@host）还是查询串里
+		// 的 @（host?r=a@b&key=...）。两种读法里 @ 两侧都可能是凭据，连主机一起盖掉。
+		authority = "****" + authority[q:q+1] + "****"
 		tail = ""
+	case q >= 0:
+		// 查询串/片段在路径之前开始：authority 只到 q，其后（含所谓「路径」）都属于它。
+		host := authority[:q]
+		if at >= 0 {
+			host = "****@" + host[at+1:]
+		}
+		authority = host + authority[q:q+1] + "****"
+		tail = ""
+	case at >= 0:
+		// Go 以第一个 `/` 之前的最后一个 @ 为 userinfo 分隔符；只有用户名的形态也常就是令牌。
+		authority = "****@" + authority[at+1:]
 	}
 	if tail != "" && tail != "/" {
 		tail = "/****"
