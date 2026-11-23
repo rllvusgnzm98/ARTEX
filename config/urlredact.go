@@ -1,54 +1,38 @@
 package config
 
 import (
-	"net/url"
 	"regexp"
 	"strings"
 )
 
-// 凭据既会藏在 URL 的 userinfo 里，也常被网关要求塞进查询串（Google AI 的 ?key=、
-// 各家的 ?access_token= 等）。打码两处都要管。
-// 凭据既会藏在 URL 的 userinfo 里，也常被网关要求塞进查询串（Google AI 的 ?key=、
-// 各家的 ?access_token= 等）。打码两处都要管。
+// 诊断需要的只是「连的是哪个端点」：scheme、主机、端口、路径。凭据恰恰只藏在 userinfo
+// 与查询串里，而「哪个参数是凭据、它的值到哪里结束」没法靠枚举判准——参数名可以百分号
+// 编码（?%6Bey=），值里可以带反引号、尖括号、单引号这些合法字符。所以查询串整段盖掉，
+// 不再逐个认参数名，也不再猜值的字符类。
 //
-// 查询串一律按**文本**打码，不走 url.Query()：那条路要求整条 URL 解析成功，而且
-// Go 的 ParseQuery 会把含分号的键值对静默丢掉，于是「解析失败」和「分号分隔」两种
-// 形态都会原样漏出去。值的字符类特意包含单引号——URL 在错误文本里被单引号截断时，
-// 按 URL 逐条打码会把引号后的半截凭据留下。
-var queryCredential = regexp.MustCompile(`(?i)([?&;](?:key|api[-_]?key|access[-_]?token|token|auth|authorization|password|passwd|pwd|secret|sig|signature|sslpassword)=)[^&;#\s"` + "`" + `<>]*`)
-
-// urlInText 粗略框出文本里的 URL。第三方错误信息常把请求 URL 原样嵌进 message
-// （net/url.Error 就是这么拼的），所以要能在任意文本里找到它们再打码。
-var urlInText = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s"'` + "`" + `<>\\]+`)
-
-// userinfoInText 兜底：URL 解析失败时，至少把 scheme 与 @ 之间的 userinfo 抹掉。
-var userinfoInText = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://)[^/\s@]*@`)
-
-// RedactURL 打码一条 URL 里的凭据：userinfo 口令与常见的凭据查询参数。
+// 打码一律按文本做，不走 net/url：url.Parse+String 会重编码（把 **** 转义成 %2A），
+// 而且解析失败的 URL 同样要盖。
 //
-// 保留用户名、主机、路径与其它参数——日志和诊断的价值就在于看得出「连的是哪个端点」，
-// 只需要让凭据本身不可读。解析失败时退回到抹掉 userinfo 整段，宁可多盖。
+// URL 在错误文本里的右边界只认空白与双引号：Go 的 url.Error 格式是 `Op "URL": err`。
+// 其余标点（反引号、尖括号、单引号、分号）一律算 URL 的一部分，宁可多盖。
+var urlInText = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s"]*`)
+
+// userinfoSegment 框出 scheme 与 @ 之间的 userinfo。只有用户名的形态也常就是令牌本身
+// （https://TOKEN@host），所以整段盖掉而不是只盖口令。
+var userinfoSegment = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://)[^/\s@]*@`)
+
+// RedactURL 打码一条 URL 里的凭据：userinfo 整段与整条查询串，保留 scheme、主机、
+// 端口与路径。
 func RedactURL(raw string) string {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return raw
 	}
-	masked := queryCredential.ReplaceAllString(raw, "${1}****")
-	u, err := url.Parse(strings.TrimSpace(masked))
-	if err != nil || u.Scheme == "" {
-		// 解析失败时至少把 scheme 与 @ 之间的 userinfo 抹掉；查询串已在上面按文本打过码。
-		return userinfoInText.ReplaceAllString(masked, "${1}****@")
+	masked := trimmed
+	if i := strings.IndexByte(masked, '?'); i >= 0 {
+		masked = masked[:i] + "?****"
 	}
-	if u.User == nil {
-		return masked
-	}
-	// 只有用户名的 userinfo 也常就是令牌本身（https://TOKEN@host），整段盖掉。
-	if _, hasPw := u.User.Password(); hasPw {
-		u.User = url.UserPassword(u.User.Username(), "****")
-	} else if u.User.Username() != "" {
-		u.User = url.User("****")
-	}
-	return u.String()
+	return userinfoSegment.ReplaceAllString(masked, "${1}****@")
 }
 
 // RedactURLsInText 把文本里出现的每条 URL 都按 RedactURL 打码，其余内容原样保留。
@@ -57,21 +41,5 @@ func RedactURLsInText(s string) string {
 	if s == "" {
 		return s
 	}
-	// 查询串凭据先按整段文本打码：URL 的边界（引号、单引号）判断不可靠，漏框一个字符
-	// 就会留下半截凭据。
-	s = queryCredential.ReplaceAllString(s, "${1}****")
-	return urlInText.ReplaceAllStringFunc(s, func(raw string) string {
-		// URL 常被引号或标点收尾（`Post "https://...": dial tcp`），尾随符号不该进 URL。
-		trailing := ""
-		for len(raw) > 0 {
-			last := raw[len(raw)-1]
-			if last == '"' || last == '\'' || last == ':' || last == ',' || last == ';' || last == '.' || last == ')' {
-				trailing = string(last) + trailing
-				raw = raw[:len(raw)-1]
-				continue
-			}
-			break
-		}
-		return RedactURL(raw) + trailing
-	})
+	return urlInText.ReplaceAllStringFunc(s, RedactURL)
 }
