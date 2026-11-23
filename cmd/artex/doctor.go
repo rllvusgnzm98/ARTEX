@@ -88,20 +88,18 @@ func runDoctor(args []string) int {
 	dsn, source, dsnErr := db.DSN()
 	profiles, dbOK, llmChecked := -1, false, false
 	if dsnErr != nil {
-		check(docFail, "PostgreSQL", config.Redact(dsnErr.Error()))
+		check(docFail, "PostgreSQL", dsnErr.Error())
 	} else if n, err := db.Probe(dsn); err != nil {
+		check(docFail, "PostgreSQL", err.Error())
 		var qe *db.ProbeQueryError
 		if errors.As(err, &qe) {
 			// 已 ping 通，但 count(*) 不是「表不存在」：权限等查询失败。
-			check(docFail, "PostgreSQL", fmt.Sprintf("查询/权限失败（来源: %s）: %v", source, err))
 			check(docWarn, "LLM profile", "查询/权限失败，无法读取 llm_profiles")
 			llmChecked = true
-		} else {
-			check(docFail, "PostgreSQL", fmt.Sprintf("连接失败（来源: %s）: %v", source, err))
 		}
 	} else {
 		dbOK, profiles = true, n
-		check(docOK, "PostgreSQL", fmt.Sprintf("可连接（来源: %s; %s）", source, config.Redact(dsn)))
+		check(docOK, "PostgreSQL", fmt.Sprintf("可连接（来源: %s）", source))
 	}
 
 	// 2. LLM profile 已配置（DB 不可达则 SKIP；查询/权限失败不得说成库未初始化）

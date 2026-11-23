@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"github.com/Autumn-27/artex/agent"
 	"io"
 	"os"
@@ -438,9 +439,8 @@ func TestRunDoctorOtherPlatformIsSkip(t *testing.T) {
 	}
 }
 
-func TestDoctorCLIDoesNotStartServer(t *testing.T) {
-	isolateConfig(t)
-	t.Setenv("ARTEX_PG_DSN", "")
+func buildArtexCLI(t *testing.T) string {
+	t.Helper()
 	bin := filepath.Join(t.TempDir(), "artex")
 	// Windows os/exec 只接受 PATHEXT 里的扩展名。不带 .exe 时能编出来，但跑不起来。
 	if runtime.GOOS == "windows" {
@@ -450,6 +450,13 @@ func TestDoctorCLIDoesNotStartServer(t *testing.T) {
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
+	return bin
+}
+
+func TestDoctorCLIDoesNotStartServer(t *testing.T) {
+	isolateConfig(t)
+	t.Setenv("ARTEX_PG_DSN", "")
+	bin := buildArtexCLI(t)
 	data := t.TempDir()
 	cmd := exec.Command(bin, "doctor", "-data", data, "-addr", ":8787")
 	cmd.Env = os.Environ()
@@ -467,6 +474,66 @@ func TestDoctorCLIDoesNotStartServer(t *testing.T) {
 	}
 	if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 1 {
 		t.Fatalf("无库配置时 doctor 应退出 1, err=%v\n%s", err, text)
+	}
+}
+
+func TestDatabaseFailureDiagnosticsDoNotEchoDSN(t *testing.T) {
+	bin := buildArtexCLI(t)
+	for _, tt := range []struct {
+		name, dsn, reason string
+		secrets           []string
+	}{
+		{"percent-space", "postgres://artex@127.0.0.1:1/postgres?password=PW%20SPACE&sslmode=bogus",
+			"invalid PostgreSQL DSN", []string{"PW%20SPACE", "PW SPACE", "PW+SPACE"}},
+		{"percent-unreserved", "postgres://artex@127.0.0.1:1/postgres?password=PW%61TAIL&sslmode=bogus",
+			"invalid PostgreSQL DSN", []string{"PW%61TAIL", "PWaTAIL"}},
+		{"invalid-url-port", "postgres://artex:PW-INVALID-PORT@127.0.0.1:invalid/postgres",
+			"invalid PostgreSQL DSN", []string{"PW-INVALID-PORT"}},
+		{"keyword-escaped-whitespace", `host=127.0.0.1 port=1 dbname=postgres user=artex password=PW\ TAIL-CANARY sslmode=disable connect_timeout=1`,
+			"PostgreSQL connection refused", []string{"PW\\ TAIL-CANARY", "PW TAIL-CANARY", "TAIL-CANARY"}},
+		{"ssl-key-password", "postgres://artex@127.0.0.1:1/postgres?sslpassword=PW-SSL-KEY&sslmode=bogus",
+			"invalid PostgreSQL DSN", []string{"PW-SSL-KEY"}},
+		{"query-password", "postgres://artex@127.0.0.1:1/postgres?password=PW-QUERY&sslmode=bogus",
+			"invalid PostgreSQL DSN", []string{"PW-QUERY"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := isolateConfig(t)
+			fileConfig, err := json.Marshal(map[string]map[string]string{"database": {"dsn": tt.dsn}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "config.json"), fileConfig, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			data := t.TempDir()
+			for _, cli := range []struct {
+				name, envDSN, prefix string
+				args                 []string
+			}{
+				{"startup", tt.dsn, "open stores: ", []string{"-data", data, "-proxy", ""}},
+				{"doctor", tt.dsn, "[FAIL] PostgreSQL: ", []string{"doctor", "-data", data}},
+				{"doctor-strict", "", "[FAIL] PostgreSQL: ", []string{"doctor", "-strict-tools", "-data", data}},
+			} {
+				t.Run(cli.name, func(t *testing.T) {
+					t.Setenv("ARTEX_PG_DSN", cli.envDSN)
+					out, err := exec.Command(bin, cli.args...).CombinedOutput()
+					if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 1 {
+						t.Fatalf("expected database failure exit 1; got %v", err)
+					}
+					output := string(out)
+					for _, unsafe := range append(tt.secrets, tt.dsn, "postgres://", "host=127.0.0.1", "cannot parse", "failed to connect") {
+						if strings.Contains(output, unsafe) {
+							t.Fatal("output leaked the DSN, a password fragment, or a raw pgx error")
+						}
+					}
+					_, diagnostic, found := strings.Cut(output, cli.prefix)
+					reason, _, _ := strings.Cut(diagnostic, "\n")
+					if !found || reason != tt.reason {
+						t.Fatalf("expected a database diagnostic with only %q", tt.reason)
+					}
+				})
+			}
+		})
 	}
 }
 

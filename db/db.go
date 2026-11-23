@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Autumn-27/artex/config"
@@ -93,17 +95,29 @@ func DSN() (dsn, source string, err error) {
 	return config.PostgresDSN()
 }
 
-// dsnSafeErr 抹掉底层错误里的口令。pgx 的解析错误会把整条 DSN 嵌进 message，而它只
-// 打码 URL userinfo 与 libpq 键值形态——实测 `?password=` / `?sslpassword=` 原样输出，
-// 再经 doctor 打印或 log.Fatalf 落进日志。连接路径的错误一律先过这里。
-func dsnSafeErr(dsn string, err error) error {
-	if err == nil {
-		return nil
+const (
+	wsaConnectionRefused   syscall.Errno = 10061 // WSAECONNREFUSED
+	win32ConnectionRefused syscall.Errno = 1225  // ERROR_CONNECTION_REFUSED
+)
+
+// databaseFailure reports a fixed reason without retaining the driver error,
+// which can contain the original DSN or other untrusted text.
+func databaseFailure(err error, fallback string) error {
+	var parseErr *pgconn.ParseConfigError
+	var pgErr *pgconn.PgError
+	switch {
+	case errors.As(err, &parseErr):
+		return errors.New("invalid PostgreSQL DSN")
+	case errors.As(err, &pgErr) && (pgErr.Code == "28P01" || pgErr.Code == "28000"):
+		return errors.New("PostgreSQL authentication failed")
+	case errors.Is(err, syscall.ECONNREFUSED) ||
+		(runtime.GOOS == "windows" && (errors.Is(err, wsaConnectionRefused) || errors.Is(err, win32ConnectionRefused))):
+		return errors.New("PostgreSQL connection refused")
+	case errors.Is(err, context.DeadlineExceeded) || pgconn.Timeout(err):
+		return errors.New("PostgreSQL connection timed out")
+	default:
+		return errors.New(fallback)
 	}
-	if safe := config.ScrubSecrets(dsn, err.Error()); safe != err.Error() {
-		return errors.New(safe)
-	}
-	return err
 }
 
 // Probe 轻量只读预检（artex doctor 用）：连接 + ping，通了就顺手只读统计
@@ -116,20 +130,20 @@ func dsnSafeErr(dsn string, err error) error {
 func Probe(dsn string) (int, error) {
 	sqlDB, err := sql.Open("pgx", dsn)
 	if err != nil {
-		return -1, dsnSafeErr(dsn, err)
+		return -1, databaseFailure(err, "PostgreSQL connection failed")
 	}
 	defer sqlDB.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := sqlDB.PingContext(ctx); err != nil {
-		return -1, dsnSafeErr(dsn, err)
+		return -1, databaseFailure(err, "PostgreSQL connection failed")
 	}
 	var n int
 	if err := sqlDB.QueryRowContext(ctx, `SELECT count(*) FROM llm_profiles`).Scan(&n); err != nil {
 		if isUndefinedTable(err) {
 			return -1, nil
 		}
-		return -1, &ProbeQueryError{Err: dsnSafeErr(dsn, err)}
+		return -1, &ProbeQueryError{}
 	}
 	return n, nil
 }
@@ -166,20 +180,10 @@ func isUndefinedTable(err error) bool {
 }
 
 // ProbeQueryError 表示 Probe 已 ping 成功，但只读 count(*) 失败，且不是表不存在。
-type ProbeQueryError struct{ Err error }
+type ProbeQueryError struct{}
 
-func (e *ProbeQueryError) Error() string {
-	if e == nil || e.Err == nil {
-		return "查询/权限失败"
-	}
-	return "查询/权限失败: " + e.Err.Error()
-}
-
-func (e *ProbeQueryError) Unwrap() error {
-	if e == nil {
-		return nil
-	}
-	return e.Err
+func (*ProbeQueryError) Error() string {
+	return "查询/权限失败"
 }
 
 // DB wraps the shared *sql.DB. PG handles its own connection pool + concurrency
@@ -236,11 +240,11 @@ func ensureDatabase(dsn string) error {
 // Open connects, applies the schema (idempotent), and seeds builtin rows.
 func Open(dsn string) (*DB, error) {
 	if err := ensureDatabase(dsn); err != nil {
-		return nil, dsnSafeErr(dsn, err)
+		return nil, databaseFailure(err, "PostgreSQL database creation failed")
 	}
 	sqlDB, err := sql.Open("pgx", dsn)
 	if err != nil {
-		return nil, dsnSafeErr(dsn, err)
+		return nil, databaseFailure(err, "PostgreSQL connection failed")
 	}
 	// database/sql 默认不限制连接数：池里没有空闲连接时会无条件新建，一路顶到
 	// PostgreSQL 的 max_connections（默认 100）才被拒，于是高峰期的查询拿到的是
@@ -254,7 +258,7 @@ func Open(dsn string) (*DB, error) {
 	sqlDB.SetConnMaxIdleTime(5 * time.Minute)
 	if err := sqlDB.Ping(); err != nil {
 		sqlDB.Close()
-		return nil, fmt.Errorf("ping postgres (%s): %w", config.Redact(dsn), dsnSafeErr(dsn, err))
+		return nil, databaseFailure(err, "PostgreSQL connection failed")
 	}
 	d := &DB{DB: sqlDB, health: NewPersistenceHealth()}
 	// pgx runs multi-statement Exec via the simple protocol when there are no args.
@@ -271,7 +275,7 @@ func Open(dsn string) (*DB, error) {
 	})
 	if err != nil {
 		sqlDB.Close()
-		return nil, err
+		return nil, databaseFailure(err, "PostgreSQL database initialization failed")
 	}
 	return d, nil
 }
