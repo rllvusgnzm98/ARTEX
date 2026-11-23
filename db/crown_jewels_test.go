@@ -61,6 +61,15 @@ func TestCrownJewelStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// upstream ancestry: a fact the intent derived from (src=parent→dst=child), so
+	// the retraced attack path must include it before the intent/finding.
+	parentFact, err := es.AddNode("fact", map[string]any{"summary": "found payments api"}, 5, "confirmed", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := es.Link(parentFact, "derived_from", intent); err != nil {
+		t.Fatal(err)
+	}
 	st, err := es.CrownJewelStatusFor(aid)
 	if err != nil {
 		t.Fatal(err)
@@ -87,6 +96,9 @@ func TestCrownJewelStatus(t *testing.T) {
 	}
 	if len(st.Path) == 0 || st.Path[len(st.Path)-1].ID != find {
 		t.Fatalf("path should end at the reaching finding: %+v", st.Path)
+	}
+	if st.Path[0].ID != parentFact {
+		t.Fatalf("path should start at the upstream ancestor fact, got %+v", st.Path)
 	}
 	if st.FrontierDistance == nil || *st.FrontierDistance < 0 {
 		t.Fatalf("frontier distance should be computed: %+v", st)

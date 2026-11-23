@@ -55,9 +55,19 @@ type CrownJewelStatus struct {
 // (derived_from/yields/spawns upstream) and measuring frontier→target distance.
 func (s *ExplorationStore) CrownJewelStatusFor(assetID int64) (CrownJewelStatus, error) {
 	st := CrownJewelStatus{AssetID: assetID, AnchoredNodes: []AssetRef{}}
-	refs, err := s.AssetRefs(assetID)
+	allRefs, err := s.AssetRefs(assetID)
 	if err != nil {
 		return st, err
+	}
+	// Exclude the task's origin/seed fact: its anchor to the configured target is
+	// provenance ("this is the objective"), not an observation that reached it —
+	// otherwise a seeded target would read as reached before any work runs.
+	refs := make([]AssetRef, 0, len(allRefs))
+	for _, r := range allRefs {
+		if r.Kind == KindFact && r.State == StateOrigin {
+			continue
+		}
+		refs = append(refs, r)
 	}
 	st.AnchoredNodes = refs
 	anchored := map[int64]bool{}
@@ -75,23 +85,18 @@ func (s *ExplorationStore) CrownJewelStatusFor(assetID int64) (CrownJewelStatus,
 	if err != nil {
 		return st, err
 	}
-	// parentsOf: child node -> its upstream parents. spawns (root→goal) and yields
-	// (intent→fact/finding) run parent→child as src→dst; derived_from runs the other
-	// way (finding/fact src derived_from intent dst). proves (evidence→goal) is a
-	// downstream assertion, not lineage, so it is excluded from upstream retrace.
+	// parentsOf: child node -> its upstream parents, retraced along lineage edges.
 	parentsOf := map[int64][]int64{}
 	adj := map[int64][]int64{} // undirected, for frontier distance
 	for _, e := range edges {
 		adj[e.From] = append(adj[e.From], e.To)
 		adj[e.To] = append(adj[e.To], e.From)
 		switch e.Rel {
-		case RelDerivedFrom:
-			// stored child→parent (finding/fact src derived_from intent dst):
-			// the dst is the upstream parent.
-			parentsOf[e.From] = append(parentsOf[e.From], e.To)
-		case RelSpawns, RelYields:
-			// stored parent→child (root spawns goal; intent yields fact/finding):
-			// the src is the upstream parent.
+		case RelDerivedFrom, RelSpawns, RelYields:
+			// Lineage edges are stored src=parent→dst=child (see FindingLineage's
+			// ancestor walk): derived_from (source fact/finding→derived intent),
+			// spawns (root→goal), yields (intent→fact/finding). proves (evidence→
+			// goal) is a downstream assertion, not lineage, so it is excluded.
 			parentsOf[e.To] = append(parentsOf[e.To], e.From)
 		}
 	}
