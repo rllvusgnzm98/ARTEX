@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Database is the PostgreSQL connection config. Either set DSN directly, or set
@@ -315,42 +317,33 @@ func ScrubSecrets(dsn, s string) string {
 
 // connectionIdentity 从 DSN 里只取「连的是哪台库」这类非机密身份字段。做运行溯源时记
 // 这些，而不是记一整条（几乎完整的）DSN——后者只要有一处打码遗漏就是凭据泄漏。
+//
+// 解析一律交给 pgconn.ParseConfig，不自己切字符串：libpq 键值串允许带引号的值（口令里
+// 可以含空格甚至 "dbname=" 字样）、`=` 两侧可以有空白，URL 的查询串还能用 host/port/
+// dbname 覆盖前面的值。实测手写的 Fields+Cut 会把引号内的片段当成字段（口令碎片因此
+// 进了快照）、把 `host = h` 整条丢掉、并忽略查询串覆盖，三种都会让溯源指向错误的库。
+//
+// 解析失败（例如 sslmode 非法）时不猜：此时连接本来也建不起来，而错误文本里还带着整条
+// DSN，绝不能顺手落库。
 func connectionIdentity(dsn string) map[string]any {
-	out := map[string]any{}
-	put := func(k, v string) {
-		if v = strings.TrimSpace(v); v != "" {
-			out[k] = v
+	cfg, err := pgconn.ParseConfig(dsn)
+	if err != nil {
+		return map[string]any{
+			"db_identity_parsed": false,
+			"db_password_set":    len(dsnSecretValues(dsn)) > 0,
 		}
 	}
-	if u, err := url.Parse(dsn); err == nil && u.Scheme != "" {
-		put("db_host", u.Hostname())
-		put("db_port", u.Port())
-		put("db_name", strings.TrimPrefix(u.Path, "/"))
-		if u.User != nil {
-			put("db_user", u.User.Username())
-		}
-		put("db_sslmode", u.Query().Get("sslmode"))
-		return out
+	return map[string]any{
+		"db_identity_parsed": true,
+		"db_host":            cfg.Host,
+		"db_port":            cfg.Port,
+		"db_name":            cfg.Database,
+		"db_user":            cfg.User,
+		// sslmode 被 ParseConfig 解析成 TLS 配置后不再保留原字符串；记「最终有没有启用
+		// TLS」比回抄一个可能没生效的 sslmode 更诚实。
+		"db_tls_enabled":  cfg.TLSConfig != nil,
+		"db_password_set": cfg.Password != "",
 	}
-	for _, field := range strings.Fields(dsn) {
-		k, v, ok := strings.Cut(field, "=")
-		if !ok {
-			continue
-		}
-		switch strings.ToLower(strings.TrimSpace(k)) {
-		case "host":
-			put("db_host", v)
-		case "port":
-			put("db_port", v)
-		case "dbname":
-			put("db_name", v)
-		case "user":
-			put("db_user", v)
-		case "sslmode":
-			put("db_sslmode", v)
-		}
-	}
-	return out
 }
 
 // CallbackAddr resolves the platform callback address:
@@ -587,7 +580,6 @@ func EffectiveSummary() map[string]any {
 	for k, v := range connectionIdentity(dsn) {
 		out[k] = v
 	}
-	out["db_password_set"] = len(dsnSecretValues(dsn)) > 0
 	if err != nil {
 		out["db_dsn_error"] = ScrubSecrets(dsn, err.Error())
 	}

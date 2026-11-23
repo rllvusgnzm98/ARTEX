@@ -106,14 +106,77 @@ func TestEffectiveSummaryKeepsNoDSN(t *testing.T) {
 		}
 	}
 	for _, want := range []struct{ k, v string }{
-		{"db_host", "db.internal"}, {"db_port", "5432"},
-		{"db_name", "artexdb"}, {"db_user", "artex"}, {"db_sslmode", "require"},
+		{"db_host", "db.internal"}, {"db_name", "artexdb"}, {"db_user", "artex"},
 	} {
 		if got, _ := sum[want.k].(string); got != want.v {
 			t.Fatalf("身份字段 %s 该是 %q，实际 %q", want.k, want.v, got)
 		}
 	}
+	if port, _ := sum["db_port"].(uint16); port != 5432 {
+		t.Fatalf("db_port 该是 5432，实际 %v", sum["db_port"])
+	}
+	if tls, _ := sum["db_tls_enabled"].(bool); !tls {
+		t.Fatal("sslmode=require 该记成启用了 TLS")
+	}
 	if set, _ := sum["db_password_set"].(bool); !set {
 		t.Fatal("该如实记下「配了口令」这一事实")
 	}
+}
+
+// TestConnectionIdentityUsesRealParser 覆盖手写切分会错的三种 DSN：引号里的口令可以含
+// 空格甚至 "dbname=" 字样、`=` 两侧可以有空白、URL 查询串能覆盖 host/port/dbname。
+// 这些都曾让快照指向错误的库，或把口令碎片当成库名记进去。
+func TestConnectionIdentityUsesRealParser(t *testing.T) {
+	t.Run("引号口令不得被当成库名", func(t *testing.T) {
+		id := connectionIdentity(`host=h user=u password='pw dbname=LEAKED'`)
+		if name, _ := id["db_name"].(string); strings.Contains(name, "LEAKED") {
+			t.Fatalf("口令碎片被当成了库名: %v", id)
+		}
+		for k, v := range id {
+			if sv, ok := v.(string); ok && strings.Contains(sv, "LEAKED") {
+				t.Fatalf("键 %q 带出了口令碎片: %v", k, sv)
+			}
+		}
+		if set, _ := id["db_password_set"].(bool); !set {
+			t.Fatalf("该认出配了口令: %v", id)
+		}
+	})
+
+	t.Run("等号两侧空白仍要有身份", func(t *testing.T) {
+		id := connectionIdentity("host = h user = u dbname = spaced")
+		if host, _ := id["db_host"].(string); host != "h" {
+			t.Fatalf("host 没解析出来: %v", id)
+		}
+		if name, _ := id["db_name"].(string); name != "spaced" {
+			t.Fatalf("dbname 没解析出来: %v", id)
+		}
+	})
+
+	t.Run("URL查询串覆盖要生效", func(t *testing.T) {
+		id := connectionIdentity("postgres://u:pw@h:5432/urldb?host=other&port=6543&dbname=overridden&sslmode=disable")
+		if host, _ := id["db_host"].(string); host != "other" {
+			t.Fatalf("查询串里的 host 覆盖没生效: %v", id)
+		}
+		if port, _ := id["db_port"].(uint16); port != 6543 {
+			t.Fatalf("查询串里的 port 覆盖没生效: %v", id)
+		}
+		if name, _ := id["db_name"].(string); name != "overridden" {
+			t.Fatalf("查询串里的 dbname 覆盖没生效: %v", id)
+		}
+	})
+
+	t.Run("解析失败时不猜身份", func(t *testing.T) {
+		id := connectionIdentity("postgres://u@h:5432/db?password=QS-PW&sslmode=bogus-tls-mode")
+		if parsed, _ := id["db_identity_parsed"].(bool); parsed {
+			t.Fatalf("sslmode 非法时不该自称解析成功: %v", id)
+		}
+		if _, ok := id["db_host"]; ok {
+			t.Fatalf("解析失败就不该给出身份字段: %v", id)
+		}
+		for k, v := range id {
+			if sv, ok := v.(string); ok && strings.Contains(sv, "QS-PW") {
+				t.Fatalf("键 %q 泄露了口令: %v", k, sv)
+			}
+		}
+	})
 }
