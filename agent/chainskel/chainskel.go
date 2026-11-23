@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 )
 
 //go:embed *.md
@@ -77,20 +78,47 @@ func ValidateChainTags(tags []string) error {
 	return nil
 }
 
-// Skeleton 返回某分类的骨架文本;文件缺失/读取失败返回 ok=false(调用方静默降级)。
+// overlay 是运行时追加的"已人工审核通过"的决策骨架来源(按 category 返回若干
+// "场景:…|判据:…|转向:…"行)。chainskel 只 embed 了编译期的 *.md,审核通过的新条目
+// 通过此钩子在运行时并入,无需重新编译;未设置时静默为空(纯 embed 行为)。
+var overlay atomic.Value // func(category string) []string
+
+// SetOverlay 安装运行时骨架叠加来源(server 用它读 DB 中 approved 的 TTP 条目)。
+func SetOverlay(fn func(category string) []string) { overlay.Store(fn) }
+
+func overlayLines(category string) []string {
+	v := overlay.Load()
+	if v == nil {
+		return nil
+	}
+	fn, ok := v.(func(string) []string)
+	if !ok || fn == nil {
+		return nil
+	}
+	return fn(category)
+}
+
+// Skeleton 返回某分类的骨架文本(embed 的 *.md + 运行时审核通过的 overlay 行);
+// 两者皆空返回 ok=false(调用方静默降级)。
 func Skeleton(category string) (string, bool) {
 	if !Valid(category) {
 		return "", false
 	}
-	b, err := skeletonFS.ReadFile(category + ".md")
-	if err != nil {
+	parts := make([]string, 0, 2)
+	if b, err := skeletonFS.ReadFile(category + ".md"); err == nil {
+		if s := strings.TrimSpace(string(b)); s != "" {
+			parts = append(parts, s)
+		}
+	}
+	for _, line := range overlayLines(category) {
+		if line = strings.TrimSpace(line); line != "" {
+			parts = append(parts, line)
+		}
+	}
+	if len(parts) == 0 {
 		return "", false
 	}
-	s := strings.TrimSpace(string(b))
-	if s == "" {
-		return "", false
-	}
-	return s, true
+	return strings.Join(parts, "\n"), true
 }
 
 // keywordRules 是回退关键词匹配器(意图无 chain_tags 时用):意图文本/vulnclass
