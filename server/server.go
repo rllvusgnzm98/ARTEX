@@ -58,6 +58,7 @@ type Server struct {
 	stage      *stage.Manager   // 受管文件投递；nil = 未就绪（启动失败降级）
 	tunnels    *tunnelRuntime   // 隧道台账运行时；nil = 未就绪
 	tunnelLive tunnelLiveLister // 内网变体/拓扑用的台账读口；nil-safe
+	emp3r0r    *emp3r0rRuntime  // emp3r0r cc sidecar 桥接；nil = 未启用
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
@@ -245,8 +246,10 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		go s.evidenceStore().RunGC(s.ctx)
 		s.seedPythonInterpreter()     // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
 		s.seedNodeInterpreter()       // Hackbots 的 node 脚本同样只在设置为空时写入
+		s.initEmp3r0r()               // emp3r0r cc sidecar 桥接（enabled 才装配）
 		s.initSessions()              // 立足点会话：Registry + 启动恢复与陈旧探活
 		s.seedSessionTools()          // register_session / session_recon 默认绑 worker
+		s.seedEmp3r0rTools()          // deploy_emp3r0r 默认绑 worker（启用时）
 		s.initTunnels(dataDir)        // 隧道台账（本刀不拉起外部适配器进程）
 		s.seedTunnelTools()           // tunnel_list/probe/deploy/teardown 默认绑 worker
 		s.initCredentials()           // 凭据库（secret AES-GCM，jwt.key 域分离）
@@ -766,12 +769,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/tasks/{id}/scope/{sid}", s.taskScopeDelete)
 	mux.HandleFunc("GET /api/tasks/{id}/pending-scope", s.pendingScopeList)
 	mux.HandleFunc("POST /api/pending-scope/{id}/decide", s.pendingScopeDecide)
-	mux.HandleFunc("GET /api/tasks/{id}/goals", s.listGoals)                       // 目标管理:列出本任务全部目标
-	mux.HandleFunc("POST /api/tasks/{id}/goals", s.addGoal)                        // 目标管理:人工新增目标(复活任务)
-	mux.HandleFunc("PATCH /api/tasks/{id}/goals/{gid}", s.editGoal)                // 目标管理:修改目标(复活任务)
-	mux.HandleFunc("DELETE /api/tasks/{id}/goals/{gid}", s.deleteGoal)             // 目标管理:硬删除目标(不复活)
-	mux.HandleFunc("GET /api/tasks/{id}/crown-jewels/paths", s.crownJewelPaths)          // 目标导向:到各靶标的攻击路径/前沿距离
-	mux.HandleFunc("POST /api/tasks/{id}/goals/{gid}/anchors", s.anchorGoalAsset)        // 目标导向:把目标锚定到靶标资产
+	mux.HandleFunc("GET /api/tasks/{id}/goals", s.listGoals)                      // 目标管理:列出本任务全部目标
+	mux.HandleFunc("POST /api/tasks/{id}/goals", s.addGoal)                       // 目标管理:人工新增目标(复活任务)
+	mux.HandleFunc("PATCH /api/tasks/{id}/goals/{gid}", s.editGoal)               // 目标管理:修改目标(复活任务)
+	mux.HandleFunc("DELETE /api/tasks/{id}/goals/{gid}", s.deleteGoal)            // 目标管理:硬删除目标(不复活)
+	mux.HandleFunc("GET /api/tasks/{id}/crown-jewels/paths", s.crownJewelPaths)   // 目标导向:到各靶标的攻击路径/前沿距离
+	mux.HandleFunc("POST /api/tasks/{id}/goals/{gid}/anchors", s.anchorGoalAsset) // 目标导向:把目标锚定到靶标资产
 	mux.HandleFunc("DELETE /api/tasks/{id}/goals/{gid}/anchors/{assetID}", s.unanchorGoalAsset)
 	mux.HandleFunc("GET /api/tasks/{id}/constraints", s.listConstraints)           // 约束管理:列出本任务操作约束
 	mux.HandleFunc("POST /api/tasks/{id}/constraints", s.addConstraint)            // 约束管理:新增约束(不通知 planner)

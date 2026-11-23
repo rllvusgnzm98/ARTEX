@@ -19,6 +19,7 @@ import (
 	"github.com/Autumn-27/artex/config"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/server"
+	"github.com/Autumn-27/artex/session"
 	"github.com/Autumn-27/artex/tools"
 )
 
@@ -272,6 +273,62 @@ func runDoctor(args []string) int {
 		check(docOK, "回连地址", "ARTEX_CALLBACK_ADDR = "+cb+cbSrc)
 	} else {
 		check(docWarn, "回连地址", "ARTEX_CALLBACK_ADDR 未设置——隧道回连平台不可用；立足点功能不受影响")
+	}
+
+	// 7.5 emp3r0r cc sidecar 连通性：enabled=off 直接 SKIP；
+	// enabled 但凭据缺失 WARN；齐全时拉起进程内 WG peer 探测 operator API。
+	ecfg := config.Emp3r0rConfig()
+	if !ecfg.Enabled {
+		check(docSkip, "emp3r0r cc", "未启用（config emp3r0r.enabled / ARTEX_EMP3R0R）")
+	} else {
+		missing := []string{}
+		if strings.TrimSpace(ecfg.WGEndpoint) == "" {
+			missing = append(missing, "wg_endpoint")
+		}
+		if strings.TrimSpace(ecfg.WGServerPublicKey) == "" {
+			missing = append(missing, "wg_server_public_key")
+		}
+		if strings.TrimSpace(ecfg.WGServerIP) == "" {
+			missing = append(missing, "wg_server_ip")
+		}
+		if strings.TrimSpace(ecfg.WGOperatorIP) == "" {
+			missing = append(missing, "wg_operator_ip")
+		}
+		if strings.TrimSpace(ecfg.WGOperatorKey) == "" {
+			missing = append(missing, "wg_operator_key")
+		}
+		if len(missing) > 0 {
+			check(docWarn, "emp3r0r cc", "已启用但凭据不完整，缺: "+strings.Join(missing, ", "))
+		} else {
+			cc, cerr := session.NewCCClient(session.Emp3r0rConfig{
+				Endpoint:     ecfg.WGEndpoint,
+				ServerKey:    ecfg.WGServerPublicKey,
+				ServerIP:     ecfg.WGServerIP,
+				OperatorIP:   ecfg.WGOperatorIP,
+				OperatorKey:  ecfg.WGOperatorKey,
+				OperatorPort: ecfg.OperatorPort,
+				SessionID:    ecfg.OperatorSession,
+			})
+			if cerr != nil {
+				check(docWarn, "emp3r0r cc", "客户端构造失败: "+cerr.Error())
+			} else {
+				cctx, ccancel := context.WithTimeout(context.Background(), 8*time.Second)
+				perr := cc.Ping(cctx)
+				ccancel()
+				_ = cc.Close()
+				if perr != nil {
+					check(docFail, "emp3r0r cc", fmt.Sprintf("连通性失败（%s 经 WG peer → %s）: %v",
+						ecfg.WGOperatorIP, ecfg.WGEndpoint, perr))
+				} else {
+					check(docOK, "emp3r0r cc", fmt.Sprintf("operator API 可达（WG endpoint %s）", ecfg.WGEndpoint))
+				}
+			}
+		}
+		if ecfg.Enabled && strings.TrimSpace(ecfg.AgentBinary) == "" {
+			check(docWarn, "emp3r0r agent", "emp3r0r.agent_binary 未配置——deploy_emp3r0r 不可用")
+		} else if ecfg.Enabled {
+			check(docOK, "emp3r0r agent", ecfg.AgentBinary)
+		}
 	}
 
 	// 8. Hackbots 脚本工具：随包脚本是否落在 skills/ 下、解释器是否可用。

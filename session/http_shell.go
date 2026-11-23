@@ -182,6 +182,8 @@ type Secret struct {
 	// 加密马（phpenc/jspenc）专有：会话密钥（base64 32B）与锁存的加密模式。
 	Key     string `json:"key,omitempty"`
 	EncMode string `json:"enc_mode,omitempty"`
+	// emp3r0r 反向会话专有：cc 侧 agent tag（恢复时重建会话用）。
+	AgentTag string `json:"agent_tag,omitempty"`
 }
 
 // Secret 导出当前连接参数（探测后的完整指纹）。

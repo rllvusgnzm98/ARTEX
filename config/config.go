@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Database is the PostgreSQL connection config. Either set DSN directly, or set
@@ -41,6 +42,25 @@ type Config struct {
 	JWTTTL            string `json:"jwt_ttl"`
 	JWTRotationPeriod string `json:"jwt_rotation_period"`
 	JWTGrace          string `json:"jwt_grace"`
+	// emp3r0r cc sidecar 集成（reverse implant 会话）。
+	Emp3r0r Emp3r0r `json:"emp3r0r"`
+}
+
+// Emp3r0r 是 emp3r0r cc sidecar 连接配置。emp3r0r v5 的 operator API 是
+// HTTP+CBOR、绑定在 userspace WireGuard netstack 上，本平台以 provisioning 的
+// operator WG 凭据接入 cc 的 WG overlay。凭据来自 cc 端 wg_config.json。
+type Emp3r0r struct {
+	Enabled           bool   `json:"enabled"`
+	WGEndpoint        string `json:"wg_endpoint"`           // cc WG UDP 端点 host:port（cc --operator-port）
+	WGServerPublicKey string `json:"wg_server_public_key"`  // cc WG server 公钥
+	WGServerIP        string `json:"wg_server_ip"`          // cc WG server IP（operator HTTP 在此监听）
+	WGOperatorIP      string `json:"wg_operator_ip"`        // 本平台 operator WG IP
+	WGOperatorKey     string `json:"wg_operator_key"`       // 本平台 operator WG 私钥
+	OperatorPort      int    `json:"operator_port"`         // operator HTTP 端口；0 = wg_endpoint 端口+1
+	OperatorSession   string `json:"operator_session"`      // operator_session 头值；空 = wg_operator_ip
+	AgentBinary       string `json:"agent_binary"`          // deploy_emp3r0r 投递的 agent 二进制路径
+	PollIntervalSec   int    `json:"poll_interval_seconds"` // agent 上线轮询间隔；0=15
+	AgentWaitSec      int    `json:"agent_wait_seconds"`    // deploy 等回连上限；0=120
 }
 
 // BaseDir is the directory that anchors all runtime artifacts (config.json and
@@ -254,6 +274,73 @@ func HostPaceRPS() float64 {
 		}
 	}
 	return HostPaceDefaultRPS
+}
+
+// Emp3r0rConfig 解析 emp3r0r sidecar 配置。优先级：ARTEX_EMP3R0R_* 环境变量 >
+// 配置文件 emp3r0r 段。Enabled 除文件 enabled 外也可用 ARTEX_EMP3R0R=on/off。
+func Emp3r0rConfig() Emp3r0r {
+	c := Load().Emp3r0r
+	if v := strings.TrimSpace(os.Getenv("ARTEX_EMP3R0R_ENDPOINT")); v != "" {
+		c.WGEndpoint = v
+	}
+	if v := strings.TrimSpace(os.Getenv("ARTEX_EMP3R0R_SERVER_KEY")); v != "" {
+		c.WGServerPublicKey = v
+	}
+	if v := strings.TrimSpace(os.Getenv("ARTEX_EMP3R0R_SERVER_IP")); v != "" {
+		c.WGServerIP = v
+	}
+	if v := strings.TrimSpace(os.Getenv("ARTEX_EMP3R0R_OPERATOR_IP")); v != "" {
+		c.WGOperatorIP = v
+	}
+	if v := strings.TrimSpace(os.Getenv("ARTEX_EMP3R0R_OPERATOR_KEY")); v != "" {
+		c.WGOperatorKey = v
+	}
+	if v := strings.TrimSpace(os.Getenv("ARTEX_EMP3R0R_OPERATOR_PORT")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.OperatorPort = n
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ARTEX_EMP3R0R_SESSION")); v != "" {
+		c.OperatorSession = v
+	}
+	if v := strings.TrimSpace(os.Getenv("ARTEX_EMP3R0R_AGENT_BINARY")); v != "" {
+		c.AgentBinary = v
+	}
+	if v := strings.TrimSpace(os.Getenv("ARTEX_EMP3R0R_POLL_INTERVAL")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.PollIntervalSec = n
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ARTEX_EMP3R0R_WAIT_SECONDS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.AgentWaitSec = n
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ARTEX_EMP3R0R")); v != "" {
+		switch strings.ToLower(v) {
+		case "on", "1", "true", "enabled":
+			c.Enabled = true
+		case "off", "0", "false", "disabled":
+			c.Enabled = false
+		}
+	}
+	return c
+}
+
+// Emp3r0rPollInterval 是 agent 上线轮询间隔（默认 15s）。
+func (e Emp3r0r) PollInterval() time.Duration {
+	if e.PollIntervalSec > 0 {
+		return time.Duration(e.PollIntervalSec) * time.Second
+	}
+	return 15 * time.Second
+}
+
+// Emp3r0rAgentWait 是 deploy_emp3r0r 等回连上限（默认 120s）。
+func (e Emp3r0r) AgentWait() time.Duration {
+	if e.AgentWaitSec > 0 {
+		return time.Duration(e.AgentWaitSec) * time.Second
+	}
+	return 120 * time.Second
 }
 
 // TaskProxyEnabled reports whether per-task MITM instances are on.
