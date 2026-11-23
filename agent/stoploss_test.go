@@ -189,14 +189,20 @@ func TestStopLossHookEnforcedInCodeNotPrompt(t *testing.T) {
 		t.Fatal("unrecognized tools must be blocked after stop-loss")
 	}
 	// Write-back remains allowed so already-identified facts can still be persisted.
-	block, _, _ = hooks.PreToolUse(context.Background(), "record_fact", []byte(`{"summary":"x"}`))
-	if block {
-		t.Fatal("write-back tools must still be allowed after stop-loss")
+	for _, name := range []string{"record_fact", "insert_assets", "report_finding", "add_finding"} {
+		if block, _, _ := hooks.PreToolUse(context.Background(), name, []byte(`{"summary":"x"}`)); block {
+			t.Fatalf("write-back tool %s must still be allowed after stop-loss", name)
+		}
 	}
 
-	prevent, _, stopMsg := hooks.Stop(context.Background(), nil)
-	if !prevent || !strings.Contains(stopMsg, StopLossMessagePrefix) {
-		t.Fatalf("Stop hook must prevent continuation, prevent=%v msg=%q", prevent, stopMsg)
+	// One bounded write-back round first, then hard termination.
+	prevent, inject, stopMsg := hooks.Stop(context.Background(), nil)
+	if prevent || len(inject) != 1 || !strings.Contains(inject[0], "record_fact") {
+		t.Fatalf("first Stop should inject one write-back round, prevent=%v inject=%q", prevent, inject)
+	}
+	prevent, inject, stopMsg = hooks.Stop(context.Background(), nil)
+	if !prevent || len(inject) != 0 || !strings.Contains(stopMsg, StopLossMessagePrefix) {
+		t.Fatalf("Stop hook must prevent continuation, prevent=%v inject=%q msg=%q", prevent, inject, stopMsg)
 	}
 
 	// Decision does not depend on prompt text (dual insurance is the hook).
@@ -349,4 +355,65 @@ func TestDefaultPolicyTreatsTwentyMinutesAsCeiling(t *testing.T) {
 
 func jsonCmd(s string) ([]byte, []byte) {
 	return []byte(s), []byte(s)
+}
+
+// Stop-loss must not drop evidence that was observed but not yet written back:
+// the write-back tools stay callable, probes do not, and the block message says so.
+func TestStopLossKeepsWriteBackAfterFiring(t *testing.T) {
+	mon := NewStopLossMonitor(tightPolicy())
+	hooks := WrapStopLoss(nil, mon)
+	cmd, _ := jsonCmd(`{"command":"curl https://edge.example.test/health"}`)
+	hooks.PostToolUse(context.Background(), "Bash", cmd, []byte(`{"ok":true}`), false)
+	hooks.PostToolUse(context.Background(), "Bash", cmd, []byte(`{"ok":true}`), false)
+	if !mon.Fired() {
+		t.Fatalf("fixture did not latch: %+v", mon.Verdict())
+	}
+	for _, name := range []string{"record_fact", "insert_assets", "report_finding", "add_finding"} {
+		if block, msg, _ := hooks.PreToolUse(context.Background(), name, []byte(`{"summary":"edge reachable"}`)); block {
+			t.Fatalf("%s blocked after stop-loss: %q", name, msg)
+		}
+	}
+	for _, name := range []string{"Bash", "WebFetch", "web_search", "unrecognized_tool"} {
+		block, msg, _ := hooks.PreToolUse(context.Background(), name, cmd)
+		if !block {
+			t.Fatalf("%s must stay blocked after stop-loss", name)
+		}
+		if !strings.Contains(msg, StopLossMessagePrefix) || !strings.Contains(msg, "record_fact") {
+			t.Fatalf("%s block message must point at write-back: %q", name, msg)
+		}
+	}
+	// A write-back after the verdict neither clears it nor reopens the run.
+	hooks.PostToolUse(context.Background(), "record_fact", []byte(`{"summary":"edge reachable"}`), []byte(`{"id":1}`), false)
+	if v := mon.Verdict(); !v.Fired() || v.Kind != StopLossRepeatedCommand {
+		t.Fatalf("write-back must not clear the latched verdict: %+v", v)
+	}
+}
+
+// The bounded write-back round is offered once per run: repeated wrap-up cannot
+// keep a stopped run alive.
+func TestStopLossWriteBackRoundIsOneShot(t *testing.T) {
+	mon := NewStopLossMonitor(tightPolicy())
+	hooks := WrapStopLoss(nil, mon)
+	a, _ := jsonCmd(`{"command":"probe edge.example.test:443"}`)
+	b, _ := jsonCmd(`{"command":"probe app.example.test:443"}`)
+	hooks.PostToolUse(context.Background(), "Bash", a, []byte("ok"), false)
+	hooks.PostToolUse(context.Background(), "Bash", b, []byte("ok"), false)
+	if !mon.Fired() || mon.Verdict().Kind != StopLossNoProgress {
+		t.Fatalf("fixture did not latch: %+v", mon.Verdict())
+	}
+	prevent, inject, _ := hooks.Stop(context.Background(), nil)
+	if prevent || len(inject) != 1 {
+		t.Fatalf("first Stop after no-progress should offer write-back: prevent=%v inject=%q", prevent, inject)
+	}
+	// Writing back during that round does not earn another one.
+	hooks.PostToolUse(context.Background(), "record_fact", []byte(`{"summary":"edge reachable"}`), []byte(`{"id":1}`), false)
+	for i := range 3 {
+		prevent, inject, msg := hooks.Stop(context.Background(), nil)
+		if !prevent || len(inject) != 0 || !strings.Contains(msg, StopLossMessagePrefix) {
+			t.Fatalf("Stop %d must terminate: prevent=%v inject=%q msg=%q", i, prevent, inject, msg)
+		}
+	}
+	if got := IntentStateAfterRun(harness.ReasonStopHookPrevented, nil, mon.Verdict()); got != "exhausted" {
+		t.Fatalf("stop-loss intent state must stay exhausted, got %s", got)
+	}
 }

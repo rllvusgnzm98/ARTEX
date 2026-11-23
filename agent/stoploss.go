@@ -22,6 +22,16 @@ const DefaultSafetyCeiling = 20 * time.Minute
 // authoritative signal is StopLossVerdict.Fired().
 const StopLossMessagePrefix = "【止损】"
 
+// StopLossWriteBackHint is appended to the block message of a tool refused after
+// stop-loss: the probe is over, but already-identified evidence can still be
+// written back.
+const StopLossWriteBackHint = "（本轮已止损，不要再运行任何命令/探测；仍可把已识别但未写回的内容落库：新资产 insert_assets、事实 record_fact、确认漏洞 report_finding，写完直接结束。）"
+
+// StopLossWriteBackPrompt is injected once by the Stop hook when stop-loss ends a
+// run: the same bounded wrap-up the budget settlement does, so observations that
+// were made but never written back are not dropped with the slot.
+const StopLossWriteBackPrompt = "本轮已因无边际进展被止损，即将结束。不要再运行任何命令/探测。只做一件事：把你上面已识别但还没写回的内容逐条写回——新资产用 insert_assets、探索结论/事实用 record_fact、确认漏洞用 report_finding；没有待写回的内容就直接用一句话纯文本收尾结束。"
+
 // StopLossKind is why a run should stop early, or why the safety ceiling applies.
 type StopLossKind string
 
@@ -199,6 +209,8 @@ type StopLossMonitor struct {
 	idle          int
 	repeats       map[string]int
 	maxRepeat     int
+	wroteBackOnce bool
+	turnsSpent    bool
 }
 
 // NewStopLossMonitor starts observing from now.
@@ -374,6 +386,35 @@ func (m *StopLossMonitor) recomputeLocked() StopLossVerdict {
 	return m.verdict
 }
 
+// offerWriteBack reports whether this run still owes its one bounded write-back
+// round, and consumes the offer. It never changes the verdict, the counters or
+// the terminal reason — only whether the Stop hook terminates now or after one
+// wrap-up round.
+func (m *StopLossMonitor) offerWriteBack() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.wroteBackOnce || m.turnsSpent {
+		return false
+	}
+	m.wroteBackOnce = true
+	return true
+}
+
+// markPostStopLossTurnsSpent records that the post-stop-loss model-call cap is
+// reached, so no write-back round is offered that could not run anyway: the run
+// then terminates through the Stop hook as before.
+func (m *StopLossMonitor) markPostStopLossTurnsSpent() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.turnsSpent = true
+	m.mu.Unlock()
+}
+
 // Verdict returns the last fired stop-loss, or a zero verdict.
 func (m *StopLossMonitor) Verdict() StopLossVerdict {
 	if m == nil {
@@ -438,10 +479,12 @@ func AttachStopLossWrites(hooks harness.HookRunner, fn func() (WriteCounts, bool
 
 func (h stopLossHooks) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
 	if verdict := h.mon.Verdict(); verdict.Fired() {
-		switch name {
-		case "record_fact":
-		default:
-			return true, verdict.Message(), nil
+		// Write-back keeps running after stop-loss: an observation already made
+		// must still be able to reach the graph (fact, asset or finding). Probes
+		// stay blocked, and the block message says what is still allowed so the
+		// remaining bounded turns are spent persisting instead of retrying.
+		if !isWriteBackTool(name) {
+			return true, verdict.Message() + StopLossWriteBackHint, nil
 		}
 	}
 	if h.inner != nil {
@@ -464,6 +507,14 @@ func (h stopLossHooks) Stop(ctx context.Context, messages []llm.Message) (bool, 
 	if h.mon != nil {
 		v := h.mon.Recompute()
 		if v.Fired() {
+			// One bounded write-back round: if the run stops while observations
+			// may still be unwritten, inject the write-back prompt once and let
+			// the model persist them. The offer is one-shot and the post-stop-loss
+			// model-call cap still bounds the run, so repeated wrap-up cannot
+			// extend it indefinitely.
+			if h.mon.offerWriteBack() {
+				return false, []string{StopLossWriteBackPrompt}, ""
+			}
 			return true, nil, v.Message()
 		}
 	}
