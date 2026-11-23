@@ -66,6 +66,31 @@ func parseTTPJSON(text string) []parsedTTP {
 	return out
 }
 
+// collectText runs one bounded non-streaming completion and returns the text.
+// Unlike server.streamCollectText (1024-token cap, meant for short verdicts), the
+// TTP distillation can emit several entries, so it needs real headroom — a cap that
+// is too low truncates the JSON array and parseTTPJSON silently drops everything.
+func collectText(ctx context.Context, prov llm.Provider, system, user string, maxTokens int) (string, error) {
+	temp := 0.0
+	req := llm.CompletionRequest{
+		System:      []string{system},
+		Messages:    []llm.Message{llm.UserText(user)},
+		MaxTokens:   maxTokens,
+		Temperature: &temp,
+		Thinking:    "disabled",
+	}
+	var sb strings.Builder
+	for ev, err := range prov.Stream(ctx, req) {
+		if err != nil {
+			return "", err
+		}
+		if ev.Type == llm.SETextDelta {
+			sb.WriteString(ev.Text)
+		}
+	}
+	return sb.String(), nil
+}
+
 // retroProvider resolves the LLM provider for a task's retro (task-pinned profile,
 // else global active), nil when none is configured.
 func (s *Server) retroProvider(t *Task) llm.Provider {
@@ -130,7 +155,7 @@ func (s *Server) runRetro(taskID string) {
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
 	defer cancel()
-	text, err := streamCollectText(ctx, prov, retroSystemPrompt, input)
+	text, err := collectText(ctx, prov, retroSystemPrompt, input, 4096)
 	if err != nil {
 		log.Printf("[retro] task %s 蒸馏失败: %v", taskID, err)
 		return
@@ -264,27 +289,24 @@ func (s *Server) reviewTTPEntry(w http.ResponseWriter, r *http.Request, status s
 		writeErr(w, 400, "invalid id")
 		return
 	}
-	cur, err := pg.GetTTPEntry(id)
+	// 原子状态转移:只在 status 仍为 pending 时更新,changed=false 表示被并发的另一次
+	// 审核(approve/reject 二选一)抢先定夺 → 返回 409,且不并入决策语料,避免重复/错误落盘。
+	updated, changed, err := pg.SetTTPStatus(id, status, "human")
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	if cur == nil {
+	if updated == nil {
 		writeErr(w, 404, "条目不存在")
 		return
 	}
-	if cur.Status != "pending" {
+	if !changed {
 		writeErr(w, 409, "该条目已审核")
-		return
-	}
-	updated, err := pg.SetTTPStatus(id, status, "human")
-	if err != nil {
-		writeErr(w, 500, err.Error())
 		return
 	}
 	// 审核通过:并入决策语料。运行时已由 overlay(读 approved)即时生效;再 best-effort
 	// 追加落盘到 agent/chainskel/<category>.md,把语料持久化成仓库格式(供下次构建 embed)。
-	if status == "approved" && updated != nil {
+	if status == "approved" {
 		appendChainskelLine(updated.Category, db.TTPLine(*updated))
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "entry": updated})
@@ -325,7 +347,7 @@ func (s *Server) importWriteup(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
 	defer cancel()
-	text, err := streamCollectText(ctx, prov, writeupSystemPrompt, body.Text)
+	text, err := collectText(ctx, prov, writeupSystemPrompt, body.Text, 4096)
 	if err != nil {
 		writeErr(w, 502, "解析失败: "+err.Error())
 		return
@@ -344,9 +366,11 @@ func (s *Server) importWriteup(w http.ResponseWriter, r *http.Request) {
 		}
 		e := db.TTPEntry{Source: "writeup", Status: "pending", Category: normCategory(p.Category),
 			Scene: p.Scene, Criteria: p.Criteria, Pivot: p.Pivot, Confidence: conf, OriginRef: origin}
-		if _, err := pg.AddTTPEntry(e); err == nil {
-			n++
+		if _, err := pg.AddTTPEntry(e); err != nil {
+			writeErr(w, 500, fmt.Sprintf("已保存 %d 条,但入库失败: %v", n, err))
+			return
 		}
+		n++
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "queued": n})
 }
