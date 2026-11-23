@@ -183,22 +183,23 @@ func IntentStateAfterRun(reason harness.TerminalReason, runErr error, loss StopL
 // StopLossMonitor observes tool use during a run and decides stop-loss.
 // It is safe for concurrent hook calls.
 type StopLossMonitor struct {
-	mu            sync.Mutex
-	policy        StopLossPolicy
-	started       time.Time
-	writes        func() (WriteCounts, bool)
-	writeBaseline WriteCounts
-	baselineSet   bool
-	verdict       StopLossVerdict
-	factsOK       bool
-	assetsOK      bool
-	cmdsOK        bool
-	newFacts      int
-	newAssets     int
-	newFinds      int
-	idle          int
-	repeats       map[string]int
-	maxRepeat     int
+	mu             sync.Mutex
+	policy         StopLossPolicy
+	started        time.Time
+	writes         func() (WriteCounts, bool)
+	writeBaseline  WriteCounts
+	baselineSet    bool
+	verdict        StopLossVerdict
+	factsOK        bool
+	assetsOK       bool
+	cmdsOK         bool
+	newFacts       int
+	newAssets      int
+	newFinds       int
+	idle           int
+	repeats        map[string]int
+	maxRepeat      int
+	preWriteNudged bool
 }
 
 // NewStopLossMonitor starts observing from now.
@@ -276,6 +277,7 @@ func (m *StopLossMonitor) resetIdleWindowLocked() {
 	m.newFacts = 0
 	m.newAssets = 0
 	m.newFinds = 0
+	m.preWriteNudged = false
 	if m.writes == nil {
 		return
 	}
@@ -408,6 +410,63 @@ func (m *StopLossMonitor) MarkSignalsUnknown(facts, assets, commands bool) {
 	m.mu.Unlock()
 }
 
+// StopLossWriteBackReminderPrefix marks the pre-latch write-back reminder in a
+// PreToolUse block message. It is NOT a stop-loss: the run continues, the idle
+// counter and the verdict are untouched, and the 6/2 thresholds are unchanged.
+// The reminder only gives the worker a chance to persist what it already
+// observed before the idle window runs out, so a run that made real progress
+// records it instead of losing it to the latch.
+const StopLossWriteBackReminderPrefix = "【写回提醒】"
+
+const writeBackReminderBody = "你已连续多次探测但还没有把结果写回知识图谱（写进图才算进展，脑子/文字里的不算）。" +
+	"本次工具调用【未执行】：若你已经观察到可写回的内容，请现在就逐条写回——新资产用 insert_assets、探索结论/事实用 record_fact、确认漏洞用 report_finding，" +
+	"只写你本次【真实观察到】的，不要为了凑进展编造或把已有事实换措辞重记。" +
+	"若确实没有新发现，无需写回，直接继续你的下一步探测即可（连续无进展仍会按原策略止损，这不是目标失败）。"
+
+// RemindWriteBack decides whether to interrupt a probe once, before the
+// no_progress latch, so the worker can persist observations it has already
+// made. It fires at most once per idle window, only for a probe tool, only
+// while the run is not latched, and only when the idle window is one probe away
+// from the no_progress limit with no new write in that window. It never changes
+// the idle counter, the verdict, or the policy thresholds: if the worker writes
+// nothing, the next probe still drives the window to the limit and no_progress
+// fires exactly as before. Returns the reminder message and true when the
+// caller should block this one tool call and hand the message to the model.
+func (m *StopLossMonitor) RemindWriteBack(name string) (string, bool) {
+	if m == nil {
+		return "", false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.verdict.Fired() {
+		return "", false
+	}
+	if !isProbeTool(name) {
+		return "", false
+	}
+	if m.preWriteNudged {
+		return "", false
+	}
+	sig := m.signalsLocked()
+	// Only when no_progress is genuinely approaching and progress is readable.
+	// Missing signals fail-soft exactly like the latch itself.
+	if !sig.FactsKnown || !sig.AssetsKnown {
+		return "", false
+	}
+	if sig.NewFacts != 0 || sig.NewAssets != 0 || sig.NewFindings != 0 {
+		return "", false
+	}
+	threshold := m.policy.idleLimit() - 1
+	if threshold < 1 {
+		threshold = 1
+	}
+	if sig.IdleProbes < threshold {
+		return "", false
+	}
+	m.preWriteNudged = true
+	return StopLossWriteBackReminderPrefix + writeBackReminderBody, true
+}
+
 // stopLossHooks wraps an inner HookRunner and enforces stop-loss in the
 // harness (PreToolUse blocks further probes; Stop prevents continuation).
 type stopLossHooks struct {
@@ -443,6 +502,8 @@ func (h stopLossHooks) PreToolUse(ctx context.Context, name string, input []byte
 		default:
 			return true, verdict.Message(), nil
 		}
+	} else if msg, ok := h.mon.RemindWriteBack(name); ok {
+		return true, msg, nil
 	}
 	if h.inner != nil {
 		return h.inner.PreToolUse(ctx, name, input)
