@@ -957,12 +957,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			// 下一轮 worker 循环撞终态门就不再领新意图;被取消的这批走下方"任务已完成"分支
 			// 归为 stopped(而非 blocked)。
 			e.cancelExec(t.ID, agent.AbortGoalMet)
-			// 结构化复盘:任务收官触发一次,蒸馏本次经验为待审 TTP(best-effort,异步)。
-			if e.retroHook != nil {
-				if _, fired := e.retroFired.LoadOrStore(t.ID, true); !fired {
-					e.retroHook(t.ID)
-				}
-			}
+			e.fireRetro(t.ID) // 结构化复盘:任务收官触发一次(best-effort,异步)
 		default:
 			log.Printf("[planner] task %s 规划完成", t.ID)
 		}
@@ -1355,4 +1350,16 @@ func (e *Engine) claimNext(ctx context.Context, t *Task, name string) *db.Node {
 		}
 	}
 	return nil
+}
+
+// fireRetro triggers the task-completion retro hook at most once per task. Both the
+// normal planner `met` branch and the deadline-settlement path call it, so a task
+// that finishes either way produces exactly one set of pending retrospective entries.
+func (e *Engine) fireRetro(taskID string) {
+	if e.retroHook == nil {
+		return
+	}
+	if _, fired := e.retroFired.LoadOrStore(taskID, true); !fired {
+		e.retroHook(taskID)
+	}
 }
