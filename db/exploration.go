@@ -200,6 +200,14 @@ func (s *ExplorationStore) AddNode(kind string, payload map[string]any, priority
 }
 
 func (s *ExplorationStore) AddNodeCtx(ctx context.Context, kind string, payload map[string]any, priority int, state, origin string, anchors []int64) (int64, error) {
+	return s.addNodeCtx(ctx, kind, payload, priority, state, origin, anchors, 0)
+}
+
+func (s *ExplorationStore) AddFactCtx(ctx context.Context, payload map[string]any, origin string, anchors []int64, intentID int64) (int64, error) {
+	return s.addNodeCtx(ctx, KindFact, payload, 5, "confirmed", origin, anchors, intentID)
+}
+
+func (s *ExplorationStore) addNodeCtx(ctx context.Context, kind string, payload map[string]any, priority int, state, origin string, anchors []int64, intentID int64) (int64, error) {
 	raw, _ := json.Marshal(payload)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -216,6 +224,11 @@ VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
 	for _, a := range anchors {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_anchors(node_id, asset_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, id, a); err != nil {
 			return 0, err
+		}
+	}
+	if intentID > 0 {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_edges(exploration_id, src_id, rel, dst_id) VALUES ($1,$2,$3,$4)`, s.expID, intentID, RelYields, id); err != nil {
+			return 0, fmt.Errorf("link fact to intent %d: %w", intentID, err)
 		}
 	}
 	return id, tx.Commit()

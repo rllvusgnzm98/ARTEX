@@ -1450,15 +1450,10 @@ func (t *ToolSet) recordOneFactCtx(ctx context.Context, it factItem, defaultInte
 		}
 	}
 	// a fact is its OWN node kind (distinct from a vuln finding).
-	id, err := t.ts.AddNodeCtx(ctx, db.KindFact, payload, 5, "confirmed", t.worker, pidList(it.AssetIDs))
+	id, err := t.ts.AddFactCtx(ctx, payload, t.worker, pidList(it.AssetIDs), intent)
 	if err != nil {
 		t.writes.Failures++
 		return 0, err
-	}
-	if intent > 0 {
-		if err := t.ts.LinkCtx(ctx, intent, db.RelYields, id); err != nil {
-			t.writes.Failures++
-		}
 	}
 	t.writes.Facts++
 	return id, nil

@@ -1,14 +1,58 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 )
+
+func TestRecordFactRollsBackWhenIntentLinkMissesDeadline(t *testing.T) {
+	d, es := retentionStore(t)
+	intent, err := es.AddIntent(map[string]any{"summary": "record facts"}, 0, nil, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := NewToolSet(es, "worker")
+	before, err := es.CountByKind(db.KindFact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locker, err := d.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Rollback()
+	if _, err := locker.Exec("LOCK TABLE exploration_edges IN ACCESS EXCLUSIVE MODE"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	item := factItem{Summary: "checkpoint"}
+	_, err = ts.recordOneFactCtx(ctx, item, intent)
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "link fact to intent") {
+		t.Fatalf("expected intent link deadline, got %v", err)
+	}
+	if err := locker.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := es.CountByKind(db.KindFact); err != nil || count != before || ts.Writes() != (WriteCounts{Failures: 1}) {
+		t.Fatalf("orphan fact or incorrect counters: count=%d before=%d writes=%+v err=%v", count, before, ts.Writes(), err)
+	}
+	id, err := ts.recordOneFactCtx(t.Context(), item, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids, err := es.FactsYielded(intent); err != nil || !reflect.DeepEqual(ids, []int64{id}) {
+		t.Fatalf("planner lookup: ids=%v err=%v, want [%d]", ids, err, id)
+	}
+}
 
 func TestRecordFactStructuredPriority(t *testing.T) {
 	_, es := retentionStore(t)
