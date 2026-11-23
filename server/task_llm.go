@@ -257,12 +257,12 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 		retries, backoffOf := sameProviderRetryPolicy(selection.retry)
 		for attempt := 0; ; attempt++ {
 			msg, sr, usage, callErr = selection.provider.Complete(ctx, req)
-			if callErr != nil && ctx.Err() == nil &&
+			if callErr != nil && ctx.Err() == nil && !agent.ModelRetriesStopped(ctx) &&
 				attempt < retries && isRetryableStreamError(callErr) {
 				backoff := backoffOf(attempt)
 				log.Printf("[task-llm] task %s 非流式调用失败,%v 后同 provider 重试 (%d/%d): %v",
 					taskID, backoff, attempt+1, retries, callErr)
-				if sleepCtx(ctx, backoff) {
+				if sleepCtx(ctx, backoff) || agent.ModelRetriesStopped(ctx) {
 					break // 退避期间 ctx 取消 → 停止重试
 				}
 				continue
@@ -273,7 +273,7 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 			return msg, sr, usage, nil
 		}
 		// profileID=0: 显式链已被清空;非额度错误:透传。二者都不改任务 failover 状态。
-		if selection.profileID == 0 || !isQuotaExhaustedError(callErr) {
+		if agent.ModelRetriesStopped(ctx) || selection.profileID == 0 || !isQuotaExhaustedError(callErr) {
 			return llm.Message{}, "", llm.Usage{}, callErr
 		}
 		transition, markErr := hooks.exhaust(selection, callErr)
@@ -331,12 +331,12 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 						return
 					}
 				}
-				if streamErr != nil && !committed && ctx.Err() == nil &&
+				if streamErr != nil && !committed && ctx.Err() == nil && !agent.ModelRetriesStopped(ctx) &&
 					attempt < retries && isRetryableStreamError(streamErr) {
 					backoff := backoffOf(attempt)
 					log.Printf("[task-llm] task %s 提交前流失败,%v 后同 provider 重试 (%d/%d): %v",
 						taskID, backoff, attempt+1, retries, streamErr)
-					if sleepCtx(ctx, backoff) {
+					if sleepCtx(ctx, backoff) || agent.ModelRetriesStopped(ctx) {
 						break // 退避期间 ctx 取消 → 停止重试
 					}
 					continue
@@ -354,7 +354,7 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 			// profileID=0 means the explicit chain was cleared while this stable task
 			// bundle was still in use. Agent/global fallback errors follow the legacy
 			// behavior and never mutate task failover state.
-			if selection.profileID == 0 || !isQuotaExhaustedError(streamErr) {
+			if agent.ModelRetriesStopped(ctx) || selection.profileID == 0 || !isQuotaExhaustedError(streamErr) {
 				for _, buffered := range pending {
 					if !yield(buffered, nil) {
 						return

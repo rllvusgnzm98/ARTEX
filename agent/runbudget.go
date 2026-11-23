@@ -12,6 +12,16 @@ import (
 )
 
 type runBudgetKey struct{}
+type modelRetryStopKey struct{}
+
+func WithModelRetryStop(ctx context.Context, monitor *StopLossMonitor) context.Context {
+	return context.WithValue(ctx, modelRetryStopKey{}, monitor)
+}
+
+func ModelRetriesStopped(ctx context.Context) bool {
+	monitor, _ := ctx.Value(modelRetryStopKey{}).(*StopLossMonitor)
+	return monitor.Fired()
+}
 
 type runBudget struct {
 	work, hard time.Time
@@ -56,6 +66,9 @@ func (p *runBudgetProvider) postStopLossLimitReached() bool {
 }
 
 func (p *runBudgetProvider) callContext(ctx context.Context) (context.Context, context.CancelFunc, time.Time) {
+	if p.loss != nil {
+		ctx = WithModelRetryStop(ctx, p.loss)
+	}
 	if p.calls != nil {
 		p.calls.Add(1)
 	}

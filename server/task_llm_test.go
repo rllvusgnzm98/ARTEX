@@ -6,8 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +19,41 @@ import (
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 )
+
+func TestTaskLLMDoesNotRetryProductionProviderAfterStopLoss(t *testing.T) {
+	policy := agent.DefaultStopLossPolicy()
+	policy.IdleProbeLimit = 1
+	loss := agent.NewStopLossMonitor(policy)
+	loss.ObserveTool("Bash", []byte(`{"command":"fixture"}`), false)
+	if !loss.Recompute().Fired() {
+		t.Fatal("fixture did not latch")
+	}
+	ctx := agent.WithModelRetryStop(t.Context(), loss)
+	for _, stream := range []bool{true, false} {
+		var calls atomic.Int64
+		endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			calls.Add(1)
+			http.Error(w, "transient failure", http.StatusServiceUnavailable)
+		}))
+		t.Cleanup(endpoint.Close)
+		retry := agent.RetryConfig{ConnectAttempts: 2, ConnectInterval: time.Millisecond, StreamAttempts: 2, StreamInterval: time.Millisecond}
+		provider, err := (agent.Config{Format: "anthropic", BaseURL: endpoint.URL, APIKey: "fixture", Model: "fixture", Retry: retry}).NewProvider()
+		if err != nil {
+			t.Fatal(err)
+		}
+		hooks := taskLLMStreamHooks{current: func() (taskLLMSelection, error) {
+			return taskLLMSelection{provider: provider, retry: retry}, nil
+		}}
+		if stream {
+			_, err = collectTaskLLMStream(streamTaskLLM(ctx, "fixture", llm.CompletionRequest{}, hooks))
+		} else {
+			_, _, _, err = completeTaskLLM(ctx, "fixture", llm.CompletionRequest{}, hooks)
+		}
+		if err == nil || !strings.Contains(err.Error(), "503") || calls.Load() != 1 {
+			t.Fatalf("stream=%t: HTTP calls=%d error=%v; want one transient failure", stream, calls.Load(), err)
+		}
+	}
+}
 
 type scriptedLLMProvider struct {
 	events []llm.StreamEvent
