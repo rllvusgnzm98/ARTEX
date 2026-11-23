@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"sync"
 
 	"github.com/Autumn-27/artex/agent"
@@ -13,10 +14,16 @@ import (
 // profile) until an operator resets health or edits the chain.
 var supplyHolds sync.Map // taskID -> struct{}
 
+// supplyMu orders a revision-checked hold against the release a chain
+// replacement issues after publishing its new revision.
+var supplyMu sync.Mutex
+
 func holdTaskSupply(taskID string) {
 	if taskID == "" {
 		return
 	}
+	supplyMu.Lock()
+	defer supplyMu.Unlock()
 	supplyHolds.Store(taskID, struct{}{})
 }
 
@@ -24,6 +31,8 @@ func releaseTaskSupply(taskID string) {
 	if taskID == "" {
 		return
 	}
+	supplyMu.Lock()
+	defer supplyMu.Unlock()
 	supplyHolds.Delete(taskID)
 }
 
@@ -58,6 +67,31 @@ func applySupplyHold(t *Task) {
 		return
 	}
 	holdTaskSupply(t.ID)
+}
+
+// applySupplyHoldAt freezes dispatch for a supply failure observed at chain
+// revision (0 = unknown). A chain replaced since then already released the
+// hold, so a late failure must not restore it. Replacement publishes the new
+// revision before releaseTaskSupply, so checking under supplyMu is enough.
+func applySupplyHoldAt(t *Task, revision int64) bool {
+	if t == nil || t.ID == "" {
+		return false
+	}
+	supplyMu.Lock()
+	defer supplyMu.Unlock()
+	if revision > 0 && t.llmStateSnapshot().ChainRevision > revision {
+		return false
+	}
+	supplyHolds.Store(t.ID, struct{}{})
+	return true
+}
+
+func taskLLMErrorRevision(err error) int64 {
+	var target *taskLLMError
+	if errors.As(err, &target) {
+		return target.revision
+	}
+	return 0
 }
 
 // shouldClaimWork is the engine-side dispatch gate.

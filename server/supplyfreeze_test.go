@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/Autumn-27/artex/agent"
@@ -111,5 +112,55 @@ func TestTaskLLMChainExhaustedIsSupplyFailure(t *testing.T) {
 	wrapped := fmt.Errorf("worker: %w", exhausted)
 	if !errors.Is(wrapped, agent.ErrProviderChainExhausted) || !agent.IsSupplyFailure(wrapped) {
 		t.Fatal("wrapped chain-exhausted error must still classify")
+	}
+}
+
+func TestLateSupplyFailureDoesNotRefreezeReplacedChain(t *testing.T) {
+	t.Cleanup(releaseAllTaskSupply)
+	task := &Task{ID: "task-replaced", LLMChainRevision: 5}
+	if applySupplyHoldAt(task, 4) || taskSupplyFrozen(task) {
+		t.Fatal("failure from a replaced chain revision must not freeze the task")
+	}
+	if !applySupplyHoldAt(task, 5) || !taskSupplyFrozen(task) {
+		t.Fatal("failure at the current revision must freeze the task")
+	}
+	releaseTaskSupply(task.ID)
+	if !applySupplyHoldAt(task, 0) || !taskSupplyFrozen(task) {
+		t.Fatal("failure with unknown revision keeps the legacy freeze")
+	}
+}
+
+func TestStaleSupplyFailuresAfterReplacementLeaveTaskUnfrozen(t *testing.T) {
+	t.Cleanup(releaseAllTaskSupply)
+	for round := 0; round < 200; round++ {
+		task := &Task{ID: "task-race", LLMChainRevision: 4}
+		var wg sync.WaitGroup
+		replaced := make(chan struct{})
+		for i := 0; i < 4; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				applySupplyHoldAt(task, 4)
+			}()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			task.llmMu.Lock()
+			task.LLMChainRevision = 5
+			task.llmMu.Unlock()
+			releaseTaskSupply(task.ID)
+			close(replaced)
+		}()
+		<-replaced
+		wg.Wait()
+		// Every stale hold either preceded the release or saw revision 5.
+		if taskSupplyFrozen(task) {
+			t.Fatalf("round %d: stale failure refroze the replaced chain", round)
+		}
+		if !applySupplyHoldAt(task, 5) || !taskSupplyFrozen(task) {
+			t.Fatalf("round %d: current-revision failure did not freeze", round)
+		}
+		releaseTaskSupply(task.ID)
 	}
 }

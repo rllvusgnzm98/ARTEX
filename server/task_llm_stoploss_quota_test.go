@@ -9,7 +9,7 @@ import (
 	"github.com/Autumn-27/norma/llm"
 )
 
-func TestTaskLLMStopLossCommittedQuotaDoesNotAdvance(t *testing.T) {
+func TestTaskLLMStopLossCommittedQuotaBooksWithoutReplay(t *testing.T) {
 	policy := agent.DefaultStopLossPolicy()
 	policy.IdleProbeLimit = 1
 	loss := agent.NewStopLossMonitor(policy)
@@ -29,13 +29,14 @@ func TestTaskLLMStopLossCommittedQuotaDoesNotAdvance(t *testing.T) {
 		exhaust: func(taskLLMSelection, error) (db.TaskLLMTransition, error) {
 			exhausts++
 			next := int64(22)
-			return db.TaskLLMTransition{PreviousProfileID: 11, NextProfileID: &next, Advanced: true}, nil
+			return db.TaskLLMTransition{PreviousProfileID: 11, NextProfileID: &next, Advanced: true, Revision: 3}, nil
 		},
 		transition: func(taskLLMSelection, db.TaskLLMTransition, error) { transitions++ },
 	}
 	events, err := collectTaskLLMStream(streamTaskLLM(ctx, "7", llm.CompletionRequest{}, hooks))
-	if err != quota || len(events) != 1 || events[0].Text != "partial" || selections != 1 ||
-		provider.calls != 1 || exhausts != 0 || transitions != 0 {
+	if !errors.Is(err, quota) || !isTaskLLMFailoverReady(err) || taskLLMErrorRevision(err) != 3 ||
+		len(events) != 1 || events[0].Text != "partial" || selections != 1 ||
+		provider.calls != 1 || exhausts != 1 || transitions != 1 {
 		t.Fatalf("events=%+v err=%v selections=%d calls=%d exhausts=%d transitions=%d", events, err, selections, provider.calls, exhausts, transitions)
 	}
 }

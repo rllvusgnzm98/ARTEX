@@ -1291,8 +1291,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		if controlErr = transitionIntentState(t.Store, intent.ID, "running", settle.IntentState); controlErr != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 供应故障回场失败: %v", name, t.ID, intent.ID, controlErr)
 		}
-		if settle.FreezeScene {
-			applySupplyHold(t)
+		if settle.FreezeScene && applySupplyHoldAt(t, taskLLMErrorRevision(err)) {
 			e.emitActivity(t, db.Activity{Worker: "system", Kind: "text", IsError: true,
 				Summary: agent.SupplyFreezeSummary(), Detail: fmt.Sprintf("%s: %v", settle.Signal, err)})
 			log.Printf("[worker %s] task %s 意图 #%d 供应故障，现场冻结（%s），不记目标失败、不标 blocked/done；写回 %s", name, t.ID, intent.ID, settle.Signal, wrote)
