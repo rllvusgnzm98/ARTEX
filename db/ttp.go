@@ -95,15 +95,21 @@ func (d *DB) GetTTPEntry(id int64) (*TTPEntry, error) {
 	return &list[0], nil
 }
 
-// SetTTPStatus moves an entry to approved/rejected (stamping reviewer+time) and
-// returns the updated row.
-func (d *DB) SetTTPStatus(id int64, status, reviewer string) (*TTPEntry, error) {
-	if _, err := d.Exec(
-		`UPDATE ttp_entries SET status=$2, reviewer=$3, reviewed_at=now() WHERE id=$1`,
-		id, status, reviewer); err != nil {
-		return nil, err
+// SetTTPStatus atomically moves a PENDING entry to approved/rejected (stamping
+// reviewer+time) and returns the row plus changed=true iff this call made the
+// transition. The WHERE status='pending' guard makes concurrent approve/reject a
+// single-winner race: the loser gets changed=false (and must not mutate the corpus).
+func (d *DB) SetTTPStatus(id int64, status, reviewer string) (*TTPEntry, bool, error) {
+	res, err := d.Exec(
+		`UPDATE ttp_entries SET status=$2, reviewer=$3, reviewed_at=now()
+		 WHERE id=$1 AND status='pending'`,
+		id, status, reviewer)
+	if err != nil {
+		return nil, false, err
 	}
-	return d.GetTTPEntry(id)
+	n, _ := res.RowsAffected()
+	e, err := d.GetTTPEntry(id)
+	return e, n > 0, err
 }
 
 // ApprovedTTPLines returns the chainskel-format lines for approved entries of a

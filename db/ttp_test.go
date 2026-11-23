@@ -42,11 +42,15 @@ func TestTTPReviewPipeline(t *testing.T) {
 	}
 
 	// Approve the retro entry → it joins the overlay; reject the writeup → it never does.
-	if _, err := d.SetTTPStatus(id, "approved", "human"); err != nil {
-		t.Fatal(err)
+	if _, changed, err := d.SetTTPStatus(id, "approved", "human"); err != nil || !changed {
+		t.Fatalf("approve failed: changed=%v err=%v", changed, err)
 	}
-	if _, err := d.SetTTPStatus(wid, "rejected", "human"); err != nil {
-		t.Fatal(err)
+	if _, changed, err := d.SetTTPStatus(wid, "rejected", "human"); err != nil || !changed {
+		t.Fatalf("reject failed: changed=%v err=%v", changed, err)
+	}
+	// A second review on an already-settled entry is a no-op (single-winner guard).
+	if _, changed, _ := d.SetTTPStatus(id, "rejected", "human"); changed {
+		t.Fatalf("second review on a settled entry must report changed=false")
 	}
 	lines, err = d.ApprovedTTPLines("web")
 	if err != nil {
