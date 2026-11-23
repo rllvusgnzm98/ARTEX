@@ -34,3 +34,36 @@ func TestEffectiveSummaryUsesEffectiveValuesAndRedacts(t *testing.T) {
 		}
 	}
 }
+
+// TestRedactMasksQueryStringPassword 覆盖 URL 查询串里的口令：keywordSecret 要求键前是
+// 行首或空白，`?password=` / `&password=` 都不匹配，所以只靠它会把口令原样留在脱敏串里，
+// 再经运行溯源落库、从 task stats 读出去。
+func TestRedactMasksQueryStringPassword(t *testing.T) {
+	const secret = "pw-in-query"
+	for _, dsn := range []string{
+		"postgres://artex@h:5432/artex?password=" + secret + "&sslmode=disable",
+		"postgres://artex@h:5432/artex?sslmode=disable&PassWord=" + secret,
+		"postgres://artex@h:5432/artex?passfile=/x&pwd=" + secret,
+	} {
+		got := Redact(dsn)
+		if strings.Contains(got, secret) {
+			t.Fatalf("查询串里的口令没打码:\n  输入: %s\n  输出: %s", dsn, got)
+		}
+		if !strings.Contains(got, "h:5432") {
+			t.Fatalf("脱敏后仍该看得出连的是哪台库: %s", got)
+		}
+	}
+
+	// 非口令参数不受影响。
+	if got := Redact("postgres://artex@h:5432/artex?sslmode=require"); !strings.Contains(got, "sslmode=require") {
+		t.Fatalf("普通参数被改动了: %s", got)
+	}
+}
+
+// TestEffectiveSummaryOmitsHostPace 确认 config 侧不再自称知道每主机限速的生效值：
+// 它可由 Settings 在运行期改写，只有 Manager 知道，server 侧负责补上。
+func TestEffectiveSummaryOmitsHostPace(t *testing.T) {
+	if _, ok := EffectiveSummary()["host_pace_rps"]; ok {
+		t.Fatal("config 摘要不该带 host_pace_rps（那只会是启动默认值）")
+	}
+}

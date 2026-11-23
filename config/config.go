@@ -225,8 +225,9 @@ func redactKeywordSecrets(s string) string {
 }
 
 // Redact 返回供日志使用的脱敏 DSN。URL 形态（postgres://user:pass@host/db）
-// 仍按原逻辑打码 User 中的口令；url.Parse 失败或没有 User 时，再处理
-// key=value（password/passwd/pwd/pass）里的口令。
+// 打码 User 中的口令，并打码查询串里的口令参数（?password=...）——keywordSecret 要求
+// 键前是行首或空白，`?`/`&` 都不匹配，单靠它会把 URL 查询串里的口令原样留下。
+// url.Parse 失败或没有 scheme 时，走 key=value（password/passwd/pwd/pass）打码。
 func Redact(dsn string) string {
 	u, err := url.Parse(dsn)
 	// 无 scheme 的 key=value 串会被 url.Parse 收成 Path 并把空格编成 %20，
@@ -237,6 +238,24 @@ func Redact(dsn string) string {
 	if u.User != nil {
 		if _, hasPw := u.User.Password(); hasPw {
 			u.User = url.UserPassword(u.User.Username(), "****")
+		}
+	}
+	if q := u.Query(); len(q) > 0 {
+		masked := false
+		for k, vs := range q {
+			switch strings.ToLower(k) {
+			case "password", "passwd", "pwd", "pass":
+				for i := range vs {
+					if vs[i] != "" {
+						vs[i] = "****"
+						masked = true
+					}
+				}
+				q[k] = vs
+			}
+		}
+		if masked {
+			u.RawQuery = q.Encode()
 		}
 	}
 	return redactKeywordSecrets(u.String())
@@ -448,6 +467,9 @@ func TaskProxyPortRange() string {
 // 否则快照可能显示一份进程从未使用过的端口区间或 DSN 来源。
 //
 // 凭据只记「是否配置」与来源，DSN 一律经 Redact 打码后再记，绝不落原文口令。
+//
+// 刻意不含 host_pace_rps：每主机限速可由 Settings 在运行期改写（Manager.SetHostPace），
+// 生效值只有 Manager 知道，这里给出的只会是启动默认值。该字段由 server 侧补上生效值。
 func EffectiveSummary() map[string]any {
 	dsn, source, err := PostgresDSN()
 	out := map[string]any{
@@ -456,7 +478,6 @@ func EffectiveSummary() map[string]any {
 		"tunnel_port_range":     TunnelPortRange(),
 		"task_proxy_enabled":    TaskProxyEnabled(),
 		"task_proxy_port_range": TaskProxyPortRange(),
-		"host_pace_rps":         HostPaceRPS(),
 		"own_infra_hosts":       len(OwnInfraHosts()),
 		"own_infra_port":        OwnInfraPort(),
 		"jwt_ttl":               JWTTTL().String(),
