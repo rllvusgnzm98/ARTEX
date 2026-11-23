@@ -37,6 +37,42 @@ services:
       # 把项目根目录的 skills 挂进容器（覆盖镜像内置的 /app/skills）；
       # 改 skill 无需重建镜像，容器读的就是宿主机这份。
       - ./skills:/app/skills
+      # emp3r0r cc workspace 只读挂载：artex 读 wg_config.json 拿 WG 凭据
+      # （server/operator 公钥私钥、WG IP），即 config.emp3r0r 的凭据来源。
+      - ./data/emp3r0r:/emp3r0r-workspace:ro
+      # deploy_emp3r0r 投递的 agent 二进制（本地构建/下载后放入该目录）。
+      - ./data/emp3r0r-agent:/emp3r0r-agent:ro
+    restart: unless-stopped
+
+  # emp3r0r C2 sidecar（server 模式）。emp3r0r v5 的 operator API 绑定在
+  # userspace WireGuard netstack 上：ARTEX 以 provisioning 的 operator WG
+  # 凭据接入 cc overlay（凭据见容器内 ~/.emp3r0r/wg_config.json）。
+  # 首次启动生成 wg_config.json；artex 侧 config.emp3r0r 从中取：
+  #   wg_endpoint        = 本服务 UDP 端口（EMP3R0R_WG_PORT）
+  #   wg_server_public_key / wg_server_ip = wg_config.json server 段
+  #   wg_operator_ip / wg_operator_key    = wg_config.json operators.artex
+  #   operator_port      = wg_endpoint 端口 + 1（HTTP 监听在 WG IP 上）
+  emp3r0r:
+    image: alpine:3.20
+    profiles: ["emp3r0r"]
+    # 固定版本 + 可选 sha256 校验，不盲信 latest：EMP3R0R_SHA256 为空时只警告。
+    command: >
+      sh -c "apk add --no-cache curl xz coreutils >/dev/null &&
+             curl -fsSL https://github.com/jm33-m0/emp3r0r/releases/download/${EMP3R0R_VERSION:-v5.9.1}/emp3r0r -o /usr/bin/emp3r0r &&
+             ( if [ -n '${EMP3R0R_SHA256:-}' ]; then
+                 echo \"${EMP3R0R_SHA256}  /usr/bin/emp3r0r\" | sha256sum -c - ||
+                   { echo '[emp3r0r] FAIL: 校验和不匹配，拒绝启动'; exit 1; };
+               else
+                 echo '[emp3r0r] WARN: EMP3R0R_SHA256 未设置，二进制未校验完整性';
+               fi ) &&
+             chmod +x /usr/bin/emp3r0r &&
+             emp3r0r server --port ${EMP3R0R_WG_PORT:-13377} --operators artex"
+    environment:
+      HOME: /root
+    volumes:
+      - ./data/emp3r0r:/root/.emp3r0r
+    ports:
+      - "13377:${EMP3R0R_WG_PORT:-13377}/udp"
     restart: unless-stopped
 
 volumes:

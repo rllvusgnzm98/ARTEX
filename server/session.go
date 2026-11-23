@@ -65,10 +65,24 @@ func (s *Server) initSessions() {
 			log.Printf("[session] 会话 %d secret 解析失败，跳过: %v", rec.ID, err)
 			continue
 		}
-		var sh *session.HTTPShell
+		var sh session.Session
 		switch rec.Kind {
 		case "http_php", "http_phpcmd", "http_jsp", "http_aspx", "http_phpenc", "http_jspenc":
 			sh, err = session.RestoreHTTPShell(rec.ID, sec)
+		case "emp3r0r":
+			if s.emp3r0r == nil || s.emp3r0r.client == nil {
+				log.Printf("[session] 会话 %d emp3r0r 未启用/桥接不可用，诚实标 dead", rec.ID)
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = s.sessStore.UpdateStatus(ctx, rec.ID, db.SessionDead)
+				cancel()
+				continue
+			}
+			sh, err = session.RestoreEmp3r0r(rec.ID, sec, s.emp3r0r.client)
+			if err == nil && s.emp3r0r != nil {
+				s.emp3r0r.mu.Lock()
+				s.emp3r0r.seen[sec.AgentTag] = rec.ID
+				s.emp3r0r.mu.Unlock()
+			}
 		default:
 			log.Printf("[session] 会话 %d 类型 %s 本期不支持恢复，跳过", rec.ID, rec.Kind)
 			continue
