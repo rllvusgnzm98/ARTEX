@@ -710,9 +710,6 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if !budgetProvider.loss.Fired() {
 		w.recoverSettlement(ctx, s, opts, settle, err, tsx, emitWrap)
 	}
-	if isRunBudgetError(err) {
-		reason = harness.ReasonTimeout
-	}
 	return reason, tsx.Writes(), err
 }
 
@@ -728,6 +725,9 @@ func captureWorkerSession(ctx context.Context, s *agentcore.Session, input strin
 	_, reason, err := captureRunSession(runCtx, s, input, emit)
 	if hardEnd != nil && context.Cause(runCtx) == hardEnd && errors.Is(err, context.DeadlineExceeded) {
 		return harness.ReasonTimeout, hardEnd
+	}
+	if isRunBudgetError(err) {
+		return harness.ReasonTimeout, err
 	}
 	return reason, err
 }
