@@ -316,39 +316,12 @@ func ScrubSecrets(dsn, s string) string {
 	return s
 }
 
-// sslPasswordSet 判断是否配了客户端私钥口令（sslpassword）。pgx 把它消化进 TLS 配置，
-// 不会留在 ConnConfig.Password 里，所以证书认证 + 加密私钥的部署单看登录口令会显示
-// 「没配口令」。
-//
-// 空值不算配了（`sslpassword=”` 是显式留空），环境变量 PGSSLPASSWORD 同样算。libpq 的
-// service 文件（PGSERVICE/pg_service.conf）里的 sslpassword 这里认不出来——要认得重写
-// 一遍 libpq 的 service 解析，不值当；那种部署会少记这一个布尔，但不会记错别的字段。
-func sslPasswordSet(dsn string) bool {
-	if strings.TrimSpace(os.Getenv("PGSSLPASSWORD")) != "" {
-		return true
-	}
-	if u, err := url.Parse(dsn); err == nil && u.Scheme != "" {
-		return strings.TrimSpace(u.Query().Get("sslpassword")) != ""
-	}
-	for _, m := range keywordSecret.FindAllStringSubmatch(dsn, -1) {
-		key := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(m[2]), "="))
-		if !strings.EqualFold(key, "sslpassword") {
-			continue
-		}
-		if strings.TrimSpace(unquoteDSNValue(m[3])) != "" {
-			return true
-		}
-	}
-	return false
-}
-
-// unquoteDSNValue 去掉 libpq 键值串里成对的引号。
-func unquoteDSNValue(v string) string {
-	if len(v) >= 2 && (v[0] == '\'' || v[0] == '"') && v[len(v)-1] == v[0] {
-		return v[1 : len(v)-1]
-	}
-	return v
-}
+// 这里刻意不记「是否配了客户端私钥口令（sslpassword）」。pgx 把它消化进 TLS 配置、不留
+// 在 ConnConfig 的任何字段里，想记就只能自己按 libpq 语义去读 DSN——而那套语义（单引号
+// 转义、双引号是字面量、引号内空白保留、显式空值压过 PGSSLPASSWORD、service 文件）复现
+// 起来极易出错：两轮评审分别抓到我把显式留空算成「配了」、又把 `sslpassword=""` 和纯空白
+// 值算成「没配」，方向正好相反。与其让快照给一个时对时错的布尔，不如不给：登录口令由
+// pgx 的 ConnConfig.Password 权威回答（见下），私钥口令的状态交给运维自己的配置来源。
 
 // isSocketHost 判断候选端点是不是 Unix 域套接字（libpq 以 "/" 开头的路径表示）。
 func isSocketHost(host string) bool { return strings.HasPrefix(host, "/") }
@@ -435,9 +408,8 @@ func connectionIdentity(dsn string) map[string]any {
 	cfg, err := pgconn.ParseConfig(dsn)
 	if err != nil {
 		return map[string]any{
-			"db_identity_parsed":    false,
-			"db_password_set":       len(dsnSecretValues(dsn)) > 0,
-			"db_key_passphrase_set": sslPasswordSet(dsn),
+			"db_identity_parsed": false,
+			"db_password_set":    len(dsnSecretValues(dsn)) > 0,
 		}
 	}
 	out := map[string]any{
@@ -450,7 +422,6 @@ func connectionIdentity(dsn string) map[string]any {
 		"db_tls_policy":   tlsPolicy(cfg),
 		"db_password_set": cfg.Password != "",
 		// 私钥口令与登录口令是两样东西，分开记，别让证书认证的部署显示成「没配口令」。
-		"db_key_passphrase_set": sslPasswordSet(dsn),
 	}
 	if eps := connectionEndpoints(cfg); len(eps) > 1 {
 		out["db_endpoints"] = eps

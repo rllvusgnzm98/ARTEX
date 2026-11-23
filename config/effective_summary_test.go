@@ -217,64 +217,6 @@ func TestIdentityKeepsFailoverEndpoints(t *testing.T) {
 	}
 }
 
-// TestKeyPassphraseIsRecordedSeparately 覆盖证书认证 + 加密私钥：pgx 把 sslpassword
-// 消化进 TLS 配置、不留在登录口令里，单看 db_password_set 会显示「没配口令」。
-func TestKeyPassphraseIsRecordedSeparately(t *testing.T) {
-	for _, dsn := range []string{
-		"postgres://u@h:5432/db?sslmode=disable&sslpassword=KEYPASS",
-		"host=h user=u dbname=d sslpassword='KEY PASS'",
-	} {
-		id := connectionIdentity(dsn)
-		if set, _ := id["db_key_passphrase_set"].(bool); !set {
-			t.Fatalf("%s 该认出配了私钥口令: %v", dsn, id)
-		}
-		for k, v := range id {
-			if sv, ok := v.(string); ok && strings.Contains(sv, "KEY") {
-				t.Fatalf("键 %q 带出了私钥口令: %v", k, sv)
-			}
-		}
-	}
-
-	// 没配时不得误报。
-	id := connectionIdentity("postgres://u:pw@h:5432/db?sslmode=disable")
-	if set, _ := id["db_key_passphrase_set"].(bool); set {
-		t.Fatalf("没配 sslpassword 不该误报: %v", id)
-	}
-	if set, _ := id["db_password_set"].(bool); !set {
-		t.Fatalf("登录口令仍该被认出: %v", id)
-	}
-}
-
-// TestKeyPassphraseEdgeCases 覆盖评审指出的两处误判：显式留空的 sslpassword 不算配了，
-// 而 PGSSLPASSWORD 环境变量算（libpq service 文件里的认不出来，见函数注释）。
-func TestKeyPassphraseEdgeCases(t *testing.T) {
-	for _, dsn := range []string{
-		"host=h user=u sslpassword=''",
-		`host=h user=u sslpassword=""`,
-		"postgres://u@h:5432/db?sslpassword=&sslmode=disable",
-	} {
-		if sslPasswordSet(dsn) {
-			t.Fatalf("显式留空不该算配了私钥口令: %s", dsn)
-		}
-	}
-
-	t.Run("环境变量", func(t *testing.T) {
-		t.Setenv("PGSSLPASSWORD", "ENVKEYPASS")
-		if !sslPasswordSet("host=h user=u dbname=d") {
-			t.Fatal("PGSSLPASSWORD 里的私钥口令该被认出")
-		}
-		id := connectionIdentity("host=h user=u dbname=d")
-		if set, _ := id["db_key_passphrase_set"].(bool); !set {
-			t.Fatalf("身份快照该如实记下: %v", id)
-		}
-		for k, v := range id {
-			if sv, ok := v.(string); ok && strings.Contains(sv, "ENVKEYPASS") {
-				t.Fatalf("键 %q 带出了私钥口令", k)
-			}
-		}
-	})
-}
-
 // TestTLSPolicyIgnoresSocketCandidates 覆盖混合 socket/TCP 部署：Unix 套接字上本来就不
 // 做 TLS，把它当成明文回退会把「每次 TCP 尝试都强制 TLS」记成 allowed。
 func TestTLSPolicyIgnoresSocketCandidates(t *testing.T) {
