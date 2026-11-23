@@ -16,6 +16,7 @@ import (
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
@@ -1128,7 +1129,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	// 止损锁定后的额度耗尽已由路由记账并切到备用 profile:本次不重放,按止损收场,
 	// 不把整个任务当供应故障冻结。
-	if loss.Fired() && isTaskLLMFailoverReady(err) {
+	if loss.Fired() && (isTaskLLMFailoverReady(err) || llmpool.HasStoppedBackup(err)) {
 		log.Printf("[worker %s] task %s 意图 #%d 止损后额度耗尽，已切换备用 profile，按止损收场: %v", name, t.ID, intent.ID, err)
 		err = nil
 	}

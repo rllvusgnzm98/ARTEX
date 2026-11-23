@@ -62,6 +62,26 @@ func failoverStopped(ctx context.Context) bool {
 	return stop != nil && stop()
 }
 
+// StoppedFailoverError is a failover-eligible failure surfaced without replay
+// because failover was stopped, while an eligible backup member remained.
+type StoppedFailoverError struct{ Err error }
+
+func (e *StoppedFailoverError) Error() string { return e.Err.Error() }
+func (e *StoppedFailoverError) Unwrap() error { return e.Err }
+
+// HasStoppedBackup reports whether err is a stopped failover with a backup left.
+func HasStoppedBackup(err error) bool {
+	var target *StoppedFailoverError
+	return errors.As(err, &target)
+}
+
+func stoppedErr(err error, backupLeft bool) error {
+	if backupLeft {
+		return &StoppedFailoverError{Err: err}
+	}
+	return err
+}
+
 // New builds a Pool over members (already in chain order). Returns nil when the
 // chain is empty. A single-member chain is still a valid Pool — it just behaves
 // exactly like the bare provider.
@@ -124,7 +144,7 @@ func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[
 				log.Printf("[llmpool] 配置 %q(%s) 已熔断：%s", m.Name, m.Model, trimErr(failed))
 			}
 			if failoverStopped(ctx) {
-				yield(llm.StreamEvent{}, failed)
+				yield(llm.StreamEvent{}, stoppedErr(failed, i+1 < len(order)))
 				return
 			}
 			if i+1 < len(order) {
@@ -170,7 +190,7 @@ func (p *Pool) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Mes
 			log.Printf("[llmpool] 配置 %q(%s) 已熔断：%s", m.Name, m.Model, trimErr(err))
 		}
 		if failoverStopped(ctx) {
-			return llm.Message{}, "", llm.Usage{}, err
+			return llm.Message{}, "", llm.Usage{}, stoppedErr(err, i+1 < len(order))
 		}
 		if i+1 < len(order) {
 			n := order[i+1]
