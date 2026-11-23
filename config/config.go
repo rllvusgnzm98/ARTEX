@@ -440,6 +440,42 @@ func TaskProxyPortRange() string {
 // 配置，但配置里混着凭据（DSN、库口令、JWT 相关、emp3r0r 密钥），所以这里按白名单
 // 取值：只收行为相关的开关与范围，凭据一律只记「是否配置」这一个布尔，绝不记原文。
 // 新增配置字段默认不进摘要——必须显式加进来，避免哪天把新的密钥顺手带出去。
+// EffectiveSummary 组装「这个进程实际在用的那套取值」的脱敏摘要。
+//
+// 与 Config.Summary() 的区别是来源：Summary 描述一份 Config 结构体（即配置文件内容），
+// 而运行时各处读的是 SkillDir()/CallbackAddr()/PostgresDSN() 这些访问器——它们在文件之上
+// 还叠了环境变量、默认值归一化，以及 SetListenAddr 这类运行期写入。做运行溯源必须记后者，
+// 否则快照可能显示一份进程从未使用过的端口区间或 DSN 来源。
+//
+// 凭据只记「是否配置」与来源，DSN 一律经 Redact 打码后再记，绝不落原文口令。
+func EffectiveSummary() map[string]any {
+	dsn, source, err := PostgresDSN()
+	out := map[string]any{
+		"skill_dir":             SkillDir(),
+		"callback_addr":         CallbackAddr(),
+		"tunnel_port_range":     TunnelPortRange(),
+		"task_proxy_enabled":    TaskProxyEnabled(),
+		"task_proxy_port_range": TaskProxyPortRange(),
+		"host_pace_rps":         HostPaceRPS(),
+		"own_infra_hosts":       len(OwnInfraHosts()),
+		"own_infra_port":        OwnInfraPort(),
+		"jwt_ttl":               JWTTTL().String(),
+		"jwt_rotation_period":   JWTRotationPeriod().String(),
+		"jwt_grace":             JWTGrace().String(),
+		"emp3r0r_enabled":       Emp3r0rConfig().Enabled,
+		// gate 的最终判定要读库里的 settings（见 ResolveGate），进程层面没有「生效值」，
+		// 所以这里如实记为配置值而不是冒充生效值。
+		"gate_mode_configured": Load().GateMode,
+		"db_dsn_set":           strings.TrimSpace(dsn) != "",
+		"db_dsn_source":        source,
+		"db_dsn_redacted":      Redact(dsn),
+	}
+	if err != nil {
+		out["db_dsn_error"] = err.Error()
+	}
+	return out
+}
+
 func (c Config) Summary() map[string]any {
 	return map[string]any{
 		"skill_dir":             c.SkillDir,

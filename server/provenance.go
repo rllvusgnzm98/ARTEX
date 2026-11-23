@@ -26,7 +26,7 @@ func runtimeProvenance() map[string]any {
 			"idle_probe_limit":       sl.IdleProbeLimit,
 			"repeat_command_limit":   sl.RepeatCommandLimit,
 		},
-		"config": config.Load().Summary(),
+		"config": config.EffectiveSummary(),
 	}
 }
 
