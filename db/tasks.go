@@ -631,7 +631,7 @@ deletable AS (
     JOIN exploration_nodes n ON n.id=ea.node_id
     JOIN tasks t ON t.exploration_id=n.exploration_id
     WHERE ea.asset_id=a.id AND t.id<>$1 AND t.deleted_at IS NULL
-  )
+  ) AND NOT a.crown_jewel  -- 目标导向:绝不随任务清理删除运营者标记的靶标资产
 )
 DELETE FROM assets a USING deletable d WHERE a.id=d.id`, id, expID)
 		if err != nil {
