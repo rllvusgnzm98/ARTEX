@@ -63,13 +63,16 @@ type runBudgetProvider struct {
 const maxPostStopLossTurns = 3
 
 func (p *runBudgetProvider) postStopLossLimitReached() bool {
-	if !p.loss.Fired() || p.postLossCalls.Add(1) <= maxPostStopLossTurns {
+	if !p.loss.Fired() {
 		return false
 	}
-	// No model call is left for a wrap-up round, so the Stop hook must not offer
-	// one: it would be injected into a run that can no longer answer it.
-	p.loss.markPostStopLossTurnsSpent()
-	return true
+	n := p.postLossCalls.Add(1)
+	if n >= maxPostStopLossTurns {
+		// No model call is left for a wrap-up round, so the Stop hook must not offer
+		// one: it would be injected into a run that can no longer answer it.
+		p.loss.markPostStopLossTurnsSpent()
+	}
+	return n > maxPostStopLossTurns
 }
 
 func (p *runBudgetProvider) callContext(ctx context.Context) (context.Context, context.CancelFunc, time.Time) {
