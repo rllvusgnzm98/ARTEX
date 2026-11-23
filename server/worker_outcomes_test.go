@@ -251,3 +251,80 @@ func TestEnginePostStopLossRecordsOneTermination(t *testing.T) {
 		})
 	}
 }
+
+func TestConcurrentHardCancelRetainsPendingTermination(t *testing.T) {
+	pg := openTestPG(t)
+	row, err := pg.CreateTask("hard cancel audit fixture", "", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := pg.DeleteTask(row.ID); err != nil {
+			t.Error(err)
+		}
+	})
+	store := pg.Exploration(row.ExplorationID)
+	iid, err := store.AddIntent(map[string]any{"summary": "cancelled fixture"}, 0, nil, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetIntentState(iid, "running"); err != nil {
+		t.Fatal(err)
+	}
+	task := &Task{ID: strconv.FormatInt(row.ID, 10), ExpID: row.ExplorationID, Store: store}
+	server := &Server{engine: NewEngine(&Manager{pg: pg})}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	workCtx, stopWork := context.WithCancelCause(ctx)
+	defer stopWork(nil)
+	server.engine.registerWork(iid, stopWork)
+
+	firstCancel := make(chan error, 1)
+	go func() {
+		_, err := server.applyIntentControl(ctx, task, iid, "cancel", "first request", "hard")
+		firstCancel <- err
+	}()
+	select {
+	case <-workCtx.Done():
+		if !errors.Is(context.Cause(workCtx), agent.AbortWorkCancelledByUser) {
+			t.Fatalf("worker was not cancelled by the first request: %v", context.Cause(workCtx))
+		}
+	case err := <-firstCancel:
+		t.Fatalf("first request returned before worker cancellation: %v", err)
+	}
+	action, complete := server.engine.detachWork(iid)
+	if action != "cancel" {
+		t.Fatalf("worker action = %q", action)
+	}
+	if err := transitionIntentState(store, iid, "running", "paused"); err != nil {
+		t.Fatal(err)
+	}
+	out, err := server.applyIntentControl(ctx, task, iid, "cancel", "second request", "hard")
+	if err != nil || out.Deleted == nil {
+		t.Fatalf("second hard cancel did not delete the paused intent: %+v %v", out, err)
+	}
+	// Resume the worker at its deferred audit write, after the cleanup won.
+	meta, err := json.Marshal(map[string]any{"run_id": "pending-audit", "intent_id": iid, "outcome_class": "cancelled"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	activity := server.engine.emitActivity(task, db.Activity{Kind: "termination", NodeID: &iid, Metadata: meta})
+	complete(nil)
+	select {
+	case err := <-firstCancel:
+		if err == nil || !strings.Contains(err.Error(), "intent not found") {
+			t.Fatalf("first request should find cleanup already completed: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("first request did not finish")
+	}
+	var rows, nullNodes int
+	if err := pg.QueryRow(`SELECT count(*), count(*) FILTER (WHERE node_id IS NULL)
+FROM activity WHERE exploration_id=$1 AND kind='termination' AND metadata->>'run_id'='pending-audit'
+  AND (metadata->>'intent_id')::bigint=$2`, task.ExpID, iid).Scan(&rows, &nullNodes); err != nil {
+		t.Fatal(err)
+	}
+	if activity.ID == 0 || rows != 1 || nullNodes != 1 {
+		t.Fatalf("termination activity id=%d rows=%d detached=%d", activity.ID, rows, nullNodes)
+	}
+}
