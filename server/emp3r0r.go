@@ -108,6 +108,8 @@ func (s *Server) pollEmp3r0rAgents() {
 			rt.mu.Unlock()
 			if !known {
 				s.registerEmp3r0rAgent(a)
+			} else {
+				s.reconcileEmp3r0rStatus(a.Tag)
 			}
 		}
 		// 下线 tag → 标 dead + 注册表移除（诚实，不伪造存活）。
@@ -136,8 +138,41 @@ func empHostLabel(a session.CCAgent) string {
 	return a.Tag
 }
 
-// registerAgent 把新上线 agent 落库（kind=emp3r0r）并注册进 Registry。
-// 落库失败只记日志（下一轮还会再试）。
+// reconcileEmp3r0rStatus 校正已知 tag 的落库状态：agent 在线但行标 dead
+// （如陈旧探活判死）→ 复活回 alive 并补回注册表。读库失败只记日志。
+func (s *Server) reconcileEmp3r0rStatus(tag string) {
+	s.emp3r0r.mu.Lock()
+	id, ok := s.emp3r0r.seen[tag]
+	s.emp3r0r.mu.Unlock()
+	if !ok || s.sessStore == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+	defer cancel()
+	rec, err := s.sessStore.Get(ctx, id)
+	if err != nil || rec == nil || rec.Status == db.SessionAlive {
+		return
+	}
+	if err := s.sessStore.UpdateStatus(ctx, id, db.SessionAlive); err != nil {
+		log.Printf("[emp3r0r] agent %s 复活落库失败: %v", tag, err)
+		return
+	}
+	if s.sessReg != nil && s.emp3r0r.client != nil {
+		if _, have := s.sessReg.Get(id); !have {
+			var sec session.Secret
+			if err := json.Unmarshal(rec.Secret, &sec); err == nil {
+				if e, rerr := session.RestoreEmp3r0r(id, sec, s.emp3r0r.client); rerr == nil {
+					s.sessReg.Add(e)
+				}
+			}
+		}
+	}
+	log.Printf("[emp3r0r] agent %s 在线但库内标 dead → 复活 session %d", tag, id)
+}
+
+// registerEmp3r0rAgent 把新上线 agent 落库（kind=emp3r0r）并注册进 Registry。
+// 重启竞态防重：库里已有同 tag 的 alive emp3r0r 行则收养（用既有 id），
+// 不再 Create 第二行；落库失败只记日志（下一轮还会再试）。
 func (s *Server) registerEmp3r0rAgent(a session.CCAgent) {
 	if s.sessStore == nil || s.sessReg == nil || s.emp3r0r == nil || s.emp3r0r.client == nil {
 		return
@@ -147,6 +182,25 @@ func (s *Server) registerEmp3r0rAgent(a session.CCAgent) {
 	if err != nil {
 		log.Printf("[emp3r0r] agent %s 会话构造失败: %v", a.Tag, err)
 		return
+	}
+	// 收养既有行：initSessions 恢复与轮询竞态下 tag 可能已落库。
+	if recs, lerr := s.sessStore.List(s.ctx, db.SessionAlive); lerr == nil {
+		for _, rec := range recs {
+			if rec.Kind != "emp3r0r" {
+				continue
+			}
+			var sec session.Secret
+			if err := json.Unmarshal(rec.Secret, &sec); err != nil || sec.AgentTag != a.Tag {
+				continue
+			}
+			e.SetID(rec.ID)
+			s.sessReg.Add(e)
+			s.emp3r0r.mu.Lock()
+			s.emp3r0r.seen[a.Tag] = rec.ID
+			s.emp3r0r.mu.Unlock()
+			log.Printf("[emp3r0r] agent 上线收养既有会话：%s (%s) → session %d", a.Tag, host, rec.ID)
+			return
+		}
 	}
 	secret, _ := json.Marshal(e.Secret())
 	rec := &db.SessionRecord{
@@ -169,16 +223,14 @@ func (s *Server) registerEmp3r0rAgent(a session.CCAgent) {
 		a.Tag, host, a.OS, a.GOOS, a.User, id)
 }
 
-// markDead 把下线 agent 的会话标 dead 并从注册表移除。
+// markEmp3r0rDead 把下线 agent 的会话标 dead 并从注册表移除。
+// UpdateStatus 失败时保留 seen 索引，下一轮重试（不写死状态丢痕）。
 func (s *Server) markEmp3r0rDead(tag string) {
 	if s.sessStore == nil {
 		return
 	}
 	s.emp3r0r.mu.Lock()
 	id, ok := s.emp3r0r.seen[tag]
-	if ok {
-		delete(s.emp3r0r.seen, tag)
-	}
 	s.emp3r0r.mu.Unlock()
 	if !ok {
 		return
@@ -186,8 +238,12 @@ func (s *Server) markEmp3r0rDead(tag string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := s.sessStore.UpdateStatus(ctx, id, db.SessionDead); err != nil {
-		log.Printf("[emp3r0r] agent %s 标 dead 落库失败: %v", tag, err)
+		log.Printf("[emp3r0r] agent %s 标 dead 落库失败（下一轮重试）: %v", tag, err)
+		return
 	}
+	s.emp3r0r.mu.Lock()
+	delete(s.emp3r0r.seen, tag)
+	s.emp3r0r.mu.Unlock()
 	if s.sessReg != nil {
 		s.sessReg.Remove(id)
 	}
