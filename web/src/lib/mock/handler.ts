@@ -1662,12 +1662,18 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     }
   }
   if (seg[0] === "tasks" && seg[2] === "crown-jewels" && seg[3] === "paths" && m === "GET") {
+    const taskFindings = mockFindings.filter((finding) => finding.task_id === seg[1]);
     const targets = mockAssets
       .filter((asset) => asset.crown_jewel)
-      .map((asset) => ({
-        asset: structuredClone(asset),
-        status: { asset_id: asset.id, reached_by_finding: false, reached_by_fact: false, anchored_nodes: [] },
-      }));
+      .map((asset) => {
+        const reached = taskFindings.some((finding) =>
+          (finding.assets ?? []).some((ref) => String(ref.id) === String(asset.id)),
+        );
+        return {
+          asset: structuredClone(asset),
+          status: { asset_id: asset.id, reached_by_finding: reached, reached_by_fact: false, anchored_nodes: [] },
+        };
+      });
     return { targets };
   }
   if (seg[0] === "tasks" && seg[2] === "assets" && seg.length === 3 && m === "POST") {
