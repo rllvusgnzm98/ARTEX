@@ -1673,6 +1673,36 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     }
     return { deleted };
   }
+  // ── crown jewels (目标导向分析) ──
+  if (seg[0] === "assets" && seg[2] === "crown-jewel" && seg.length === 3) {
+    const asset = mockAssets.find((candidate) => candidate.id === Number(seg[1]));
+    if (!asset) throw new Error("资产不存在");
+    if (m === "POST") {
+      asset.crown_jewel = true;
+      asset.crown_jewel_note = typeof b.note === "string" ? b.note.trim() : "";
+      return { ok: true, asset: structuredClone(asset) };
+    }
+    if (m === "DELETE") {
+      asset.crown_jewel = false;
+      asset.crown_jewel_note = "";
+      return { ok: true, asset: structuredClone(asset) };
+    }
+  }
+  if (seg[0] === "tasks" && seg[2] === "crown-jewels" && seg[3] === "paths" && m === "GET") {
+    const taskFindings = mockFindings.filter((finding) => finding.task_id === seg[1]);
+    const targets = mockAssets
+      .filter((asset) => asset.crown_jewel)
+      .map((asset) => {
+        const reached = taskFindings.some((finding) =>
+          (finding.assets ?? []).some((ref) => String(ref.id) === String(asset.id)),
+        );
+        return {
+          asset: structuredClone(asset),
+          status: { asset_id: asset.id, reached_by_finding: reached, reached_by_fact: false, anchored_nodes: [] },
+        };
+      });
+    return { targets };
+  }
   if (seg[0] === "tasks" && seg[2] === "assets" && seg.length === 3 && m === "POST") {
     const task = mockTasks.find((item) => item.id === seg[1]);
     const numericTaskID = mockTaskAssetID(seg[1]);

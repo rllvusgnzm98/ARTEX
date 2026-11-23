@@ -19,6 +19,7 @@ import {
 import { toast } from "sonner";
 
 import { AssetDslSearch } from "@/components/asset-dsl-search";
+import { CrownJewelToggle } from "@/components/crown-jewel-toggle";
 import { ScopeTextEditor } from "@/components/scope-text-editor";
 import {
   AlertDialog,
@@ -441,16 +442,19 @@ export default function AssetsPage() {
                 <TableCell className="text-xs">
                   {companyName(a.company_id) || <span className="text-muted-foreground">未归属</span>}
                 </TableCell>
-                <TableCell className="w-8 pl-0">
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="size-7 text-muted-foreground hover:text-destructive"
-                    onClick={() => openDelete([a.id])}
-                    aria-label={`删除资产 ${a.domain || a.id}`}
-                  >
-                    <Trash2Icon className="size-3.5" />
-                  </Button>
+                <TableCell className="pl-0">
+                  <div className="flex items-center justify-end gap-1">
+                    <CrownJewelToggle asset={a} onChange={refresh} />
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-7 text-muted-foreground hover:text-destructive"
+                      onClick={() => openDelete([a.id])}
+                      aria-label={`删除资产 ${a.domain || a.id}`}
+                    >
+                      <Trash2Icon className="size-3.5" />
+                    </Button>
+                  </div>
                 </TableCell>
               </TableRow>
             ))}
@@ -488,16 +492,19 @@ export default function AssetsPage() {
                     mono
                   />
                 </TableCell>
-                <TableCell className="w-8 pl-0">
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="size-7 text-muted-foreground hover:text-destructive"
-                    onClick={() => openDelete([a.id])}
-                    aria-label={`删除资产 ${a.ip || a.id}`}
-                  >
-                    <Trash2Icon className="size-3.5" />
-                  </Button>
+                <TableCell className="pl-0">
+                  <div className="flex items-center justify-end gap-1">
+                    <CrownJewelToggle asset={a} onChange={refresh} />
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-7 text-muted-foreground hover:text-destructive"
+                      onClick={() => openDelete([a.id])}
+                      aria-label={`删除资产 ${a.ip || a.id}`}
+                    >
+                      <Trash2Icon className="size-3.5" />
+                    </Button>
+                  </div>
                 </TableCell>
               </TableRow>
             ))}
@@ -530,16 +537,19 @@ export default function AssetsPage() {
                 <TableCell className="max-w-xs truncate font-mono text-xs">
                   {(Array.isArray(a.record_value) ? a.record_value.join(", ") : a.record_value) || "—"}
                 </TableCell>
-                <TableCell className="w-8 pl-0">
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="size-7 text-muted-foreground hover:text-destructive"
-                    onClick={() => openDelete([a.id])}
-                    aria-label={`删除资产 ${a.domain || a.id}`}
-                  >
-                    <Trash2Icon className="size-3.5" />
-                  </Button>
+                <TableCell className="pl-0">
+                  <div className="flex items-center justify-end gap-1">
+                    <CrownJewelToggle asset={a} onChange={refresh} />
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-7 text-muted-foreground hover:text-destructive"
+                      onClick={() => openDelete([a.id])}
+                      aria-label={`删除资产 ${a.domain || a.id}`}
+                    >
+                      <Trash2Icon className="size-3.5" />
+                    </Button>
+                  </div>
                 </TableCell>
               </TableRow>
             ))}
@@ -570,16 +580,19 @@ export default function AssetsPage() {
                 <TableCell className="font-mono text-xs">{a.bundle_id || "—"}</TableCell>
                 <TableCell className="text-xs">{a.category || "—"}</TableCell>
                 <TableCell className="text-xs">{a.app_icp || "—"}</TableCell>
-                <TableCell className="w-8 pl-0">
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="size-7 text-muted-foreground hover:text-destructive"
-                    onClick={() => openDelete([a.id])}
-                    aria-label={`删除资产 ${a.app_name || a.id}`}
-                  >
-                    <Trash2Icon className="size-3.5" />
-                  </Button>
+                <TableCell className="pl-0">
+                  <div className="flex items-center justify-end gap-1">
+                    <CrownJewelToggle asset={a} onChange={refresh} />
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-7 text-muted-foreground hover:text-destructive"
+                      onClick={() => openDelete([a.id])}
+                      aria-label={`删除资产 ${a.app_name || a.id}`}
+                    >
+                      <Trash2Icon className="size-3.5" />
+                    </Button>
+                  </div>
                 </TableCell>
               </TableRow>
             ))}
@@ -665,16 +678,19 @@ export default function AssetsPage() {
                       })
                     )}
                   </TableCell>
-                  <TableCell className="w-8 pl-0">
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="size-7 text-muted-foreground hover:text-destructive"
-                      onClick={() => openDelete([a.id])}
-                      aria-label={`删除资产 ${a.url || a.id}`}
-                    >
-                      <Trash2Icon className="size-3.5" />
-                    </Button>
+                  <TableCell className="pl-0">
+                    <div className="flex items-center justify-end gap-1">
+                      <CrownJewelToggle asset={a} onChange={refresh} />
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="size-7 text-muted-foreground hover:text-destructive"
+                        onClick={() => openDelete([a.id])}
+                        aria-label={`删除资产 ${a.url || a.id}`}
+                      >
+                        <Trash2Icon className="size-3.5" />
+                      </Button>
+                    </div>
                   </TableCell>
                 </TableRow>
               );
@@ -717,16 +733,19 @@ export default function AssetsPage() {
                     mono
                   />
                 </TableCell>
-                <TableCell className="w-8 pl-0">
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="size-7 text-muted-foreground hover:text-destructive"
-                    onClick={() => openDelete([a.id])}
-                    aria-label={`删除资产 ${a.url || a.id}`}
-                  >
-                    <Trash2Icon className="size-3.5" />
-                  </Button>
+                <TableCell className="pl-0">
+                  <div className="flex items-center justify-end gap-1">
+                    <CrownJewelToggle asset={a} onChange={refresh} />
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-7 text-muted-foreground hover:text-destructive"
+                      onClick={() => openDelete([a.id])}
+                      aria-label={`删除资产 ${a.url || a.id}`}
+                    >
+                      <Trash2Icon className="size-3.5" />
+                    </Button>
+                  </div>
                 </TableCell>
               </TableRow>
             ))}

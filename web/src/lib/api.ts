@@ -30,6 +30,7 @@ import type {
   CoverageAssetRefs,
   CoverageGraphData,
   CredentialList,
+  CrownJewelTarget,
   DailyTokenBucket,
   DeleteTaskOptions,
   DeleteTaskResult,
@@ -511,6 +512,18 @@ export const api = {
     ).then((r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 })),
   assetCounts: (taskId = "") =>
     get<Record<string, number>>(`/assets/counts${taskId ? `?task_id=${encodeURIComponent(taskId)}` : ""}`),
+  // ---- crown jewels (目标导向分析) ----
+  setCrownJewel: (id: number, note?: string) =>
+    post<{ ok: boolean; asset?: Asset }>(`/assets/${id}/crown-jewel`, { note: note ?? "" }),
+  unsetCrownJewel: (id: number) => del<{ ok: boolean; asset?: Asset }>(`/assets/${id}/crown-jewel`),
+  crownJewelPaths: (id: string) =>
+    get<{ targets: CrownJewelTarget[] }>(`/tasks/${encodeURIComponent(id)}/crown-jewels/paths`).then((r) => ({
+      targets: arr(r.targets),
+    })),
+  anchorGoalAsset: (id: string, goalId: string, assetId: number) =>
+    post<{ ok: boolean }>(`/tasks/${encodeURIComponent(id)}/goals/${goalId}/anchors`, { asset_id: assetId }),
+  unanchorGoalAsset: (id: string, goalId: string, assetId: number) =>
+    del<{ ok: boolean }>(`/tasks/${encodeURIComponent(id)}/goals/${goalId}/anchors/${assetId}`),
   // ---- 结构化复盘 / TTP 沉淀 ----
   ttpEntries: (status?: string) =>
     get<{ entries: TTPEntry[] }>(`/ttp/entries${status ? `?status=${encodeURIComponent(status)}` : ""}`).then((r) => ({

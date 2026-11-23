@@ -696,7 +696,7 @@ AND NOT EXISTS (
  SELECT 1 FROM exploration_anchors anchor JOIN exploration_nodes node ON node.id=anchor.node_id
  JOIN tasks task ON task.exploration_id=node.exploration_id
  WHERE anchor.asset_id=asset.id AND task.id<>$1 AND task.deleted_at IS NULL
-) ORDER BY asset.id`, taskID, expID)
+) AND NOT asset.crown_jewel ORDER BY asset.id`, taskID, expID)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}

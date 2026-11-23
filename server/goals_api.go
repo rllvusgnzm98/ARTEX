@@ -44,8 +44,9 @@ func (s *Server) addGoal(w http.ResponseWriter, r *http.Request) {
 	defer s.engine.decInflight(t.ID)
 
 	var body struct {
-		Text      string `json:"text"`
-		VulnClass string `json:"vulnclass"`
+		Text      string  `json:"text"`
+		VulnClass string  `json:"vulnclass"`
+		AssetIDs  []int64 `json:"asset_ids"` // 目标导向:把目标锚定到(靶标)资产,复用 exploration_anchors
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, 400, "invalid JSON")
@@ -67,6 +68,11 @@ func (s *Server) addGoal(w http.ResponseWriter, r *http.Request) {
 	}
 	if of, _ := t.Store.OriginFactID(); of > 0 && id > 0 {
 		_ = t.Store.Link(of, db.RelSpawns, id) // goal descends from the task root (origin fact)
+	}
+	for _, aid := range body.AssetIDs { // anchor the goal to its target asset(s)
+		if aid > 0 {
+			_ = t.Store.Anchor(id, aid)
+		}
 	}
 	t.NotifyGoal([]string{text}) // 记「人新增了目标:…」触发并唤醒 planner
 	s.reviveTask(t)              // 把已完成/暂停的任务拉回运行态继续跑

@@ -260,6 +260,32 @@ export interface Asset {
   task_source?: string;
   task_source_summary?: string;
   task_source_node_id?: number;
+  // 目标导向分析: operator-marked high-value target + its business value note.
+  crown_jewel?: boolean;
+  crown_jewel_note?: string;
+}
+
+// Crown Jewels (目标导向分析) target views.
+export interface CrownJewelPathNode {
+  id: number;
+  kind: string;
+  state: string;
+  summary: string;
+}
+
+export interface CrownJewelStatus {
+  asset_id: number;
+  reached_by_finding: boolean;
+  reached_by_fact: boolean;
+  anchored_nodes?: { id: number; kind: string; state: string }[];
+  frontier_distance?: number;
+  path?: CrownJewelPathNode[];
+}
+
+export interface CrownJewelTarget {
+  asset: Asset;
+  status: CrownJewelStatus;
+  goal_ids?: string[];
 }
 
 export interface IntentAsset {

@@ -502,6 +502,44 @@ func (t *ToolSet) graphOverviewDataFrom(g *graphSnapshot) map[string]any {
 			out["honeypot_assets"] = plist
 		}
 	}
+	// crown jewels (目标导向分析): operator-marked high-value target assets + this
+	// task's standing toward each (reached by finding/fact? graph distance from the
+	// open frontier?), so the planner prioritizes intents that approach still-
+	// unreached targets. Global asset marks; capped to keep the overview compact.
+	if t.as != nil && t.ts != nil {
+		if jewels, err := t.as.CrownJewels(); err == nil && len(jewels) > 0 {
+			const cjCap = 20
+			cjList := make([]map[string]any, 0, len(jewels))
+			for _, a := range jewels {
+				if len(cjList) >= cjCap {
+					break
+				}
+				st, err := t.ts.CrownJewelStatusFor(a.ID)
+				if err != nil {
+					continue
+				}
+				m := map[string]any{
+					"asset_id":           a.ID,
+					"label":              crownJewelLabel(a),
+					"reached_by_finding": st.ReachedByFinding,
+					"reached_by_fact":    st.ReachedByFact,
+				}
+				if a.CrownJewelNote != "" {
+					m["business_value"] = a.CrownJewelNote
+				}
+				if st.FrontierDistance != nil {
+					m["frontier_distance"] = *st.FrontierDistance
+				}
+				if gids, _ := t.ts.AnchoredGoalIDs(a.ID); len(gids) > 0 {
+					m["goal_ids"] = gids
+				}
+				cjList = append(cjList, m)
+			}
+			if len(cjList) > 0 {
+				out["crown_jewels"] = cjList
+			}
+		}
+	}
 	// recent_facts：非折叠事实里最新的一窗（≤N，factNodes 按 id 降序即最新在前）。已折进
 	// digest 且仍冷的（hidden）走 cold_digests，不在此重复。每条 {id, summary, from_intent?,
 	// confidence?}；evidence 等详情用 node_detail(id)。更早的用 list_facts 翻。
@@ -2118,4 +2156,26 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
 	}
+}
+
+// crownJewelLabel builds a short display label for a crown jewel asset (url >
+// domain > ip:port > app name > #id).
+func crownJewelLabel(a *db.Asset) string {
+	switch {
+	case a.URL != "":
+		return a.URL
+	case a.Domain != "":
+		if a.Port != nil && *a.Port > 0 {
+			return fmt.Sprintf("%s:%d", a.Domain, *a.Port)
+		}
+		return a.Domain
+	case a.IP != "":
+		if a.Port != nil && *a.Port > 0 {
+			return fmt.Sprintf("%s:%d", a.IP, *a.Port)
+		}
+		return a.IP
+	case a.AppName != "":
+		return a.AppName
+	}
+	return fmt.Sprintf("#%d", a.ID)
 }
