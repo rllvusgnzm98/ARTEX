@@ -111,8 +111,9 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 			lastTool.done(ev.ToolResult.ToolUseID)
 			auditTrace.Complete(ev.ToolResult.ToolUseID, out, ev.ToolResult.IsError)
 			outcome := toolActivityOutcome(result, ev.ToolResult.IsError)
+			isError := ev.ToolResult.IsError && outcome != "policy_blocked"
 			rec(db.Activity{Kind: "tool_result", Tool: toolNames[ev.ToolResult.ToolUseID], ToolUseID: ev.ToolResult.ToolUseID,
-				IsError: ev.ToolResult.IsError, Summary: firstLine(out, 200), Detail: out, Metadata: outcomeMetadata(outcome)})
+				IsError: isError, Summary: firstLine(out, 200), Detail: out, Metadata: outcomeMetadata(outcome)})
 		case harness.KindText:
 			addDelta("text", ev.Text)
 		case harness.KindThinking:

@@ -78,6 +78,9 @@ func TestWorkerPostStopLossBound(t *testing.T) {
 					results++
 				}
 				if a.Kind == "tool_result" && strings.Contains(string(a.Metadata), "policy_blocked") {
+					if a.IsError {
+						t.Error("captured policy block had is_error=true")
+					}
 					blocked++
 				}
 			})
