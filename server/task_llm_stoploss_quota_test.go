@@ -23,11 +23,14 @@ func TestTaskLLMStopLossQuotaBooksFailoverWithoutReplay(t *testing.T) {
 		name      string
 		stream    bool
 		exhausted bool
+		stale     bool
 	}{
-		{"complete fallback", false, false},
-		{"stream fallback", true, false},
-		{"complete chain exhausted", false, true},
-		{"stream chain exhausted", true, true},
+		{"complete fallback", false, false, false},
+		{"stream fallback", true, false, false},
+		{"complete chain exhausted", false, true, false},
+		{"stream chain exhausted", true, true, false},
+		{"complete stale, last profile gone", false, true, true},
+		{"stream stale, last profile gone", true, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			first := &scriptedLLMProvider{err: quota}
@@ -36,6 +39,9 @@ func TestTaskLLMStopLossQuotaBooksFailoverWithoutReplay(t *testing.T) {
 			exhausts, transitions := 0, 0
 			hooks := taskLLMStreamHooks{
 				current: func() (taskLLMSelection, error) {
+					if active == 0 {
+						return taskLLMSelection{}, &taskLLMError{taskID: "7", chainExhausted: true, cause: errors.New("all selected profiles are quota exhausted")}
+					}
 					if active == 11 {
 						return taskLLMSelection{profileID: 11, provider: first}, nil
 					}
@@ -43,6 +49,10 @@ func TestTaskLLMStopLossQuotaBooksFailoverWithoutReplay(t *testing.T) {
 				},
 				exhaust: func(taskLLMSelection, error) (db.TaskLLMTransition, error) {
 					exhausts++
+					if tc.stale {
+						active = 0
+						return db.TaskLLMTransition{PreviousProfileID: 11, Stale: true}, nil
+					}
 					if tc.exhausted {
 						return db.TaskLLMTransition{PreviousProfileID: 11, ChainExhausted: true, Advanced: true}, nil
 					}
@@ -58,7 +68,11 @@ func TestTaskLLMStopLossQuotaBooksFailoverWithoutReplay(t *testing.T) {
 			} else {
 				_, _, _, err = completeTaskLLM(ctx, "7", llm.CompletionRequest{}, hooks)
 			}
-			if err == nil || exhausts != 1 || transitions != 1 || first.calls != 1 || second.calls != 0 {
+			wantTransitions := 1
+			if tc.stale {
+				wantTransitions = 0
+			}
+			if err == nil || exhausts != 1 || transitions != wantTransitions || first.calls != 1 || second.calls != 0 {
 				t.Fatalf("err=%v exhausts=%d transitions=%d calls=%d/%d", err, exhausts, transitions, first.calls, second.calls)
 			}
 			if isTaskLLMFailoverReady(err) == tc.exhausted || isTaskLLMChainExhausted(err) != tc.exhausted {

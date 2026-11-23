@@ -90,9 +90,17 @@ func isTaskLLMFailoverReady(err error) bool {
 
 // stoppedQuotaError ends a stop-latched call after its quota failure has been
 // booked, instead of replaying it on the next profile.
-func stoppedQuotaError(taskID string, transition db.TaskLLMTransition, cause error) error {
-	ready := !transition.ChainExhausted && (transition.Stale || transition.NextProfileID != nil)
-	return &taskLLMError{taskID: taskID, chainExhausted: transition.ChainExhausted, failoverReady: ready, cause: cause}
+// A stale transition says nothing about the chain's current state (another
+// worker may have exhausted the last profile), so it is re-read.
+func stoppedQuotaError(taskID string, transition db.TaskLLMTransition, cause error, hooks taskLLMStreamHooks) error {
+	exhausted := transition.ChainExhausted
+	ready := !exhausted && transition.NextProfileID != nil
+	if transition.Stale {
+		_, curErr := hooks.current()
+		exhausted = isTaskLLMChainExhausted(curErr)
+		ready = curErr == nil
+	}
+	return &taskLLMError{taskID: taskID, chainExhausted: exhausted, failoverReady: ready, cause: cause}
 }
 
 func isTaskLLMChainExhausted(err error) bool {
@@ -300,7 +308,7 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 			hooks.transition(selection, transition, callErr)
 		}
 		if agent.ModelRetriesStopped(ctx) {
-			return llm.Message{}, "", llm.Usage{}, stoppedQuotaError(taskID, transition, callErr)
+			return llm.Message{}, "", llm.Usage{}, stoppedQuotaError(taskID, transition, callErr, hooks)
 		}
 		if !transition.Stale && transition.NextProfileID == nil {
 			return llm.Message{}, "", llm.Usage{}, &taskLLMError{taskID: taskID, chainExhausted: transition.ChainExhausted, cause: callErr}
@@ -404,7 +412,7 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 						return
 					}
 				}
-				yield(llm.StreamEvent{}, stoppedQuotaError(taskID, transition, streamErr))
+				yield(llm.StreamEvent{}, stoppedQuotaError(taskID, transition, streamErr, hooks))
 				return
 			}
 			if committed || (!transition.Stale && transition.NextProfileID == nil) {
