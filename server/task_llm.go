@@ -97,6 +97,9 @@ func stoppedQuotaError(taskID string, transition db.TaskLLMTransition, cause err
 	ready := !exhausted && transition.NextProfileID != nil
 	if transition.Stale {
 		_, curErr := hooks.current()
+		if curErr != nil && !isTaskLLMChainExhausted(curErr) {
+			return curErr
+		}
 		exhausted = isTaskLLMChainExhausted(curErr)
 		ready = curErr == nil
 	}

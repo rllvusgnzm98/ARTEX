@@ -18,19 +18,23 @@ func TestTaskLLMStopLossQuotaBooksFailoverWithoutReplay(t *testing.T) {
 		t.Fatal("fixture did not latch")
 	}
 	ctx := agent.WithModelRetryStop(t.Context(), loss)
+	errLookup := errors.New("LLM profile #22 is missing or invalid")
 	quota := errors.New("openai: status 402: insufficient_quota")
 	for _, tc := range []struct {
 		name      string
 		stream    bool
 		exhausted bool
 		stale     bool
+		lookupErr bool
 	}{
-		{"complete fallback", false, false, false},
-		{"stream fallback", true, false, false},
-		{"complete chain exhausted", false, true, false},
-		{"stream chain exhausted", true, true, false},
-		{"complete stale, last profile gone", false, true, true},
-		{"stream stale, last profile gone", true, true, true},
+		{"complete fallback", false, false, false, false},
+		{"stream fallback", true, false, false, false},
+		{"complete chain exhausted", false, true, false, false},
+		{"stream chain exhausted", true, true, false, false},
+		{"complete stale, last profile gone", false, true, true, false},
+		{"stream stale, last profile gone", true, true, true, false},
+		{"complete stale, lookup fails", false, false, true, true},
+		{"stream stale, lookup fails", true, false, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			first := &scriptedLLMProvider{err: quota}
@@ -39,6 +43,9 @@ func TestTaskLLMStopLossQuotaBooksFailoverWithoutReplay(t *testing.T) {
 			exhausts, transitions := 0, 0
 			hooks := taskLLMStreamHooks{
 				current: func() (taskLLMSelection, error) {
+					if active == -1 {
+						return taskLLMSelection{}, errLookup
+					}
 					if active == 0 {
 						return taskLLMSelection{}, &taskLLMError{taskID: "7", chainExhausted: true, cause: errors.New("all selected profiles are quota exhausted")}
 					}
@@ -51,6 +58,9 @@ func TestTaskLLMStopLossQuotaBooksFailoverWithoutReplay(t *testing.T) {
 					exhausts++
 					if tc.stale {
 						active = 0
+						if tc.lookupErr {
+							active = -1
+						}
 						return db.TaskLLMTransition{PreviousProfileID: 11, Stale: true}, nil
 					}
 					if tc.exhausted {
@@ -74,6 +84,12 @@ func TestTaskLLMStopLossQuotaBooksFailoverWithoutReplay(t *testing.T) {
 			}
 			if err == nil || exhausts != 1 || transitions != wantTransitions || first.calls != 1 || second.calls != 0 {
 				t.Fatalf("err=%v exhausts=%d transitions=%d calls=%d/%d", err, exhausts, transitions, first.calls, second.calls)
+			}
+			if tc.lookupErr {
+				if !errors.Is(err, errLookup) {
+					t.Fatalf("lookup error was replaced: %v", err)
+				}
+				return
 			}
 			if isTaskLLMFailoverReady(err) == tc.exhausted || isTaskLLMChainExhausted(err) != tc.exhausted {
 				t.Fatalf("failoverReady=%t chainExhausted=%t", isTaskLLMFailoverReady(err), isTaskLLMChainExhausted(err))
