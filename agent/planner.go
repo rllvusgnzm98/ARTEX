@@ -48,10 +48,17 @@ type Planner struct {
 	// dispatch it step-by-step over rounds instead of front-loading it in parallel.
 	todoMu sync.Mutex
 	todos  map[int64]*actool.TodoStore
+
+	// probes keeps ONE opening-probe allowance per task (keyed by exploration id).
+	// The planner is woken on every graph change, so a per-round counter would
+	// reset the "at most PlannerProbeLimit probes at the opening" boundary on each
+	// wake-up and bound nothing; keeping it here makes the cap hold across rounds.
+	probeMu sync.Mutex
+	probes  map[int64]*plannerProbeState
 }
 
 func NewPlanner(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int) *Planner {
-	return &Planner{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns, todos: map[int64]*actool.TodoStore{}}
+	return &Planner{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns, todos: map[int64]*actool.TodoStore{}, probes: map[int64]*plannerProbeState{}}
 }
 
 func (p *Planner) SetCompactionWindowResolver(fn func() int) { p.windowFn = fn }
@@ -124,6 +131,19 @@ func (p *Planner) todoFor(expID int64) *actool.TodoStore {
 	if s == nil {
 		s = actool.NewTodoStore()
 		p.todos[expID] = s
+	}
+	return s
+}
+
+// probeFor returns the task's opening-probe allowance, creating it on first use.
+// Shared across all of this task's planner wake-ups.
+func (p *Planner) probeFor(expID int64) *plannerProbeState {
+	p.probeMu.Lock()
+	defer p.probeMu.Unlock()
+	s := p.probes[expID]
+	if s == nil {
+		s = &plannerProbeState{}
+		p.probes[expID] = s
 	}
 	return s
 }
@@ -320,7 +340,7 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 2. **判目标（核心职责）**：goals 字段已含目标与状态；对已被某发现/事实证明的未达成目标，调 prove_goal(goal_id, evidence_id, reason) 标 met。**当你标记的恰是最后一个未完成目标时，系统自动判定整个任务完成**——收官只由逐个 prove_goal 驱动，没有别的"一键完成"手段。
    - ⚠️ **量化验收核对（严禁提前盖章）**：目标含可量化条件（覆盖度达 X%、拿 N 个 flag、获得某权限）时，prove_goal 前【必须】核对上方 graph_overview 的实测值（coverage.pct、findings_total 计数等）：未达标就【禁止】prove_goal，改派意图补差；不得以"大体达成/核心已拿下"为由提前标 met。例：要求覆盖度 100% 而实测 coverage.pct=40% → 未达成，继续派补测意图。
 
-3. **（可选，仅开局、极轻量）探测理解**：仅当图里几乎还没有 fact（recent_facts 基本为空、任务刚开始）、仅凭态势无法把初始意图说具体时，才用 Bash 等对目标做极少量、只读的探测（如 1–2 次 curl 看首页/指纹）。**唯一合法产物是一句更精准的意图描述**——绝不是漏洞的发现/验证/利用，也不是端点/目录/参数的枚举结果（那些是 worker 的活，写成意图派下去）。三条硬边界：
+3. **（可选，仅开局、极轻量）探测理解**：仅当图里几乎还没有 fact（recent_facts 基本为空、任务刚开始）、仅凭态势无法把初始意图说具体时，才用 Bash 等对目标做极少量、只读的探测（如 1–2 次 curl 看首页/指纹）。**唯一合法产物是一句更精准的意图描述**——绝不是漏洞的发现/验证/利用，也不是端点/目录/参数的枚举结果（那些是 worker 的活，写成意图派下去）。三条硬边界（前两条由代码强制，越界的 Bash/WebFetch 会被直接拦下，不是靠你自觉）：
    - 图里已有 worker 产出的 fact（facts>0 / recent_facts 非空）→【禁止】再自己探测，一切判断基于已有 fact，本轮产物只能是"派新意图"或"结束"；想深挖某线索 → 派意图让 worker 去查，不是自己 curl。
    - 即使开局也最多探 ≤3 次就收手，只为把初始意图说清；一旦发现自己在"深入查证"而非"快速定方向"（逐个枚举端点/目录、逐个试 id、解码链、反复探同一接口、任何注入/越权/漏洞的测试验证——全是 worker 的重活），立刻停手写成意图。
    - 能从现有事实/态势判断的，根本不必探测。
@@ -377,6 +397,8 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		tsx.SetOwnerNode(origin) // planner-side anchors default to the task root (origin fact)
 	}
 	// 领域工具 + 基础默认工具集（Read/Write/Edit/MultiEdit/LS/Glob/Grep/Bash）
+	// Bash/WebFetch 仍在集合里(开局极轻量探测要用),但由 plannerProbeHooks 按提示词里
+	// 那三条硬边界在 harness 层兜底:有 worker 事实后禁用、开局额度 PlannerProbeLimit 封顶。
 	// 资产覆盖度功能关闭时剔除 add_task_scope/list_untested_assets（不入 prompt）。
 	base := append(tsx.DropCoverageTools(tsx.PlannerTools()), defaultToolsExcept()...)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts)})
@@ -446,6 +468,17 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		MaxTokens:    p.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
 	}
 	AttachStableWebFetch(&opts, p.uaForTask(taskID))
+	// Enforce the planner's probe boundaries in the harness, not just in the prompt:
+	// no self-probing once workers have produced facts, and a finite opening
+	// allowance shared across this task's wake-ups. Planning, graph reads and
+	// intent generation are untouched.
+	opts.Hooks = WrapPlannerProbe(nil, p.probeFor(ts.ID()), PlannerProbeLimit, func() (int, bool) {
+		n, err := ts.CountWorkerFacts()
+		if err != nil {
+			return 0, false // fail soft: never guess the graph is empty
+		}
+		return n, true
+	})
 	if p.tx != nil { // persist raw LLM conversation; one accumulating file per task's planner
 		opts.Transcript = p.tx
 		opts.SessionID = fmt.Sprintf("exp%d-planner", ts.ID())
