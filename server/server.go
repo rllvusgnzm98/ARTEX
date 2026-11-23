@@ -276,7 +276,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		}
 	} else if cfg, ok := agent.FromEnv(); ok {
 		if err := s.applyLLM(cfg); err != nil {
-			log.Printf("[engine] env provider init failed — engine idle: %v", err)
+			log.Printf("[engine] env provider init failed — engine idle: %s", config.RedactURLsInText(err.Error()))
 		} else {
 			log.Printf("[engine] LLM configured from env: %s / %s", cfg.Provider(), cfg.Model)
 		}
@@ -1455,7 +1455,7 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 	}
 	// Validate provider construction before persisting it as the active profile.
 	if _, err := cfg.NewProvider(); err != nil {
-		writeErr(w, 400, "provider init failed: "+err.Error())
+		writeErr(w, 400, "provider init failed: "+config.RedactURLsInText(err.Error()))
 		return
 	}
 	if err := s.saveLLMConfig(cfg); err != nil {
@@ -1468,7 +1468,7 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.applyLLM(cfg); err != nil {
-		writeErr(w, 400, "provider init failed: "+err.Error())
+		writeErr(w, 400, "provider init failed: "+config.RedactURLsInText(err.Error()))
 		return
 	}
 	log.Printf("[engine] LLM configured via UI: %s / %s", cfg.Provider(), cfg.Model)
@@ -3745,7 +3745,7 @@ func (s *Server) testWebSearch(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	results, err := actool.WebSearchProbe(ctx, cfg, probeQuery, 3)
 	if err != nil {
-		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error(), "backend": backend})
+		writeJSON(w, 200, map[string]any{"ok": false, "error": config.RedactURLsInText(err.Error()), "backend": backend})
 		return
 	}
 	if len(results) == 0 {
