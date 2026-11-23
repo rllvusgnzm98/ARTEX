@@ -482,6 +482,9 @@ func restoreArchiveAssets(tx *sql.Tx, taskID int64, raw json.RawMessage) (map[in
 			warnings = append(warnings, fmt.Sprintf("资产 ID %d 已被占用，恢复为 %d", oldID, candidate))
 		}
 		row["task_ids"] = mergeJSONTaskID(row["task_ids"], taskID)
+		if row["crown_jewel"] == nil { // older archives predate this NOT NULL column
+			row["crown_jewel"] = false
+		}
 		assetRaw, _ := json.Marshal(row)
 		res, err := tx.Exec(`INSERT INTO assets SELECT * FROM json_populate_record(NULL::assets,$1::json) ON CONFLICT DO NOTHING`, string(assetRaw))
 		if err != nil {
