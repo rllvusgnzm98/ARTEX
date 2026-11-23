@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -94,6 +95,11 @@ func DSN() (dsn, source string, err error) {
 	return config.PostgresDSN()
 }
 
+const (
+	wsaConnectionRefused   syscall.Errno = 10061 // WSAECONNREFUSED
+	win32ConnectionRefused syscall.Errno = 1225  // ERROR_CONNECTION_REFUSED
+)
+
 // databaseFailure reports a fixed reason without retaining the driver error,
 // which can contain the original DSN or other untrusted text.
 func databaseFailure(err error, fallback string) error {
@@ -104,7 +110,8 @@ func databaseFailure(err error, fallback string) error {
 		return errors.New("invalid PostgreSQL DSN")
 	case errors.As(err, &pgErr) && (pgErr.Code == "28P01" || pgErr.Code == "28000"):
 		return errors.New("PostgreSQL authentication failed")
-	case errors.Is(err, syscall.ECONNREFUSED):
+	case errors.Is(err, syscall.ECONNREFUSED) ||
+		(runtime.GOOS == "windows" && (errors.Is(err, wsaConnectionRefused) || errors.Is(err, win32ConnectionRefused))):
 		return errors.New("PostgreSQL connection refused")
 	case errors.Is(err, context.DeadlineExceeded) || pgconn.Timeout(err):
 		return errors.New("PostgreSQL connection timed out")

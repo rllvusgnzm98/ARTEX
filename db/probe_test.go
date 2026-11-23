@@ -5,7 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
+	"os"
+	"runtime"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -175,5 +179,32 @@ func TestProbeUnreachable(t *testing.T) {
 	_, err := Probe("postgres://artex@127.0.0.1:1/definitely_not_listening?sslmode=disable")
 	if err == nil {
 		t.Fatal("不可达实例应返回错误")
+	}
+}
+
+func TestDatabaseFailureConnectionRefused(t *testing.T) {
+	const fallback = "PostgreSQL connection failed"
+	const refused = "PostgreSQL connection refused"
+	windowsReason := fallback
+	if runtime.GOOS == "windows" {
+		windowsReason = refused
+	}
+	for _, tt := range []struct {
+		name string
+		code syscall.Errno
+		want string
+	}{
+		{"portable", syscall.ECONNREFUSED, refused},
+		{"winsock", 10061, windowsReason},
+		{"win32", 1225, windowsReason},
+		{"other", syscall.ECONNRESET, fallback},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			opErr := &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", tt.code)}
+			err := errors.Join(errors.New("untrusted connection refused text"), opErr)
+			if got := databaseFailure(err, fallback).Error(); got != tt.want {
+				t.Errorf("databaseFailure = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
