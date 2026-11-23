@@ -948,14 +948,16 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			return
 		}
 		defer e.decInflight(t.ID)
-		e.stampRunProvenance(t) // 首次真正规划 → 记下跑它的 build 与有效配置(所有任务)
-		e.stampFirstRun(t)      // 首次真正规划 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
+		e.stampFirstRun(t) // 首次真正规划 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
 		e.touch(t.ID)
 		emit := func(r db.Activity) { e.emitActivity(t, r) }
 		ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; 带任务 deadline
 		if ectx.Err() != nil || e.IsDeleting(t.ID) {
 			return
 		}
+		// 过了取消/删除这道最终准入才算「真的跑了」：在它之前盖章，会给一次根本没执行
+		// 的尝试留下运行证据。
+		e.stampRunProvenance(t)
 		log.Printf("[planner] task %s 规划中…(%s 触发)", t.ID, src)
 		// round marker: each Plan() is one planner round; emit a boundary so the
 		// UI can separate rounds in the transcript (kind='round').
@@ -1091,8 +1093,7 @@ func (e *Engine) runWorkerStep(ctx context.Context, t *Task, name string, worker
 // cannot observe quiescence between the LLM return and the final DB writes.
 func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *agent.Worker, intent *db.Node, requestID, message string) bool {
 	hasChatMessage := message != ""
-	e.stampRunProvenance(t) // 首次真正执行 → 记下跑它的 build 与有效配置(所有任务)
-	e.stampFirstRun(t)      // 首次真正执行 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
+	e.stampFirstRun(t) // 首次真正执行 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
 	e.touch(t.ID)
 	emit := func(r db.Activity) { e.emitActivity(t, r) }
 	ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; 带任务 deadline
@@ -1102,6 +1103,8 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		}
 		return true
 	}
+	// 同上：过了取消/删除的最终准入才盖章，避免给没真正执行的尝试留证据。
+	e.stampRunProvenance(t)
 	// per-work child context so the planner's kill_work can stop just this work.
 	workCtx, workCancel := context.WithCancelCause(ectx)
 	workCtx = llmrec.WithAttribution(workCtx, intent.ID, name, 0)

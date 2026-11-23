@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -304,13 +305,15 @@ func TestLegacyRanTaskStaysUnknownAfterUpgrade(t *testing.T) {
 }
 
 // TestAnchorWriteErrMapsFKViolation 不连库：去掉校验时的 FOR SHARE 后，校验与写入之间
-// 的并发清理由外键兜底，这里确认它被翻译成同一个一致性错误并记进健康表，而不是把裸的
-// 驱动错误抛出去；非外键错误必须原样返回。
+// 的并发清理由外键兜底，这里确认它被按**约束名**翻译成对应的一致性错误并登记健康表。
+// exploration_anchors 两列都有外键，只看 SQLSTATE 会把「owner 节点没了」误报成
+// 「asset 没了」，所以约束名拿不到时宁可原样返回，也不猜。
 func TestAnchorWriteErrMapsFKViolation(t *testing.T) {
 	h := NewPersistenceHealth()
-	err := anchorWriteErr(&pgconn.PgError{Code: "23503"}, h, 11, []int64{5, 5, 3})
+	assetFK := &pgconn.PgError{Code: "23503", ConstraintName: anchorAssetFK}
+	err := anchorWriteErr(assetFK, h, 11, 99, []int64{5, 5, 3})
 	if !errors.Is(err, ErrDanglingAnchor) {
-		t.Fatalf("外键冲突该翻译成悬空锚点错误，实际 %v", err)
+		t.Fatalf("asset 外键冲突该翻译成悬空锚点错误，实际 %v", err)
 	}
 	var dangling *DanglingAnchorError
 	if !errors.As(err, &dangling) {
@@ -323,11 +326,153 @@ func TestAnchorWriteErrMapsFKViolation(t *testing.T) {
 		t.Fatalf("悬空锚点该在健康表里可见: %+v", snap)
 	}
 
+	ownerFK := &pgconn.PgError{Code: "23503", ConstraintName: anchorOwnerFK}
+	ownerErr := anchorWriteErr(ownerFK, h, 12, 77, []int64{5})
+	if errors.Is(ownerErr, ErrDanglingAnchor) {
+		t.Fatalf("owner 节点缺失不该误报成 asset 缺失: %v", ownerErr)
+	}
+	var owner *MissingAnchorOwnerError
+	if !errors.As(ownerErr, &owner) || owner.NodeID != 77 {
+		t.Fatalf("该报成挂靠节点不存在并带上节点 id，实际 %v", ownerErr)
+	}
+	if snap := h.Snapshot(12); snap.Healthy() {
+		t.Fatalf("owner 缺失也该在健康表里可见: %+v", snap)
+	}
+
+	// 约束名拿不到时不猜（不同 PG 版本/手工建库都可能没有），原样返回。
+	bare := &pgconn.PgError{Code: "23503"}
+	if got := anchorWriteErr(bare, h, 13, 1, []int64{3}); got != error(bare) {
+		t.Fatalf("约束名未知时该原样返回，实际 %v", got)
+	}
+
 	other := errors.New("连接断了")
-	if got := anchorWriteErr(other, h, 11, []int64{3}); got != other {
+	if got := anchorWriteErr(other, h, 11, 1, []int64{3}); got != other {
 		t.Fatalf("非外键错误该原样返回，实际 %v", got)
 	}
-	if anchorWriteErr(nil, h, 11, []int64{3}) != nil {
+	if anchorWriteErr(nil, h, 11, 1, []int64{3}) != nil {
 		t.Fatal("nil 该返回 nil")
+	}
+}
+
+// TestAnchorOwnerNodeFKIsDistinct 覆盖评审指出的张冠李戴：exploration_anchors 两列都有
+// 外键，asset 还在、挂靠的节点没了时也是 23503。按约束名区分之后，这种情形必须报成
+// MissingAnchorOwnerError 而不是「asset 不存在」。
+func TestAnchorOwnerNodeFKIsDistinct(t *testing.T) {
+	d := reliabilityTestDB(t)
+	task := newReliabilityTask(t, d, "锚点owner缺失-"+t.Name())
+	asset := newReliabilityAsset(t, d, task.ID)
+	store := d.Exploration(task.ExplorationID)
+
+	// 建一个节点再删掉：asset 仍然健在，owner 节点已不存在。
+	nodeID, err := store.AddFactCtx(context.Background(), map[string]any{"text": "owner"}, "test", nil, 0)
+	if err != nil {
+		t.Fatalf("建节点失败: %v", err)
+	}
+	if _, err := d.Exec(`DELETE FROM exploration_nodes WHERE id=$1`, nodeID); err != nil {
+		t.Fatalf("删节点失败: %v", err)
+	}
+
+	err = store.AnchorCtx(context.Background(), nodeID, asset)
+	if err == nil {
+		t.Fatal("挂靠节点已不存在，锚定该失败")
+	}
+	if errors.Is(err, ErrDanglingAnchor) {
+		t.Fatalf("不该误报成 asset 不存在: %v", err)
+	}
+	if !errors.Is(err, ErrMissingAnchorOwner) {
+		t.Fatalf("该报成挂靠节点不存在，实际 %v", err)
+	}
+	var owner *MissingAnchorOwnerError
+	if !errors.As(err, &owner) || owner.NodeID != nodeID {
+		t.Fatalf("该带上缺失的节点 id: %v", err)
+	}
+}
+
+// TestAnchorDeleteBetweenPrecheckAndInsert 覆盖去掉 FOR SHARE 之后的那段窗口：校验
+// 通过后、写入前资产被并发删掉，外键会拒绝，而调用方拿到的仍须是同一个一致性错误。
+func TestAnchorDeleteBetweenPrecheckAndInsert(t *testing.T) {
+	d := reliabilityTestDB(t)
+	task := newReliabilityTask(t, d, "校验到写入之间被删-"+t.Name())
+	asset := newReliabilityAsset(t, d, task.ID)
+	store := d.Exploration(task.ExplorationID)
+	ctx := context.Background()
+
+	nodeID, err := store.AddFactCtx(ctx, map[string]any{"text": "owner"}, "test", nil, 0)
+	if err != nil {
+		t.Fatalf("建节点失败: %v", err)
+	}
+
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("开事务失败: %v", err)
+	}
+	defer tx.Rollback()
+
+	// ① 校验此刻通过（asset 还在）。
+	if err := checkAnchorAssets(ctx, tx, d.Health(), task.ExplorationID, []int64{asset}); err != nil {
+		t.Fatalf("校验此刻不该失败: %v", err)
+	}
+
+	// ② 另一条连接把它删掉——不加 FOR SHARE 正是为了让这一步不被阻塞（否则会与
+	//    DeleteTaskCascadePrepared 的加锁顺序相反而死锁）。
+	if _, err := d.Exec(`DELETE FROM assets WHERE id=$1`, asset); err != nil {
+		t.Fatalf("并发删除失败（不该被阻塞）: %v", err)
+	}
+
+	// ③ 写入被外键拒绝，且翻译成 DanglingAnchorError。
+	_, execErr := tx.ExecContext(ctx, `INSERT INTO exploration_anchors(node_id, asset_id) VALUES ($1,$2)`, nodeID, asset)
+	if execErr == nil {
+		t.Fatal("asset 已被删除，锚点写入该被外键拒绝")
+	}
+	mapped := anchorWriteErr(execErr, d.Health(), task.ExplorationID, nodeID, []int64{asset})
+	if !errors.Is(mapped, ErrDanglingAnchor) {
+		t.Fatalf("该翻译成悬空锚点错误，实际 %v", mapped)
+	}
+	if snap := d.Health().Snapshot(task.ExplorationID); snap.DanglingAnchors == 0 {
+		t.Fatalf("该登记进健康表: %+v", snap)
+	}
+}
+
+// TestDevBuildWithoutCommitIsNotRecorded 覆盖评审第 3 条：plain go build / dev.sh 的
+// go run 都落到 "dev"，它指不回任何一次提交，不该被读成「记录过」；只有同时记到
+// build_commit 时才算证据。
+func TestDevBuildWithoutCommitIsNotRecorded(t *testing.T) {
+	if provenanceRecorded(DevBuildVersion, map[string]any{"build_commit_source": "unknown"}) {
+		t.Fatal("没有提交证据的 dev 不该算记录过")
+	}
+	if provenanceRecorded(DevBuildVersion, nil) {
+		t.Fatal("没有 runtime 的 dev 不该算记录过")
+	}
+	if !provenanceRecorded(DevBuildVersion, map[string]any{"build_commit": "f33e81bfbaca639dbbaf263786841052a6681cc4"}) {
+		t.Fatal("带提交 SHA 的 dev 应算记录过")
+	}
+	if provenanceRecorded(LegacyUnknownBuild, map[string]any{"build_commit": "abc"}) {
+		t.Fatal("legacy 哨兵永远不算记录过")
+	}
+	if !provenanceRecorded("0.4.3", nil) {
+		t.Fatal("正式版本号应算记录过")
+	}
+}
+
+// TestProbeErrorDoesNotLeakDSNPassword 是评审第 1 条（阻塞项）的回归测试，不需要活库：
+// 一条带查询串口令、且 sslmode 非法的 URL 会在连接之前就被 pgx 拒绝，而 pgx 的解析错误
+// 把整条 DSN 嵌进 message，且只打码 URL userinfo 与 libpq 键值形态。实测 `?password=`
+// 与 `?sslpassword=` 原样输出，再经 artex doctor 打印、或 log.Fatalf("open stores: %v")
+// 落进日志。连接路径的错误必须先过 ScrubSecrets。
+func TestProbeErrorDoesNotLeakDSNPassword(t *testing.T) {
+	const canary = "PW-LEAK-CANARY"
+	for _, dsn := range []string{
+		"postgres://artex@127.0.0.1:1/artex?password=" + canary + "&sslmode=bogus-tls-mode",
+		"postgres://artex@127.0.0.1:1/artex?sslpassword=" + canary + "&sslmode=bogus-tls-mode",
+		"postgres://artex:" + canary + "@127.0.0.1:1/artex?sslmode=bogus-tls-mode",
+		"host=127.0.0.1 port=1 user=artex password=" + canary + " sslmode=bogus-tls-mode",
+	} {
+		_, err := Probe(dsn)
+		if err == nil {
+			t.Fatalf("sslmode 非法，该在连接前就失败: %s", strings.ReplaceAll(dsn, canary, "<PW>"))
+		}
+		if strings.Contains(err.Error(), canary) {
+			t.Fatalf("连接错误泄露了口令原文:\n  %v", err)
+		}
 	}
 }

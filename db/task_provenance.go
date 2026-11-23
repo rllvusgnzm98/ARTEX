@@ -4,12 +4,30 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 )
 
 // LegacyUnknownBuild 标记「升级前就已经跑过、build 已无从考证」的任务（见 schema.sql
 // 的回填）。它与空串的区别是：空串表示任务还没真正跑过，之后第一次跑时应当如实盖章；
 // 这个哨兵表示任务跑过但证据缺失，必须一直上报「构建未知」，绝不被当前 build 回填。
 const LegacyUnknownBuild = "legacy-unknown"
+
+// DevBuildVersion 是未注入版本时的默认标签（plain go build、dev.sh 的 go run、非 Git
+// 目录下的 build.sh 都落到它）。它指不回任何一次提交，所以除非同时记到了 build_commit，
+// 否则不算运行证据——否则「构建未知」会被一个毫无信息量的 "dev" 顶替。
+const DevBuildVersion = "dev"
+
+// provenanceRecorded 判定这一行是否真有可归因的构建证据。
+func provenanceRecorded(version string, runtime map[string]any) bool {
+	switch version {
+	case "", LegacyUnknownBuild:
+		return false
+	case DevBuildVersion:
+		commit, _ := runtime["build_commit"].(string)
+		return strings.TrimSpace(commit) != ""
+	}
+	return true
+}
 
 // TaskProvenance 是一次任务运行的溯源证据：当时真正在跑的二进制版本，以及脱敏后的
 // 有效配置快照。
@@ -60,9 +78,10 @@ func (d *DB) TaskProvenance(id int64) (TaskProvenance, error) {
 	if err != nil {
 		return TaskProvenance{}, err
 	}
-	out := TaskProvenance{BuildVersion: version, Recorded: version != "" && version != LegacyUnknownBuild}
+	out := TaskProvenance{BuildVersion: version}
 	if len(raw) > 0 {
 		_ = json.Unmarshal(raw, &out.Runtime)
 	}
+	out.Recorded = provenanceRecorded(version, out.Runtime)
 	return out, nil
 }
