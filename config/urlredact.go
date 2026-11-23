@@ -17,33 +17,46 @@ import (
 // 其余标点（反引号、尖括号、单引号、分号）一律算 URL 的一部分，宁可多盖。
 var urlInText = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s"]*`)
 
-// userinfoSegment 框出 scheme 与 @ 之间的 userinfo。只有用户名的形态也常就是令牌本身
-// （https://TOKEN@host），所以整段盖掉而不是只盖口令。
-var schemeUserinfo = regexp.MustCompile(`(?i)^([a-z][a-z0-9+.-]*://)[^/\s]*@`)
+// schemePrefix 认出开头的 scheme://；没有它的配置值（代理常写成 u:pw@host:port）按
+// 整条都是 authority 处理。
+var schemePrefix = regexp.MustCompile(`(?i)^[a-z][a-z0-9+.-]*://`)
 
-// bareUserinfo 处理没有 scheme 的配置值(代理常被写成 u:pw@host:port)。两者都贪婪匹配
-// 到第一个 `/` 之前的最后一个 `@`:Go 以最后一个 @ 为 userinfo 分隔符,口令里允许含
-// 字面量 @,只盖到第一个 @ 会把后半截口令留在日志里。
-var bareUserinfo = regexp.MustCompile(`^[^/\s]*@`)
-
-// RedactURL 打码一条 URL 里的凭据：userinfo 整段与整条查询串，保留 scheme、主机、
-// 端口与路径。
+// RedactURL 把一条 URL 收敛成「连的是哪个端点」：scheme、主机、端口；userinfo、路径、
+// 查询串、片段一律盖掉。
+//
+// 只保留端点而不保留路径，是几轮评审逼出来的结论：凭据能藏的地方远不止 userinfo 与查询
+// 串——参数名可百分号编码，值里可带反引号/尖括号/单引号，口令里可有字面量 @，路径里
+// 还能嵌一整条带凭据的 URL（https://gw/proxy/https://u:pw@api/...），也有把令牌直接放进
+// 路径段的网关。任何「留下有用部分、只认出凭据」的做法都会漏。完整 base_url 仍由已鉴权
+// 的配置页原样回读，日志不需要重复它。
+//
+// 打码按文本做、不经 net/url：url.Parse+String 会重编码（把 **** 转成 %2A），解析失败的
+// URL 也一样要盖。
 func RedactURL(raw string) string {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return raw
 	}
-	masked := trimmed
-	if i := strings.IndexByte(masked, '?'); i >= 0 {
-		masked = masked[:i] + "?****"
+	prefix, rest := "", trimmed
+	if m := schemePrefix.FindString(rest); m != "" {
+		prefix, rest = m, rest[len(m):]
 	}
-	if schemeUserinfo.MatchString(masked) {
-		return schemeUserinfo.ReplaceAllString(masked, "${1}****@")
+	authority, tail := rest, ""
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		authority, tail = rest[:i], rest[i:]
 	}
-	if !strings.Contains(masked, "://") {
-		return bareUserinfo.ReplaceAllString(masked, "****@")
+	// Go 以第一个 `/` 之前的最后一个 @ 为 userinfo 分隔符；只有用户名的形态也常就是令牌。
+	if at := strings.LastIndexByte(authority, '@'); at >= 0 {
+		authority = "****@" + authority[at+1:]
 	}
-	return masked
+	if i := strings.IndexAny(authority, "?#"); i >= 0 {
+		authority = authority[:i+1] + "****"
+		tail = ""
+	}
+	if tail != "" && tail != "/" {
+		tail = "/****"
+	}
+	return prefix + authority + tail
 }
 
 // ScrubURLValue 把文本里出现的 raw 原样换成它的打码形态。
