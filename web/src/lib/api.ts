@@ -29,6 +29,8 @@ import type {
   ConvTokenSummary,
   CoverageAssetRefs,
   CoverageGraphData,
+  CredentialList,
+  CrownJewelTarget,
   DailyTokenBucket,
   DeleteTaskOptions,
   DeleteTaskResult,
@@ -54,7 +56,6 @@ import type {
   InterceptPending,
   InterceptRule,
   IntranetTopology,
-  PendingScopeRow,
   JudgeConfig,
   JudgeUsage,
   LLMPoolStatus,
@@ -72,16 +73,15 @@ import type {
   NotificationDelivery,
   NotificationFilter,
   NotificationMeta,
+  PendingScopeRow,
   PromptVar,
   PromptVersion,
-  SessionTokenUsage,
   SessionFsEntry,
   SessionReadResult,
+  SessionTokenUsage,
   Settings,
   Severity,
   ShellSession,
-  TunnelRecord,
-  CredentialList,
   SkillCall,
   SkillItem,
   SSProject,
@@ -108,6 +108,7 @@ import type {
   TrafficEvidenceRole,
   TrafficHost,
   TrafficResp,
+  TunnelRecord,
   UpdateCheck,
   UsageStats,
   WorkspaceFile,
@@ -510,6 +511,18 @@ export const api = {
     ).then((r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 })),
   assetCounts: (taskId = "") =>
     get<Record<string, number>>(`/assets/counts${taskId ? `?task_id=${encodeURIComponent(taskId)}` : ""}`),
+  // ---- crown jewels (目标导向分析) ----
+  setCrownJewel: (id: number, note?: string) =>
+    post<{ ok: boolean; asset?: Asset }>(`/assets/${id}/crown-jewel`, { note: note ?? "" }),
+  unsetCrownJewel: (id: number) => del<{ ok: boolean; asset?: Asset }>(`/assets/${id}/crown-jewel`),
+  crownJewelPaths: (id: string) =>
+    get<{ targets: CrownJewelTarget[] }>(`/tasks/${encodeURIComponent(id)}/crown-jewels/paths`).then((r) => ({
+      targets: arr(r.targets),
+    })),
+  anchorGoalAsset: (id: string, goalId: string, assetId: number) =>
+    post<{ ok: boolean }>(`/tasks/${encodeURIComponent(id)}/goals/${goalId}/anchors`, { asset_id: assetId }),
+  unanchorGoalAsset: (id: string, goalId: string, assetId: number) =>
+    del<{ ok: boolean }>(`/tasks/${encodeURIComponent(id)}/goals/${goalId}/anchors/${assetId}`),
   deleteAssets: (ids: number[]) =>
     http<{ deleted: number }>("/assets", { method: "DELETE", body: JSON.stringify({ ids }) }),
   // task-scoped view of the same endpoint — server-side paginated like `assets`
@@ -850,8 +863,7 @@ export const api = {
   // 渠道是多实例资源（同一类型可配多个机器人、各有过滤规则），因此独立成组，
   // 不塞进扁平的 settings 键值里。
   notifyMeta: () => get<NotificationMeta>(`/notify/meta`),
-  notifyChannels: () =>
-    get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
+  notifyChannels: () => get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
   notifyCreateChannel: (payload: {
     name: string;
     kind: string;
@@ -1340,9 +1352,9 @@ export const api = {
   rollbackUpdate: () => post<{ ok: boolean }>(`/update/rollback`),
 
   pendingScope: (taskId: string, all = false) =>
-    get<{ items: PendingScopeRow[] }>(
-      `/tasks/${encodeURIComponent(taskId)}/pending-scope${all ? "?all=1" : ""}`,
-    ).then((r) => arr(r.items)),
+    get<{ items: PendingScopeRow[] }>(`/tasks/${encodeURIComponent(taskId)}/pending-scope${all ? "?all=1" : ""}`).then(
+      (r) => arr(r.items),
+    ),
   decidePendingScope: (id: number, action: "approve" | "dismiss") =>
     post<PendingScopeRow>(`/pending-scope/${id}/decide`, { action }),
 

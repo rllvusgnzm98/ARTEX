@@ -88,6 +88,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_app_name     ON assets(app_name)  WHERE
 CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_service_http ON assets(url) WHERE type = 'service' AND service_type = 'http';
 CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_service_other
     ON assets(COALESCE(domain,''), COALESCE(ip,''), port, service_name) WHERE type = 'service' AND service_type = 'other';
+-- crown jewels (目标导向分析): operator-marked high-value target assets. crown_jewel
+-- flags the asset; crown_jewel_note records its business value. Goal nodes anchor to
+-- these via exploration_anchors so the planner can prioritize intents approaching them.
+ALTER TABLE assets ADD COLUMN IF NOT EXISTS crown_jewel      BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE assets ADD COLUMN IF NOT EXISTS crown_jewel_note TEXT;
+CREATE INDEX IF NOT EXISTS idx_assets_crown_jewel ON assets(id) WHERE crown_jewel;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_av2_endpoint     ON assets(url, method) WHERE type = 'endpoint';
 CREATE INDEX IF NOT EXISTS idx_av2_company      ON assets(company_id)       WHERE company_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_av2_company_type ON assets(company_id, type) WHERE company_id IS NOT NULL;
