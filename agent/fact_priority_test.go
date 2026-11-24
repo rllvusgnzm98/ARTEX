@@ -189,3 +189,63 @@ func TestRecordFactBatchPrioritySchema(t *testing.T) {
 		t.Fatalf("batch fields lost: %s", n.Payload)
 	}
 }
+
+func TestReportFindingRequiresAndFallsBackName(t *testing.T) {
+	d := testDB(t)
+	t.Cleanup(func() { d.Close() })
+	task, err := d.CreateTask("finding name test", "verify finding name fallback", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+
+	es := d.Exploration(task.ExplorationID)
+	ts := NewToolSet(es, "worker")
+	ts.SetTaskID(task.ID)
+	tool := ts.addFinding()
+
+	req, _ := tool.InputSchema()["required"].([]string)
+	hasName := false
+	for _, r := range req {
+		if r == "name" {
+			hasName = true
+		}
+	}
+	if !hasName {
+		t.Fatalf("report_finding required=%v, want 'name' included", req)
+	}
+
+	// Omitting name derives a concise title from summary instead of storing empty name.
+	res1, err := tool.Call(t.Context(), json.RawMessage(`{"vulnclass":"rce","severity":"critical","summary":"HugeGraph Gremlin 沙箱逃逸导致任意文件读取。详细过程见 evidence。"}`), nil)
+	if err != nil || res1.IsError {
+		t.Fatalf("report_finding without name failed: %s %v", res1.Flatten(), err)
+	}
+	var got1 db.RecordedFinding
+	if _, body, ok := strings.Cut(res1.Flatten(), "\n"); !ok || json.Unmarshal([]byte(body), &got1) != nil || got1.FindingID <= 0 {
+		t.Fatalf("unexpected report_finding response: %s", res1.Flatten())
+	}
+	var name1 string
+	if err := d.QueryRow(`SELECT name FROM findings WHERE id=$1`, got1.FindingID).Scan(&name1); err != nil {
+		t.Fatal(err)
+	}
+	if name1 != "HugeGraph Gremlin 沙箱逃逸导致任意文件读取" {
+		t.Fatalf("derived finding name=%q, want concise first clause", name1)
+	}
+
+	// Explicit name is preserved verbatim.
+	res2, err := tool.Call(t.Context(), json.RawMessage(`{"vulnclass":"rce","name":"Explicit Finding Title","severity":"high","summary":"long summary"}`), nil)
+	if err != nil || res2.IsError {
+		t.Fatalf("report_finding with explicit name failed: %s %v", res2.Flatten(), err)
+	}
+	var got2 db.RecordedFinding
+	if _, body, ok := strings.Cut(res2.Flatten(), "\n"); !ok || json.Unmarshal([]byte(body), &got2) != nil || got2.FindingID <= 0 {
+		t.Fatalf("unexpected report_finding response: %s", res2.Flatten())
+	}
+	var name2 string
+	if err := d.QueryRow(`SELECT name FROM findings WHERE id=$1`, got2.FindingID).Scan(&name2); err != nil {
+		t.Fatal(err)
+	}
+	if name2 != "Explicit Finding Title" {
+		t.Fatalf("explicit finding name=%q, want 'Explicit Finding Title'", name2)
+	}
+}

@@ -249,6 +249,31 @@ func TestRenderWorkerGraphOverviewDropsPlannerFieldsAndCapsLists(t *testing.T) {
 	}
 }
 
+func TestRenderWorkerGraphOverviewCapsFindingList(t *testing.T) {
+	longText := strings.Repeat("漏洞详情描述", 60) // 360 runes
+	findings := make([]map[string]any, 10)
+	for i := range findings {
+		findings[i] = map[string]any{
+			"id":          int64(900 + i),
+			"from_intent": int64(700 + i),
+			"summary":     longText,
+		}
+	}
+	body := newWorkerOverviewBody(map[string]any{"finding_list": findings}, nil)
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Fatalf("worker overview JSON invalid: %v\n%s", err, body)
+	}
+	gotList := parsed["finding_list"].([]any)
+	if len(gotList) != workerOverviewFindingsCap {
+		t.Fatalf("finding_list len=%d want %d", len(gotList), workerOverviewFindingsCap)
+	}
+	firstSummary := gotList[0].(map[string]any)["summary"].(string)
+	if utf8.RuneCountInString(firstSummary) > workerOverviewRunningSummaryMax+1 {
+		t.Fatalf("finding summary not clipped: runes=%d > %d", utf8.RuneCountInString(firstSummary), workerOverviewRunningSummaryMax+1)
+	}
+}
+
 func TestEntrySeedDirectParentDetailRelevantKeysAndEmptyGraph(t *testing.T) {
 	// 1. Direct parent general fact retains up to 600-rune detail; non-parent general fact omits detail.
 	parentDetail := strings.Repeat("上游凭据与参数细节", 50) // 450 runes (<600)

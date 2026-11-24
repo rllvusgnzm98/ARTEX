@@ -3,6 +3,7 @@ package guard
 import (
 	"net"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -47,18 +48,22 @@ var valueFlags = map[string]bool{
 	"-p": true, "-o": true, "-oA": true, "-oX": true, "-oN": true, "-oG": true,
 	"-iL": true, "-i": true, "-e": true, "-w": true, "-t": true, "-c": true,
 	"-H": true, "-A": true, "-U": true, "-d": true, "-x": true, "-u": true,
-	"-F": true, "-b": true, "-m": true, "-l": true, "-P": true,
-	"--data": true, "--header": true, "--proxy": true, "--user-agent": true,
+	"-F": true, "-b": true, "-m": true, "-l": true, "-L": true, "-P": true,
+	"-C": true, "-O": true, "-T": true, "-D": true, "-K": true,
+	"--data": true, "--data-binary": true, "--data-raw": true, "--data-urlencode": true,
+	"--header": true, "--proxy": true, "--user-agent": true,
 	"--connect-timeout": true, "--max-time": true, "--output": true,
+	"--config": true, "--cookie": true, "--cookie-jar": true, "--upload-file": true,
 	"--cacert": true, "--cert": true, "--key": true,
 	"--top-ports": true, "--min-rate": true, "--max-rate": true,
 }
 
 var (
 	reScheme = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s'"<>|\\^` + "`" + `]+`)
-	// 主机名:至少一段点分且以字母 TLD 结尾(file.txt 这类误判由 valueFlags 兜住)。
-	reHostName   = regexp.MustCompile(`^(?i)[a-z0-9]([a-z0-9-]*\.)+[a-z]{2,}$`)
-	reShellSplit = regexp.MustCompile(`[\s|;&<>]+`)
+	// 主机名:至少一段点分且以字母 TLD 结尾(file.txt 这类误判由 valueFlags 与扩展名黑名单兜住)。
+	reHostName     = regexp.MustCompile(`^(?i)[a-z0-9]([a-z0-9-]*\.)+[a-z]{2,}$`)
+	reSegmentSplit = regexp.MustCompile(`[|;&\r\n]+`)
+	reTokenSplit   = regexp.MustCompile(`\s+`)
 )
 
 // ExtractHosts extracts likely interaction targets from a shell command line:
@@ -84,59 +89,93 @@ func ExtractHosts(command string) []string {
 		}
 	}
 
-	// Pass 2: token scan — tool positional args + standalone IP literals.
-	curTool := "" // 当前 hostTools 工具名(小写);空表示不在工具参数位
-	skipNext := false
-	takeHost := false // 上一个词是当前工具的目标开关,本词按 host 收
-	for _, tok := range reShellSplit.Split(command, -1) {
-		tok = strings.Trim(tok, `"'`)
-		if tok == "" {
-			continue
-		}
-		if skipNext {
-			skipNext = false
-			takeHost = false
-			continue
-		}
-		if takeHost {
-			addHostCandidate(add, tok)
-			takeHost = false
-			continue
-		}
-		base := strings.ToLower(baseOf(tok))
-		if isShellKeyword(base) {
-			curTool = ""
-			continue
-		}
-		if hostTools[base] {
-			curTool = base
-			continue
-		}
-		if curTool != "" {
-			if strings.HasPrefix(tok, "-") {
-				name, inline := splitFlag(tok)
-				if hostValueFlags[curTool][name] {
-					if inline != "" {
-						addHostCandidate(add, inline)
-					} else {
-						takeHost = true
+	// Pass 2: segment-scoped token scan — reset tool context on every pipe /
+	// chain / newline so downstream commands (grep, python3, cat) do not inherit
+	// an upstream hostTool, and skip redirection targets.
+	for _, seg := range reSegmentSplit.Split(command, -1) {
+		curTool := "" // 当前 hostTools 工具名(小写);空表示不在工具参数位
+		skipNext := false
+		takeHost := false // 上一个词是当前工具的目标开关,本词按 host 收
+		skipRedirect := false
+		for _, tok := range reTokenSplit.Split(seg, -1) {
+			tok = strings.Trim(tok, `"'`)
+			if tok == "" {
+				continue
+			}
+			if skipRedirect {
+				skipRedirect = false
+				continue
+			}
+			if isRedirectOpToken(tok) {
+				skipRedirect = true
+				continue
+			}
+			if startsWithRedirectOp(tok) {
+				continue
+			}
+			if skipNext {
+				skipNext = false
+				takeHost = false
+				continue
+			}
+			if takeHost {
+				addHostCandidate(add, tok)
+				takeHost = false
+				continue
+			}
+			base := strings.ToLower(baseOf(tok))
+			if isShellKeyword(base) {
+				curTool = ""
+				continue
+			}
+			if hostTools[base] {
+				curTool = base
+				continue
+			}
+			if curTool != "" {
+				if strings.HasPrefix(tok, "-") {
+					name, inline := splitFlag(tok)
+					if hostValueFlags[curTool][name] {
+						if inline != "" {
+							addHostCandidate(add, inline)
+						} else {
+							takeHost = true
+						}
+						continue
+					}
+					if valueFlags[tok] {
+						skipNext = true
 					}
 					continue
 				}
-				if valueFlags[tok] {
-					skipNext = true
-				}
+				addHostCandidate(add, tok)
 				continue
 			}
-			addHostCandidate(add, tok)
-			continue
-		}
-		// 非工具参数位置:只收独立 IP 字面量(裸主机名歧义太大,宁缺勿滥)。
-		if ip := parseBareIP(tok); ip != "" {
-			add(ip)
+			// 非工具参数位置:只收独立 IP 字面量(裸主机名歧义太大,宁缺勿滥)。
+			if ip := parseBareIP(tok); ip != "" {
+				add(ip)
+			}
 		}
 	}
 	return out
+}
+
+func isRedirectOpToken(tok string) bool {
+	switch tok {
+	case ">", ">>", "<", "1>", "1>>", "2>", "2>>", "&>", "&>>":
+		return true
+	default:
+		return false
+	}
+}
+
+func startsWithRedirectOp(tok string) bool {
+	for _, p := range []string{">>", ">", "<", "1>>", "1>", "2>>", "2>", "&>>", "&>"} {
+		if strings.HasPrefix(tok, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func isShellKeyword(tok string) bool {
@@ -199,9 +238,30 @@ func addHostCandidate(add func(string), tok string) {
 		add(ip)
 		return
 	}
-	if reHostName.MatchString(stripPortMaybe(tok)) {
+	host := stripPortMaybe(tok)
+	if reHostName.MatchString(host) && !hasNonTLDFileExt(host) {
 		add(tok)
 	}
+}
+
+var nonTLDFileExts = map[string]bool{
+	".txt": true, ".html": true, ".htm": true, ".json": true, ".jsonl": true,
+	".js": true, ".mjs": true, ".cjs": true, ".yaml": true, ".yml": true,
+	".xml": true, ".csv": true, ".tsv": true, ".log": true, ".sql": true,
+	".sqlite": true, ".db": true, ".pdf": true, ".tar": true, ".gz": true,
+	".tgz": true, ".bz2": true, ".xz": true, ".7z": true, ".rar": true,
+	".pem": true, ".crt": true, ".cer": true, ".key": true, ".bak": true,
+	".tmp": true, ".swp": true, ".asm": true, ".elf": true, ".bin": true,
+	".php": true, ".jsp": true, ".asp": true, ".aspx": true,
+	".wordlist": true, ".dic": true, ".lst": true, ".md": true,
+	".ini": true, ".conf": true, ".cfg": true, ".toml": true,
+	".wasm": true, ".apk": true, ".ipa": true, ".jar": true, ".war": true,
+	".pyc": true,
+}
+
+func hasNonTLDFileExt(host string) bool {
+	ext := strings.ToLower(filepath.Ext(host))
+	return nonTLDFileExts[ext]
 }
 
 // splitFlag 拆出 -u/--url 与可选的 =value;不认识的粘连短选项保持原样当 name。

@@ -16,6 +16,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
@@ -105,7 +106,7 @@ var errWorkControlConflict = errors.New("work control conflict")
 // In particular, a quota error after partial streaming advances the task cursor
 // for the next LLM call but must not replay this whole intent on the backup.
 func retryableWorkerModelError(reason harness.TerminalReason, err error) bool {
-	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err) && !agent.IsSupplyFailure(err)
+	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err) && !agent.IsSupplyFailure(err) && !agent.IsGatewayWAFBlock(err)
 }
 
 // Engine drives the event-driven exploration loop with real LLM agents
@@ -191,6 +192,12 @@ type Engine struct {
 	// readiness reports whether a global LLM provider is configured — the signal behind
 	// Ready()/the llm_configured indicator. Wired once at startup; nil → not ready.
 	readiness func() bool
+
+	campaignKickoff func(t *Task) bool
+	campaignPatrol  func(ctx context.Context, t *Task, trigger string) bool
+	campaignWakes   sync.Map // taskID -> chan string (buffered 1)
+	campaignDoneCnt sync.Map // taskID -> *atomic.Int64
+	campaignKicked  sync.Map // taskID -> bool
 }
 
 type taskRuntime struct {
@@ -327,6 +334,9 @@ func (e *Engine) StopTask(taskID string) {
 	e.stamped.Delete(taskID)
 	e.inflight.Delete(taskID)
 	e.coordStarted.Delete(taskID)
+	e.campaignWakes.Delete(taskID)
+	e.campaignDoneCnt.Delete(taskID)
+	e.campaignKicked.Delete(taskID)
 	e.deleteMu.Lock()
 	e.deleting.Delete(taskID)
 	e.deleteMu.Unlock()
@@ -906,9 +916,158 @@ func (e *Engine) ReadyFor(t *Task) bool {
 	return p != nil && w != nil
 }
 
-// Run starts the planner loop + N worker loops for a task. The loops always run
-// but no-op until an LLM is configured (so a task created while idle picks up
-// automatically once LLM is set from the UI).
+const defaultCampaignPatrolInterval = 5 * time.Minute
+
+// SetCampaignOrchestrator installs the MainAgent autonomous campaign-patrol hooks.
+// Safe to leave unset in focused planner/worker unit tests.
+func (e *Engine) SetCampaignOrchestrator(shouldKickoff func(t *Task) bool, patrol func(ctx context.Context, t *Task, trigger string) bool) {
+	e.campaignKickoff = shouldKickoff
+	e.campaignPatrol = patrol
+}
+
+func envCampaignDisabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("ARTEX_CAMPAIGN_DISABLED")))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+func (e *Engine) campaignInterval() time.Duration {
+	if envCampaignDisabled() {
+		return 0
+	}
+	if raw := strings.TrimSpace(os.Getenv("ARTEX_CAMPAIGN_INTERVAL_SEC")); raw != "" {
+		if sec, err := strconv.Atoi(raw); err == nil && sec > 0 {
+			return time.Duration(sec) * time.Second
+		}
+	}
+	return defaultCampaignPatrolInterval
+}
+
+func (e *Engine) enqueueCampaignWake(taskID, reason string) {
+	if e == nil || e.campaignPatrol == nil || taskID == "" {
+		return
+	}
+	v, _ := e.campaignWakes.LoadOrStore(taskID, make(chan string, 1))
+	ch := v.(chan string)
+	select {
+	case ch <- reason:
+	default:
+	}
+}
+
+func (e *Engine) notifyCampaignFromWorker(t *Task, state string) {
+	if e == nil || e.campaignPatrol == nil || t == nil {
+		return
+	}
+	if state == "blocked" {
+		e.enqueueCampaignWake(t.ID, "blocked_check")
+	}
+	v, _ := e.campaignDoneCnt.LoadOrStore(t.ID, &atomic.Int64{})
+	if n := v.(*atomic.Int64).Add(1); n%3 == 0 {
+		e.enqueueCampaignWake(t.ID, "wave_settled")
+	}
+}
+
+func (e *Engine) campaignLoop(ctx context.Context, t *Task) {
+	interval := e.campaignInterval()
+	if interval <= 0 {
+		return
+	}
+	v, _ := e.campaignWakes.LoadOrStore(t.ID, make(chan string, 1))
+	wakeCh := v.(chan string)
+
+	runPatrol := func(trigger string) bool {
+		if e.campaignPatrol == nil || ctx.Err() != nil {
+			return false
+		}
+		if e.IsPaused(t.ID) || e.IsDeleting(t.ID) || e.isSettling(t.ID) || taskSupplyFrozen(t) || isTerminalStatus(t.lifecycleSnapshot().Status) {
+			return false
+		}
+		if t.Store != nil {
+			if open, err := t.Store.HasOpenGoal(); err == nil && !open {
+				return false
+			}
+		}
+		if !e.beginTaskOperation(t.ID) {
+			return false
+		}
+		defer e.decInflight(t.ID)
+		ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false)
+		if ectx.Err() != nil || e.IsDeleting(t.ID) {
+			return false
+		}
+		return e.campaignPatrol(ectx, t, trigger)
+	}
+
+	kickoffPending := false
+	if e.campaignKickoff != nil && e.campaignKickoff(t) {
+		if _, done := e.campaignKicked.Load(t.ID); !done {
+			kickoffPending = true
+		}
+	}
+	tryKickoff := func() {
+		if !kickoffPending {
+			return
+		}
+		if e.campaignKickoff != nil && !e.campaignKickoff(t) {
+			e.campaignKicked.Store(t.ID, true)
+			kickoffPending = false
+			return
+		}
+		if runPatrol("kickoff") {
+			e.campaignKicked.Store(t.ID, true)
+			kickoffPending = false
+			if t.Store != nil {
+				if has, err := t.Store.HasActiveIntent(); err == nil && !has {
+					t.Notify()
+				}
+			}
+		}
+	}
+	tryKickoff()
+
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	var lastPatrol time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case trigger := <-wakeCh:
+			if kickoffPending {
+				tryKickoff()
+				if !kickoffPending {
+					lastPatrol = time.Now()
+					resetPlannerTimer(timer, interval)
+					continue
+				}
+			}
+			if !lastPatrol.IsZero() && time.Since(lastPatrol) < 20*time.Second && trigger != "blocked_check" {
+				continue
+			}
+			if runPatrol(trigger) {
+				lastPatrol = time.Now()
+			}
+		case <-timer.C:
+			if kickoffPending {
+				tryKickoff()
+				if !kickoffPending {
+					lastPatrol = time.Now()
+					resetPlannerTimer(timer, interval)
+					continue
+				}
+			}
+			if runPatrol("periodic") {
+				lastPatrol = time.Now()
+			}
+		}
+		resetPlannerTimer(timer, interval)
+	}
+}
+
+// Run starts the planner loop + N worker loops (plus the campaign patrol loop
+// when wired) for a task. The loops always run but no-op until an LLM is
+// configured (so a task created while idle picks up automatically once LLM is
+// set from the UI).
 func (e *Engine) Run(ctx context.Context, t *Task) {
 	workers := e.m.Workers()
 	e.deleteMu.RLock()
@@ -921,7 +1080,12 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 		t.Notify() // already running — just nudge a planning round
 		return
 	}
-	rt := e.registerTaskRoutines(ctx, t.ID, 1+workers)
+	hasCampaign := e.campaignPatrol != nil && !envCampaignDisabled()
+	routines := 1 + workers
+	if hasCampaign {
+		routines++
+	}
+	rt := e.registerTaskRoutines(ctx, t.ID, routines)
 	e.deleteMu.RUnlock()
 	e.touch(t.ID)
 	runTaskRoutine(rt, func(loopCtx context.Context) { e.plannerLoop(loopCtx, t) })
@@ -929,14 +1093,22 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 		name := fmt.Sprintf("work#%d", i+1)
 		runTaskRoutine(rt, func(loopCtx context.Context) { e.workerLoop(loopCtx, t, name) })
 	}
+	willKickoff := false
+	if hasCampaign {
+		if e.campaignKickoff != nil && e.campaignKickoff(t) {
+			if _, done := e.campaignKicked.Load(t.ID); !done {
+				willKickoff = true
+			}
+		}
+		runTaskRoutine(rt, func(loopCtx context.Context) { e.campaignLoop(loopCtx, t) })
+	}
 	e.startDeadlineCoordinator(ctx, t) // 任务级超时定时器(仅 timeout>0;去重)
-	// 仅在「完全没有活动意图(open+running)」时才 kick 首轮规划。带种子意图的任务:种子已
-	// 是 open,或已被上面刚起的 worker 抢先 claim 成 running——两种都算「有活干」,一律跳过
-	// 首轮 planner,worker 直接领种子意图开跑,跑完由 NotifyDone/心跳唤醒 planner。
-	// ⚠️ 不能用 Frontier(只数 open):worker 领取(open→running)与本检查存在竞态,会误 kick。
-	// 重启自动恢复时也可能只剩 running 意图,同样应跳过。
-	if has, _ := t.Store.HasActiveIntent(); !has {
-		t.Notify() // kick the first planning round (acted on once LLM is ready)
+	// 仅在「完全没有活动意图(open+running)」且无需 MainAgent kickoff 时才 kick 首轮规划。
+	// 若需 kickoff，先由 MainAgent 完成控制面预检/账本/资产种子后唤醒 planner，避免 Turn 0 抢跑。
+	if !willKickoff {
+		if has, _ := t.Store.HasActiveIntent(); !has {
+			t.Notify() // kick the first planning round (acted on once LLM is ready)
+		}
 	}
 }
 
@@ -1243,6 +1415,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// per-work child context so the planner's kill_work can stop just this work.
 	workCtx, workCancel := context.WithCancelCause(ectx)
 	workCtx = llmrec.WithAttribution(workCtx, intent.ID, name, 0)
+	workCtx = guard.WithScopeKey(workCtx, fmt.Sprintf("intent:%d", intent.ID))
 	e.registerWork(intent.ID, workCancel)
 	// wrap the guard hooks so steer_work can inject a mid-run course-correction
 	// for THIS intent (drained before the worker's next tool call).
@@ -1276,6 +1449,23 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
 	}
 	e.EndLLMCall(t.ID)
+	if !loss.Fired() && reason == harness.ReasonModelError && agent.IsGatewayWAFBlock(err) &&
+		workCtx.Err() == nil && ectx.Err() == nil && !e.IsPaused(t.ID) && !e.isSettling(t.ID) && t.Store != nil {
+		if scrubbed, scrubErr := worker.SanitizeSessionForWAF(t.Store.ID(), intent.ID); scrubErr != nil {
+			log.Printf("[worker %s] task %s 意图 #%d 网关 WAF 脱敏失败: %v", name, t.ID, intent.ID, scrubErr)
+		} else if scrubbed {
+			log.Printf("[worker %s] task %s 意图 #%d 命中上游网关 WAF 403，已脱敏尾部敏感载荷并自愈续跑 1 次", name, t.ID, intent.ID)
+			e.BeginLLMCall(t.ID)
+			var attemptWrites agent.WriteCounts
+			if hasChatMessage {
+				reason, attemptWrites, err = worker.ExecuteWithMessage(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, requestID, message)
+			} else {
+				reason, attemptWrites, err = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
+			}
+			wrote = wrote.Add(attemptWrites)
+			e.EndLLMCall(t.ID)
+		}
+	}
 	// model_error 收场 → 额外重跑几次（退避后再试）。仅在意图仍属本 work、任务
 	// 未暂停/未终止/未取消【且未进入收尾】时重试；否则让位给对应分支处理(收尾期不
 	// 再重试,避免退避挤占其他 worker 的优雅收尾窗口)。
@@ -1458,6 +1648,8 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	if state == "blocked" && isTaskLLMChainExhausted(err) {
 		controlErr = t.Store.SetIntentBlockedReason(intent.ID, db.IntentBlockedLLMQuota)
+	} else if state == "blocked" && agent.IsGatewayWAFBlock(err) {
+		controlErr = t.Store.SetIntentBlockedReason(intent.ID, db.IntentBlockedGatewayWAF)
 	} else {
 		controlErr = transitionIntentState(t.Store, intent.ID, "running", state)
 	}
@@ -1468,6 +1660,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	e.touch(t.ID)
 	t.NotifyDone(intent.ID) // results changed the graph -> wake the planner (with the just-finished intent id)
+	e.notifyCampaignFromWorker(t, state)
 	return true
 }
 

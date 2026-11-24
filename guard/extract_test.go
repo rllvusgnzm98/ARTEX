@@ -82,3 +82,46 @@ func TestExtractHostsShellHintCLIs(t *testing.T) {
 		}
 	}
 }
+
+func TestExtractHostsIgnoresLocalFilenamesRedirectsAndDownstreamCode(t *testing.T) {
+	cases := []struct {
+		name string
+		cmd  string
+		want []string
+	}{
+		{
+			"curl -o + grep",
+			`curl -s http://10.0.164.137:3000/install -o install.html && grep -oE "x" install.html`,
+			[]string{"10.0.164.137"},
+		},
+		{
+			"curl redirect + cat",
+			`curl -s http://10.0.164.137:3000/install > install.html && cat install.html`,
+			[]string{"10.0.164.137"},
+		},
+		{
+			"hydra -L -P wordlists",
+			`hydra -L u.txt -P p.txt 10.0.164.136 telnet`,
+			[]string{"10.0.164.136"},
+		},
+		{
+			"downstream python urllib.parse",
+			`curl http://10.0.164.137/ && python3 -c "import urllib.parse"`,
+			[]string{"10.0.164.137"},
+		},
+		{
+			"local file arg after curl",
+			`curl -s http://10.0.164.136:3000/apps -o apps.html && grep foo layout.js`,
+			[]string{"10.0.164.136"},
+		},
+	}
+	for _, c := range cases {
+		got := ExtractHosts(c.cmd)
+		if len(got) == 0 {
+			got = nil
+		}
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: ExtractHosts(%q) = %v, want %v", c.name, c.cmd, got, c.want)
+		}
+	}
+}

@@ -3,6 +3,8 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -203,6 +205,9 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 	}
 
 	intentAssets := uniqueIDs(append([]int64(nil), g.IntentAssetIDs...))
+	if len(intentAssets) == 0 && len(parentFacts) == 0 && g.Intent != nil && len(g.Assets) > 0 {
+		intentAssets = inferIntentAssetIDs(string(g.Intent.Payload), g.Assets)
+	}
 	anchorOf := func(id int64) []int64 {
 		if g.Anchors == nil {
 			return nil
@@ -793,4 +798,73 @@ func selectedEntrySeedFacts(seed WorkerEntrySeed) (keys, general []EntryFact, om
 	}
 	sort.Slice(general, func(i, j int) bool { return general[i].ID < general[j].ID })
 	return keys, general, keyCount - len(keys), generalCount - len(general)
+}
+
+func inferIntentAssetIDs(intentPayload string, assets map[int64]string) []int64 {
+	intentText := strings.ToLower(intentPayload)
+	if intentText == "" || len(assets) == 0 {
+		return nil
+	}
+	var matched []int64
+	for id, label := range assets {
+		if id <= 0 {
+			continue
+		}
+		host := assetHostToken(label)
+		if host == "" {
+			continue
+		}
+		if containsHostToken(intentText, host) {
+			matched = append(matched, id)
+		}
+	}
+	sort.Slice(matched, func(i, j int) bool { return matched[i] < matched[j] })
+	return matched
+}
+
+func assetHostToken(label string) string {
+	s := strings.TrimSpace(label)
+	if s == "" {
+		return ""
+	}
+	if strings.Contains(s, "://") {
+		if u, err := url.Parse(s); err == nil && u.Hostname() != "" {
+			s = u.Hostname()
+		}
+	} else if h, _, err := net.SplitHostPort(s); err == nil {
+		s = h
+	}
+	s = strings.ToLower(strings.Trim(strings.TrimSpace(s), "[]"))
+	if len(s) < 4 {
+		return ""
+	}
+	if !strings.Contains(s, ".") && net.ParseIP(s) == nil {
+		return ""
+	}
+	return s
+}
+
+func containsHostToken(text, host string) bool {
+	if text == "" || host == "" {
+		return false
+	}
+	offset := 0
+	for {
+		idx := strings.Index(text[offset:], host)
+		if idx < 0 {
+			return false
+		}
+		start := offset + idx
+		end := start + len(host)
+		beforeOK := start == 0 || !isHostTokenChar(text[start-1])
+		afterOK := end == len(text) || !isHostTokenChar(text[end])
+		if beforeOK && afterOK {
+			return true
+		}
+		offset = start + 1
+	}
+}
+
+func isHostTokenChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '.' || b == '-' || b == '_'
 }

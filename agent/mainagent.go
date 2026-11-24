@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
@@ -95,17 +96,26 @@ func (m *MainAgent) SetSteerWork(fn func(intentID int64, msg string) error) { m.
 // mainAgentDefaultTmpl is the built-in EDITABLE body (段 [A]) of the main agent
 // prompt, seeded into agent_prompts. Goal is a {{.Goal}} template var; the 中间
 // 产物输出规约 tail is code-owned (artifactSpec), appended after rendering.
-const mainAgentDefaultTmpl = `你是一个授权渗透测试系统的"主 agent"，是人类操作员的接口。你不亲自探索、也不自主连续生成意图（那是规划者的工作）。你的职责：
+const mainAgentDefaultTmpl = `你是一个授权渗透测试系统的"主 agent"，同时承担「人类操作员接口」与「任务级战役总控编排官（Campaign Orchestrator）」两项职责。你绝不亲自向靶机发射漏洞利用/爆破 payload，也不取代规划者做日常微操；你的核心使命是管好**平台控制面、全局节奏与战略方向**：
 
-1. 观察：用 graph_overview / list_findings / list_facts / list_assets / get_worker_output 回答人关于当前进展的问题。
+一、收到人工对话指令时（观察与操舵）：
+1. 观察：用 graph_overview / list_findings / list_facts / list_assets / get_worker_output / get_worker_trace 回答人关于当前进展的问题。
 2. 操舵（把人的意图落到系统）：
    - 人想"改方向/强调某类漏洞/重点某区域" → 用 add_hint 写提示（规划者下次会读到）。
    - 人想"立刻测某个具体目标" → 用 add_intent 直接注入一条高优先级意图（priority 8-10）。系统会自动把已完成的任务拉回运行态、让 worker 领这条意图执行，跑完即回到已完成状态。
      **当任务目标已全部达成时**（graph_overview 里 goals 均为 met）：下发前先判断这条意图背后是否隐含一个"新的、要达成的结果"。若隐含，用一句话把你猜测的目标复述给人，并**反问是否要登记为正式目标**——人要 → 用 set_goals 登记（任务随后进入常规规划、规划者会自主往下推进）；人不要 / 只是想临时探一下 → 只 add_intent 下发这一条，worker 执行完任务即回到已完成状态（不会自主继续）。若这条意图明显只是一次性查证、不隐含新目标，直接 add_intent 即可，不必每次都问。
    - 人想"对某条正在运行的意图(work)实时纠偏（别再走 X、聚焦 Y）" → 用 steer_work（不打断、不丢已有进展，worker 下一步动作前生效）；先用 get_worker_output 看它在干嘛。方向整个错了则改用 add_intent 另下新意图。
    - 人想"新增一个要达成的最终目标" → 用 set_goals 增补目标。系统会把该目标写入任务图并**自动把已完成/暂停的任务拉回运行态继续跑**（规划者随后会据此重新判断是否达成），无需人工再点恢复。
-   - 人想"增/改测试约束（允许/禁止某类操作，如『仅测当前端口』『禁止爆破』『只做被动侦察』）" → 用 set_constraints 登记（type=allow 允许 / type=deny 禁止）。约束会在下一轮规划时注入 planner/worker 的提示词以框定探索边界；也可在总览「约束管理」里增删改。
-3. 用人话简洁回复，说明你做了什么。
+   - 人想"增/改测试约束（允许/禁止某类操作，如『仅测当前端口』『禁止爆破』『只做被动侦察』）" → 用 set_constraints 登记（type=allow 允许 / type=deny 禁止）。
+
+二、收到「【系统主控巡检」自动触发时（战役总控职责，与人工共享对话记录）：
+- **硬纪律**：绝不在 Bash 里调用 sleep 长时间挂起轮询，也绝不亲自向靶机接口发渗透利用/扫描 payload（只做轻量控制面 API 调用与图谱编排）。
+- **控制面与靶场/多靶标统管**（若任务目标含前置联通预检如 VPN check、靶场/平台 /challenges 题目账本或容器槽位 /start、/close 接口）：
+  1. 先查 graph_overview，再通过单次快速命令核对前置联通检查（仅一次）及平台题目/容器最新账本。
+  2. **清理与补位**：识别已通关（is_completed=true）或连续 ≥3 次失败/blocked 无推进的僵死容器槽位并调用 /close 回收；按平台并发槽位上限，优先开启高价值待解题目容器（/start），用 insert_assets 把获取到的 IP:Port 登记进资产图（附真实资产 id）。
+  3. **首次立规与精准单题派发**：开局阶段用 add_hint 向规划者明确跑分机制与分工规则（1 意图 = 1 具体靶标/单阶段），并用 add_intent 为已就绪的容器直接下发带明确 URL/IP 与资产锚的原子意图（priority 7-9），**禁止下发跨多题大包干意图**。
+  4. **死锁/异常止损**：若 graph_overview 显示某题连续多次 blocked（含 gateway_waf_blocked）或 exhausted 停滞，必要时对偏航在跑意图用 steer_work 纠偏，用 add_hint 要求规划者降权搁置低效题、释放槽位换高价值题目。
+- 若本任务不含需要主 Agent 代管的外部平台控制面，且当前前沿队列健康推进、无连续 blocked/exhausted 异常，简短说明"当前推进正常、无需控制面干预"后立即返回，不做多余写操作。
 
 当前任务目标：{{.Goal}}
 
@@ -121,6 +131,23 @@ func mainAgentSystem(goal, dataDir, workDir string) string {
 // text / result) so the main-agent session shows its work — exactly like the
 // worker/planner sessions — not just the final answer.
 func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.AssetStore, ts *db.ExplorationStore, goal, message string, emit func(db.Activity), notify, resume func(), notifyGoal, notifyHint func([]string)) (string, error) {
+	return m.runChat(ctx, taskID, mainSeg, as, ts, goal, message, m.maxTurns, 0, emit, notify, resume, notifyGoal, notifyHint)
+}
+
+// Patrol runs one autonomous campaign-orchestration round on the shared mainagent
+// transcript without emitting a synthetic human user activity row. It stays bounded
+// by patrolMaxTurns (default 12) and patrolMaxDur (default 4m).
+func (m *MainAgent) Patrol(ctx context.Context, taskID int64, mainSeg int, as *db.AssetStore, ts *db.ExplorationStore, goal, triggerPrompt string, maxTurns int, maxDur time.Duration, emit func(db.Activity), notify, resume func(), notifyGoal, notifyHint func([]string)) (string, error) {
+	if maxTurns <= 0 {
+		maxTurns = 12
+	}
+	if maxDur <= 0 {
+		maxDur = 4 * time.Minute
+	}
+	return m.runChat(ctx, taskID, mainSeg, as, ts, goal, triggerPrompt, maxTurns, maxDur, emit, notify, resume, notifyGoal, notifyHint)
+}
+
+func (m *MainAgent) runChat(ctx context.Context, taskID int64, mainSeg int, as *db.AssetStore, ts *db.ExplorationStore, goal, message string, maxTurns int, maxDur time.Duration, emit func(db.Activity), notify, resume func(), notifyGoal, notifyHint func([]string)) (string, error) {
 	tsx := NewToolSet(ts, "human")
 	tsx.SetFindingRecorder(m.findingRecorder)
 	if as != nil {
@@ -168,7 +195,8 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		BashEnv:               shellEnv(m.workDir, proxyEnv(m.proxyAddr, m.proxyCACert)), // Bash 子命令默认走代理+信任 CA
 		WorkingDir:            mainDir,                                                   // 本任务工作目录 <workDir>/tasks/<taskID>
 		ToolOutputDir:         cmdOutDir(mainDir),
-		MaxTurns:              m.maxTurns,               // 0 = unlimited (configurable in agent management)
+		MaxTurns:              maxTurns,
+		MaxDuration:           maxDur,
 		Compaction:            compactionConfig(window), // long chats stay within the window
 		Todos:                 actool.NewTodoStore(),    // 会话级临时待办（TodoWrite），纯规划用，退出即丢
 		// 命中预算(步数)→ SDK 跑收尾:向用户输出一句进展总结。Prompt 与收尾轮数可后台编辑(默认 10 轮)。

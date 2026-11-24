@@ -56,6 +56,12 @@ func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (st
 	}
 
 	var sum string
+	reasonLabel := terminalReasonLabel(reason)
+	reasonHintText := terminalReasonHint(reason)
+	if term.Err != nil && IsGatewayWAFBlock(term.Err) {
+		reasonLabel = "gateway_waf_blocked"
+		reasonHintText = "上游 LLM 网关 Cloudflare WAF 拦截了请求体（HTTP 403）：对话历史中的工具输入/输出含触发网关防火墙的明文攻击载荷特征（非靶机拦截、非额度耗尽）。重派时须要求 worker 禁止明文读取/打印完整 CVE 模板或 PoC，改用编码构造；若同一目标连续触发 ≥3 次请降权绕行"
+	}
 	if aborted {
 		_, short, _, ok := AbortReason(ctx)
 		if !ok {
@@ -72,15 +78,13 @@ func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (st
 	} else if reason == harness.ReasonMaxTurns || reason == harness.ReasonTimeout {
 		sum = "（达到运行预算上限(" + string(reason) + ")，已收尾写回事实" + progressSuffix(term, tr) + "；本次无文字总结）"
 	} else {
-		hint := terminalReasonHint(reason)
-		sum = "（无文字总结，终态 " + terminalReasonLabel(reason) + "：" + firstLine(hint, 80) + "）"
+		sum = "（无文字总结，终态 " + reasonLabel + "：" + firstLine(reasonHintText, 80) + "）"
 	}
 
 	var b strings.Builder
 	b.WriteString(sum)
 	b.WriteString("\n\n")
-	displayReason := terminalReasonLabel(reason)
-	fmt.Fprintf(&b, "- **终态**: `%s` - %s\n", displayReason, terminalReasonHint(reason))
+	fmt.Fprintf(&b, "- **终态**: `%s` - %s\n", reasonLabel, reasonHintText)
 	if aborted {
 		code, _, why, ok := AbortReason(ctx)
 		if ok {

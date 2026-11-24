@@ -47,6 +47,9 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 			summary = clipPlainRunes(s, intentSummaryMax)
 		}
 		m := map[string]any{"id": n.ID, "summary": summary, "state": n.State}
+		if n.BlockedReason != "" {
+			m["blocked_reason"] = n.BlockedReason
+		}
 		if n.Inherited {
 			m["source_task_id"] = n.SourceTaskID
 			m["inherited"] = true
@@ -1195,6 +1198,11 @@ func (t *ToolSet) addOneIntentCtx(ctx context.Context, it intentItem) (int64, er
 	if strings.TrimSpace(it.Summary) == "" {
 		return 0, fmt.Errorf("summary 不能为空")
 	}
+	if t.worker == "planner" {
+		if err := validateAtomicPlannerIntent(it.Summary); err != nil {
+			return 0, err
+		}
+	}
 	// 先校验锚点（建节点前，避免坏锚点留下孤儿意图）。
 	parents := pidList(it.ParentIDs)
 	for _, pidv := range parents {
@@ -1257,6 +1265,28 @@ func (t *ToolSet) addOneIntentCtx(ctx context.Context, it intentItem) (int64, er
 		}
 	}
 	return id, nil
+}
+
+var broadSweepIntentPatterns = []string{
+	"兜底收割",
+	"收割未被覆盖",
+	"收割所有未",
+	"批量解题",
+	"从medium难度题切入",
+	"从hard难度题切入",
+	"从easy难度题切入",
+}
+
+// validateAtomicPlannerIntent rejects omnibus multi-challenge sweep intents from
+// the planner so each worker receives a focused single-target / single-stage mandate.
+func validateAtomicPlannerIntent(summary string) error {
+	norm := strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(summary)), ""))
+	for _, pat := range broadSweepIntentPatterns {
+		if strings.Contains(norm, pat) {
+			return fmt.Errorf("意图过于宽泛（多题大包干扫荡，命中 %q）：请遵守「1 意图 = 1 个明确目标/单阶段」，拆分为具体单题或单资产意图后再调用 add_intent；如仅需核对平台题目与容器槽位，请交由主 Agent 巡检或只发纯只读对账/清理意图。", pat)
+		}
+	}
+	return nil
 }
 
 func (t *ToolSet) addIntent() actool.CoreTool {
@@ -1397,7 +1427,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		"evidence_hint_id": idp("可选：本任务中对应此漏洞的提示节点 ID，自动携带其结构化 traffic_refs；不能引用继承提示或其他漏洞的提示"),
 		"traffic_refs": map[string]any{"type": "array", "description": "可选；HTTP/HTTPS 漏洞先检索并逐条核实请求/响应确实支持漏洞结论，再按复现顺序填写真实 ID。TCP 等非 HTTP 漏洞、未采集或找不到确切记录时省略或传 []，不阻止上报；可在 evidence 说明原因并提供其他可验证证据。不要猜测 ID、按域名/时间推定关联或仅为补包重复探测。用途 baseline 正常对照 / proof 漏洞证明 / verification 补充验证 / supporting 辅助证据。",
 			"items": obj(map[string]any{"traffic_id": str("traffic_search 返回的真实流量 ID"), "role": map[string]any{"type": "string", "enum": []string{"baseline", "proof", "verification", "supporting"}}, "note": str("该流量如何支持漏洞结论")}, "traffic_id")},
-	}, "vulnclass", "severity", "summary"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+	}, "vulnclass", "name", "severity", "summary"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 		var a struct {
 			VulnClass, Name, Severity, Summary, Evidence string
 			IntentID                                     json.RawMessage   `json:"intent_id"`
@@ -1426,7 +1456,11 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if err != nil {
 			return actool.Errorf(err.Error()), nil
 		}
-		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs)}
+		name := strings.TrimSpace(a.Name)
+		if name == "" {
+			name = deriveFindingName(a.VulnClass, a.Summary)
+		}
+		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs)}
 		if !t.beginEvidenceWrite(ctx) {
 			return actool.Errorf("evidence write interrupted"), nil
 		}
@@ -1473,6 +1507,25 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		raw, _ := json.Marshal(result)
 		return actool.Text(fmt.Sprintf("finding recorded: %d\n%s", recorded.NodeID, raw)), nil
 	})
+}
+
+func deriveFindingName(vulnClass, summary string) string {
+	s := strings.TrimSpace(summary)
+	if s != "" {
+		if idx := strings.IndexAny(s, "\r\n"); idx >= 0 {
+			s = strings.TrimSpace(s[:idx])
+		}
+		for _, sep := range []string{"。", "；", ";"} {
+			if idx := strings.Index(s, sep); idx > 0 {
+				s = strings.TrimSpace(s[:idx])
+				break
+			}
+		}
+		if s != "" {
+			return clipPlainRunes(s, 80)
+		}
+	}
+	return clipPlainRunes(strings.TrimSpace(vulnClass), 80)
 }
 
 // recordFact writes a general exploration RESULT/conclusion (not a vuln, not a

@@ -92,7 +92,7 @@ func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
 	if res, stop := g.checkHoneypot(ev, cmd); stop {
 		return res
 	}
-	g.checkTarpit(ev)
+	g.checkTarpit(ctx, ev)
 	res := g.applyIntercept(ctx, ev)
 	if res.Decision == "block" {
 		return res

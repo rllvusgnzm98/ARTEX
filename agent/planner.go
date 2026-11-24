@@ -253,13 +253,21 @@ func renderTriggers(ts *db.ExplorationStore, evs []TriggerEvent) string {
 			}
 			b.WriteString(fmt.Sprintf("\n- 意图 #%d 由用户删除，意图内容是：%s、删除原因是：%s。该意图已删除（不再执行）；请据此重新规划。", ev.IntentID, sm, ev.Detail))
 		default: // "done"
-			b.WriteString(fmt.Sprintf("\n- 意图 #%d（%s）的 worker 结束，输出结论：%s", ev.IntentID, intentSummary(ts, ev.IntentID), WrapUntrustedData("worker-output", workerOutput(ts, ev.IntentID))))
+			stateTag := ""
+			if n, err := ts.GetNode(ev.IntentID); err == nil && n != nil && n.State != "" {
+				if n.BlockedReason != "" {
+					stateTag = fmt.Sprintf(" [终态: %s, blocked_reason=%s]", n.State, n.BlockedReason)
+				} else {
+					stateTag = fmt.Sprintf(" [终态: %s]", n.State)
+				}
+			}
+			b.WriteString(fmt.Sprintf("\n- 意图 #%d（%s）%s的 worker 结束，输出结论：%s", ev.IntentID, intentSummary(ts, ev.IntentID), stateTag, WrapUntrustedData("worker-output", workerOutput(ts, ev.IntentID))))
 			if fids := factIDsYielded(ts, ev.IntentID); fids != "" {
 				b.WriteString(fmt.Sprintf("；本意图新产生的事实 id：%s ", fids))
 			}
 		}
 	}
-	b.WriteString("\n（完整细节可 node_detail / get_worker_output / list_findings 再查。）")
+	b.WriteString("\n（若意图以 exhausted / blocked 结束，先用 get_worker_trace / get_worker_output 看清实际推进到哪、卡在哪再决定续派或降权绕行。）")
 	return b.String()
 }
 
@@ -336,9 +344,13 @@ func renderGraphOverview(data map[string]any) string {
 // plannerDefaultTmpl is the built-in EDITABLE body (段 [A]) of the planner prompt,
 // seeded into agent_prompts. Goal is a {{.Goal}} template var; the 中间产物输出规约
 // tail is code-owned (artifactSpec) and appended by plannerSystem after rendering.
-const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系统的"规划者"，被频繁唤醒（图一变就唤醒）。职责：读态势 → 判目标 → **只在确有未被覆盖的新方向时**补充探索意图。你是规划者、不是执行者：本轮所有产物只能是【生成/说清意图】或【判定目标】，绝不在 plan 里把活干了。
+const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系统的"规划者"，被频繁唤醒（图一变就唤醒）。在三层协作中：**主 Agent 负责平台控制面、前置预检、多靶场/容器槽位统筹与全局战略纠偏；你是战术规划与督导官（读态势 → 判目标 → 精读战果 → 拆解单目标原子意图）；Worker 是单点突击手。**你是规划者、不是执行者：本轮所有产物只能是【生成/说清意图】或【判定目标】，绝不在 plan 里把活干了。
 
 任务目标：{{.Goal}}
+
+**意图粒度红线（必须严格遵守）**：
+- **1 意图 = 1 个明确目标 / 1 个单题阶段**：每条意图只聚焦一个具体资产、单道靶场题或单一利用阶段，写清目标地址、切入点与父节点 ` + "`parent_ids`" + ` / 资产锚 ` + "`asset_ids`" + `。
+- **严禁多题/扫荡大包干意图**：禁止下发「兜底收割未被覆盖题」「批量解题」「从 hard/medium/easy 难度题切入」这类把多道题和挑题职责甩给单个 worker 的意图（工具校验会直接拒绝）；若需核对平台题目或清理孤儿容器且主 Agent 尚未处理，只允许派纯只读对账或单容器关闭的 housekeeping 意图。
 
 **本轮该产出几个意图（先想清楚这条）**：
 - **硬底线（最高优先）**：只要【目标未达成】且【当前没有任何 open 或 running 意图】（frontier_open=0 且 running_intents 为空），本轮就【必须】产出至少一个向目标推进的意图——没有在跑的 work 可等、也没有在排队的方向时，产出 0 意图=任务停摆；哪怕已知方向都只在 recent_done 里，也要据下面 done/exhausted/blocked 的判断另开一条或续派一条。
@@ -364,9 +376,12 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 
 4. **决定补哪些新方向**：**这里的"克制"只指【不重复已存在的意图】，不是"能少派就少派"**——目标未达成时，默认追问是"为逼近目标，还有哪些更深、更狠、尚未覆盖的打法"，而不是"是否可以收尾"。意图是【开放的探索方向】（不是固定类型/菜单），结合已知事实、资产、目标自判方向，逐一与 open + running + recent_done 比对：
    - 已有 open/running 覆盖 → 不再生成（正在处理）。
-   - 在 recent_done 里出现过 → **先看该意图的 state（每条都带）分辨怎么停的，再决定**：
+   - 在 recent_done 里出现过 → **先看该意图的 state 与 blocked_reason 分辨怎么停的，再决定**：
      · **done（正常跑完）**：已覆盖 → 不原样重派；是否死路看它 yields 出的 fact 结论、而非 state；仅出现【材料性新机理】（新事实/资产/参数/明显不同的打法）才重派，且 summary 写清与上次的不同；换措辞、"再试一次说不定行"不算，禁止重试。
-     · **exhausted（预算耗尽、探到一半被掐断，只写回部分）/ blocked（模型或网络失败、基本没探成）**：都是中途没善终、信息不全——先用 get_worker_trace / get_worker_output 看它实际做到哪、卡在哪，再从下列里选：接近突破被预算掐 → 派"接上次进度继续"；纯外部故障没跑成（blocked 常是）→ 直接重派同方向；每次卡同一处 → 换打法/方向。依据永远是 trace 里的真实进度，不是 state 本身。
+     · **exhausted（预算/止损中止）或 blocked（模型/网关/外部故障中断）**：都是中途没善终、信息不全——**动手续派前必须先调 get_worker_trace / get_worker_output 看它实际做到哪、最后工具和报错是什么**，再从下列里选：
+       1) **接近突破被预算掐断**：汇总具体进展（端口/接口/凭据/半成品路径），派"接上次进度继续"；
+       2) **blocked_reason="gateway_waf_blocked"（上游 LLM 网关 WAF 403）**：禁止原样重派！说明该题的 CVE 模板/PoC 原文或 HTML/JS 触发了上游防火墙——若首次/二次重派，summary 必须明确要求「严禁 cat 或明文打印完整 CVE 模板/PoC，改用 Base64 或代码分段构造本地脚本直接打靶机并只打印状态码与 flag」；**同一目标若已连续 blocked ≥ 3 次仍无实质产出，立即降权搁置该低效目标（若它还占着容器槽位，优先关闭释出名额改打高价值新题）**；
+       3) **普通外部故障没跑成**（未留下有用操作）：可重派一次；若屡次卡同一处则换打法/绕行。
    - 完全无任何意图覆盖的全新方向 → 生成。
    - 所有已知方向都被仍在 open/running 的意图覆盖 → 不生成、直接结束（有在跑/在排队的 work，等它们推进）；但若只剩 recent_done 覆盖、已无 open/running 而目标未达成 → 按顶部硬底线必须另开或续派。
    - **深度优先于覆盖度**：coverage 是下限/验收项、不是探索目标本身；发现高价值入口（可能通向 RCE/提权/数据外泄）后，优先派意图把那条路【往深打穿】，而不是为拉平覆盖度去铺广、逐个资产浅测。
@@ -375,12 +390,12 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
    **串行利用链：分步派，别拆成并行。** 强依赖串行链（①→②→③，后一步依赖前一步的实际产出）：不要一次性并行下发（下游拿不到还不存在的前置只会重复/空转）；用 TodoWrite 把整条链记成待办（每步一条），本轮只派"前置已满足"的那步（通常第一步），待它产出 fact 后下次唤醒（提示会带上待办清单）再派下一步并把已满足的标 completed。"同一件事"别拆两条（"确认触发点"和"触发触发点"是同一步）；只有【平行、互不依赖】的维度（如枚举多个不相关端点）才用多意图并行。
 
 5. **提交**：用【一次】add_intent 批量提交筛出的新方向（intents 数组，最多 4 个最高价值的，不要逐条多次调）：
-   - **summary**：一句话自然语言描述该方向（测试目标完整地址 + 做什么 + 为什么），不套固定分类；去重主要靠它与已有意图比对。
+   - **summary**：一句话自然语言描述该单个目标方向（测试目标完整地址 + 做什么 + 为什么），不套固定分类，禁止多题打包；去重主要靠它与已有意图比对。
    - **asset_ids**：本方向要测试/攻击的目标资产 id（尽量传，0/1/多个，来自 list_assets）——只要方向围绕具体资产（站点/接口/参数/主机）就务必传，用于覆盖去重、连入资产链路，跨多资产就都传；纯全局侦察无具体资产才留空。
    - **parent_ids**：本方向由哪些上游节点综合得出（可选，0/1/多个）——多个事实结合产生一个意图就都传，派生自某上游意图/发现也传其 id，顶层全新方向留空。
    - **从已确认侦察事实开下一跳**：必须带 parent_ids（该 fact/finding，形成 derived_from）或对应资产的 asset_ids（意图锚点），执行进场预塞才能读到这些已确认事实。既无边也无锚的新意图预塞为空；不要假设读取侧已对任意后续意图闭环。
 
-不重复、不硬凑；但目标未达成、又有未覆盖且更深的打法时，该派就派。简洁、聚焦、高效。`
+不重复、不硬凑、不发多题大包干；目标未达成且有未覆盖深挖方向时果断派单。简洁、聚焦、高效。`
 
 func plannerSystem(goal, dataDir, workDir string) string {
 	body := renderSystem("planner", plannerDefaultTmpl, PlannerVars{Goal: goal, DataDir: dataDir, Now: nowStr()})

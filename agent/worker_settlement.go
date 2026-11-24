@@ -21,13 +21,16 @@ func (w *Worker) recoverSettlement(ctx context.Context, previous *agentcore.Sess
 		return
 	}
 	why := "run_budget"
+	hard := b.hardDeadline()
 	if IsCallTimeout(runErr) {
 		why = "call_timeout"
-		b.hard = minTime(b.hard, time.Now().Add(b.reserve))
+		hard = minTime(hard, time.Now().Add(b.reserve))
 	}
-	if time.Until(b.hard) < 5*time.Second {
+	if time.Until(hard) < 5*time.Second {
 		return
 	}
+	b.hard = hard
+	b.ext = nil
 	start, before := time.Now(), tsx.Writes()
 	var calls atomic.Int64
 	var recoveryErr error
@@ -68,7 +71,7 @@ func (w *Worker) recoverSettlement(ctx context.Context, previous *agentcore.Sess
 		}
 	}
 	opts.Tools, opts.Settlement = tools, nil
-	opts.MaxTurns, opts.MaxDuration = settle.MaxTurns, time.Until(b.hard)
+	opts.MaxTurns, opts.MaxDuration = settle.MaxTurns, time.Until(hard)
 	opts.Provider = &runBudgetProvider{inner: opts.Provider, calls: &calls}
 	b.recovery = true
 	ctx = context.WithValue(ctx, runBudgetKey{}, b)

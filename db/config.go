@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -740,6 +741,23 @@ func (d *DB) CurrentPrompt(agentID int64) (string, error) {
 		return "", nil
 	}
 	return tmpl.String, err
+}
+
+// IsPromptSystemManaged reports whether agentID's active prompt version was
+// authored by the system (empty or "system" updated_by) or has no active version
+// yet. Manual edits record a concrete operator name and return false so built-in
+// migrations never overwrite user-customized prompts.
+func (d *DB) IsPromptSystemManaged(agentID int64) (bool, error) {
+	var updatedBy sql.NullString
+	err := d.QueryRow(`SELECT COALESCE(p.updated_by, '') FROM agents a LEFT JOIN agent_prompts p ON p.id=a.current_prompt_id WHERE a.id=$1`, agentID).Scan(&updatedBy)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	by := strings.TrimSpace(updatedBy.String)
+	return by == "" || by == "system", nil
 }
 
 // SeedPromptIfEmpty writes the code-default template as the agent's first prompt

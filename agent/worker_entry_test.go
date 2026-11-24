@@ -287,3 +287,36 @@ func TestWorkerToolsListFactsIsCallableShape(t *testing.T) {
 		t.Fatal("tools need descriptions")
 	}
 }
+
+func TestEntrySeedFallbackMatchesPayloadHostWithBoundaries(t *testing.T) {
+	// Un-anchored continuation intent (no asset_ids, no derived_from edges)
+	// should still recover matching asset hosts from its summary while obeying
+	// host/IP token boundaries (10.0.164.13 must NOT match 10.0.164.138).
+	intent := node(795, db.KindIntent, "open", map[string]any{
+		"summary": "续解 c-06（HugeGraph 1.2.0，10.0.164.138:8080）",
+	})
+	factMatched := node(794, db.KindFact, "confirmed", map[string]any{
+		"summary":    "c-06 拿到 admin_token",
+		"confidence": "observed",
+	})
+	factPrefixTrap := node(799, db.KindFact, "confirmed", map[string]any{
+		"summary":    "无关主机 10.0.164.13 上的观察",
+		"confidence": "observed",
+	})
+	g := EntryGraph{
+		Intent: intent,
+		Facts:  []*db.Node{factMatched, factPrefixTrap},
+		Anchors: map[int64][]int64{
+			factMatched.ID:    {10},
+			factPrefixTrap.ID: {20},
+		},
+		Assets: map[int64]string{
+			10: "http://10.0.164.138:8080",
+			20: "10.0.164.13",
+		},
+	}
+	seed := BuildWorkerEntrySeed(g)
+	if len(seed.ConfirmedFacts) != 1 || seed.ConfirmedFacts[0].ID != factMatched.ID {
+		t.Fatalf("fallback host match mismatch: got %+v, want only fact #%d", seed.ConfirmedFacts, factMatched.ID)
+	}
+}

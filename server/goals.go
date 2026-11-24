@@ -197,6 +197,12 @@ func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (queued
 		// otherwise the old settling flag would make every worker skip forever.
 		s.engine.resetTimeoutRevival(t.ID)
 	}
+	if requirePaused {
+		// Explicit operator resume clears any in-memory supply hold (401/402/403
+		// on single/global profile) BEFORE waking planner/worker loops; persisted
+		// chain_exhausted state in Task.LLMFailoverState remains authoritative.
+		releaseTaskSupply(t.ID)
+	}
 	if shouldQueue {
 		if !wasQueued {
 			summary := fmt.Sprintf("已排队：达到并发上限 %d，等待空位后自动开始", limit)

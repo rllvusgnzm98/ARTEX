@@ -227,3 +227,33 @@ func TestCallTimeoutSettlementNotSupplyOrTargetFailure(t *testing.T) {
 		t.Fatal("用户取消不得误标为墙钟超时回场")
 	}
 }
+
+func TestClassifySupplyFailureIgnoresCloudflareWAF403(t *testing.T) {
+	t.Parallel()
+	wafErr := errors.New("openai: status 403: <!DOCTYPE html><html><head><title>Attention Required! | Cloudflare</title></head><body>Cloudflare Ray ID: a5f4edb64b9e1ec0</body></html>")
+	if IsGatewayWAFBlock(wafErr) != true {
+		t.Fatal("Cloudflare HTML 403 must be recognized as gateway WAF block")
+	}
+	if class, ok := ClassifySupplyFailure(wafErr); ok {
+		t.Fatalf("Cloudflare WAF 403 must not classify as supply failure, got %+v", class)
+	}
+	settle := SettleWorkerRun(harness.ReasonModelError, wafErr)
+	if settle.SupplyFailure || settle.FreezeScene {
+		t.Fatalf("Cloudflare WAF 403 must not freeze scene, got %+v", settle)
+	}
+	if settle.IntentState != "blocked" || settle.TerminalKind != TerminalTargetBlocked || !settle.AllowRedispatch || settle.TargetFailureWrites != 0 {
+		t.Fatalf("unexpected WAF 403 settlement: %+v", settle)
+	}
+
+	plain403 := errors.New("provider: status 403: forbidden")
+	if IsGatewayWAFBlock(plain403) {
+		t.Fatal("plain 403 forbidden must not be treated as WAF HTML block")
+	}
+	if class, ok := ClassifySupplyFailure(plain403); !ok || class.Signal != SupplyHTTP403 {
+		t.Fatalf("plain 403 must still classify as SupplyHTTP403, got %+v ok=%v", class, ok)
+	}
+	plainSettle := SettleWorkerRun(harness.ReasonModelError, plain403)
+	if !plainSettle.SupplyFailure || !plainSettle.FreezeScene {
+		t.Fatalf("plain 403 must still freeze scene, got %+v", plainSettle)
+	}
+}

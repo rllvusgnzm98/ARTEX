@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -24,10 +25,71 @@ func ModelRetriesStopped(ctx context.Context) bool {
 	return monitor.Fired()
 }
 
+type budgetExtension struct {
+	mu       sync.Mutex
+	bonus    time.Duration
+	maxBonus time.Duration
+}
+
 type runBudget struct {
 	work, hard time.Time
 	reserve    time.Duration
 	recovery   bool
+	ext        *budgetExtension
+}
+
+func (b runBudget) currentBonus() time.Duration {
+	if b.ext == nil {
+		return 0
+	}
+	b.ext.mu.Lock()
+	defer b.ext.mu.Unlock()
+	return b.ext.bonus
+}
+
+func (b runBudget) workDeadline() time.Time { return b.work.Add(b.currentBonus()) }
+
+func (b runBudget) hardDeadline() time.Time { return b.hard.Add(b.currentBonus()) }
+
+func (b runBudget) maxHardDeadline() time.Time {
+	if b.ext == nil {
+		return b.hard
+	}
+	return b.hard.Add(b.ext.maxBonus)
+}
+
+func (b runBudget) extend(delta time.Duration) (added, total time.Duration) {
+	if b.ext == nil || delta <= 0 {
+		return 0, 0
+	}
+	b.ext.mu.Lock()
+	defer b.ext.mu.Unlock()
+	rem := b.ext.maxBonus - b.ext.bonus
+	if rem <= 0 {
+		return 0, b.ext.bonus
+	}
+	if delta > rem {
+		delta = rem
+	}
+	b.ext.bonus += delta
+	return delta, b.ext.bonus
+}
+
+func enableRunBudgetExtension(ctx context.Context, maxBonus time.Duration) context.Context {
+	b, ok := ctx.Value(runBudgetKey{}).(runBudget)
+	if !ok || maxBonus <= 0 || b.work.IsZero() {
+		return ctx
+	}
+	b.ext = &budgetExtension{maxBonus: maxBonus}
+	return context.WithValue(ctx, runBudgetKey{}, b)
+}
+
+func extendRunBudgetFromContext(ctx context.Context, delta time.Duration) (time.Duration, time.Duration) {
+	b, ok := ctx.Value(runBudgetKey{}).(runBudget)
+	if !ok {
+		return 0, 0
+	}
+	return b.extend(delta)
 }
 
 func withRunBudget(ctx context.Context, start time.Time, total, reserve time.Duration) (context.Context, time.Duration) {
@@ -78,9 +140,9 @@ func (p *runBudgetProvider) callContext(ctx context.Context) (context.Context, c
 	if !ok {
 		return ctx, func() {}, time.Time{}
 	}
-	deadline := b.work
-	if p.loss.Fired() || b.recovery || !time.Now().Before(b.work) {
-		deadline = b.hard
+	deadline := b.workDeadline()
+	if p.loss.Fired() || b.recovery || !time.Now().Before(deadline) {
+		deadline = b.hardDeadline()
 	}
 	callCtx, cancel := context.WithDeadline(ctx, deadline)
 	return callCtx, cancel, deadline
@@ -99,6 +161,11 @@ func (p *runBudgetProvider) Complete(ctx context.Context, req llm.CompletionRequ
 	}
 	if p.postStopLossLimitReached() {
 		return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock(p.loss.Verdict().Message())}}, "end_turn", llm.Usage{}, nil
+	}
+	if b, ok := ctx.Value(runBudgetKey{}).(runBudget); ok && b.ext != nil && !b.recovery && !p.loss.Fired() {
+		if deadline := b.workDeadline(); !time.Now().Before(deadline) {
+			return llm.Message{}, "", llm.Usage{}, &RunBudgetError{Deadline: deadline}
+		}
 	}
 	callCtx, cancel, deadline := p.callContext(ctx)
 	defer cancel()
@@ -119,6 +186,12 @@ func (p *runBudgetProvider) Stream(ctx context.Context, req llm.CompletionReques
 				yield(llm.StreamEvent{Type: llm.SEMessageStop}, nil)
 			}
 			return
+		}
+		if b, ok := ctx.Value(runBudgetKey{}).(runBudget); ok && b.ext != nil && !b.recovery && !p.loss.Fired() {
+			if deadline := b.workDeadline(); !time.Now().Before(deadline) {
+				yield(llm.StreamEvent{}, &RunBudgetError{Deadline: deadline})
+				return
+			}
 		}
 		callCtx, cancel, deadline := p.callContext(ctx)
 		defer cancel()

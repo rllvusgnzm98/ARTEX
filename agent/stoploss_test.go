@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -352,10 +353,12 @@ func jsonCmd(s string) ([]byte, []byte) {
 }
 
 func TestStopLossRemindsBeforeLatch(t *testing.T) {
-	// A write-back reminder appears one probe before the no_progress latch,
-	// blocking that probe and handing a message to the model — but it is not a
-	// stop-loss (verdict stays clear) and it fires only once per idle window.
-	mon := NewStopLossMonitor(tightPolicy()) // idle limit 2 → remind at 1
+	// A write-back reminder appears one probe before the no_progress latch when
+	// explicitly enabled in policy, blocking that probe and handing a message to the
+	// model — without altering idle counter or firing stop-loss.
+	p := tightPolicy()
+	p.WriteBackReminder = true
+	mon := NewStopLossMonitor(p) // idle limit 2 → remind at 1
 	hooks := WrapStopLoss(nil, mon)
 	a, _ := jsonCmd(`{"command":"probe edge.example.test:443"}`)
 	hooks.PostToolUse(context.Background(), "Bash", a, []byte("ok"), false)
@@ -389,7 +392,9 @@ func TestStopLossReminderDoesNotFireOnFreshWindow(t *testing.T) {
 func TestStopLossReminderResetsAfterWriteBack(t *testing.T) {
 	// A real write-back resets the idle window, so the reminder can fire again
 	// in the next window — and a worker that keeps writing never latches.
-	mon := NewStopLossMonitor(tightPolicy())
+	p := tightPolicy()
+	p.WriteBackReminder = true
+	mon := NewStopLossMonitor(p)
 	hooks := WrapStopLoss(nil, mon)
 	a, _ := jsonCmd(`{"command":"probe edge.example.test:443"}`)
 	hooks.PostToolUse(context.Background(), "Bash", a, []byte("ok"), false)
@@ -414,7 +419,9 @@ func TestStopLossReminderDoesNotAlterLatch(t *testing.T) {
 	// If the worker ignores the reminder and keeps probing with nothing new,
 	// no_progress still fires at exactly the idle limit — the reminder only
 	// inserted one blocked round, it did not move the threshold.
-	mon := NewStopLossMonitor(tightPolicy()) // limit 2
+	p := tightPolicy()
+	p.WriteBackReminder = true
+	mon := NewStopLossMonitor(p) // limit 2
 	hooks := WrapStopLoss(nil, mon)
 	a, _ := jsonCmd(`{"command":"probe edge.example.test:443"}`)
 	hooks.PostToolUse(context.Background(), "Bash", a, []byte("ok"), false) // idle 1
@@ -455,7 +462,9 @@ func (h pendingSteerHooks) SteerPending() bool { return h.pending }
 func TestStopLossReminderYieldsToPendingSteer(t *testing.T) {
 	// A queued operator correction wins over the write-back reminder, and the
 	// reminder stays available for the next call in the same window.
-	mon := NewStopLossMonitor(tightPolicy())
+	p := tightPolicy()
+	p.WriteBackReminder = true
+	mon := NewStopLossMonitor(p)
 	a, _ := jsonCmd(`{"command":"probe edge.example.test:443"}`)
 	steered := WrapStopLoss(pendingSteerHooks{pending: true}, mon)
 	steered.PostToolUse(context.Background(), "Bash", a, []byte("ok"), false)
@@ -473,15 +482,19 @@ func TestStopLossReminderYieldsToPendingSteer(t *testing.T) {
 func TestStopLossDefaultPolicyAndEnvOverrides(t *testing.T) {
 	t.Setenv("ARTEX_STOPLOSS_IDLE_PROBES", "")
 	t.Setenv("ARTEX_STOPLOSS_REPEAT_LIMIT", "")
+	t.Setenv("ARTEX_STOPLOSS_NOVEL_RELIEF", "")
+	t.Setenv("ARTEX_STOPLOSS_WRITE_REMINDER", "")
 	def := DefaultStopLossPolicy()
-	if def.IdleProbeLimit != 8 || def.RepeatCommandLimit != 3 {
-		t.Fatalf("default policy = %+v, want IdleProbeLimit=8 RepeatCommandLimit=3", def)
+	if def.IdleProbeLimit != 14 || def.RepeatCommandLimit != 4 || def.MaxNovelRelief != 16 || def.WriteBackReminder {
+		t.Fatalf("default policy = %+v, want 14/4/16/WriteBackReminder=false", def)
 	}
-	t.Setenv("ARTEX_STOPLOSS_IDLE_PROBES", "12")
+	t.Setenv("ARTEX_STOPLOSS_IDLE_PROBES", "18")
 	t.Setenv("ARTEX_STOPLOSS_REPEAT_LIMIT", "5")
+	t.Setenv("ARTEX_STOPLOSS_NOVEL_RELIEF", "24")
+	t.Setenv("ARTEX_STOPLOSS_WRITE_REMINDER", "1")
 	over := DefaultStopLossPolicy()
-	if over.IdleProbeLimit != 12 || over.RepeatCommandLimit != 5 {
-		t.Fatalf("env override policy = %+v, want 12/5", over)
+	if over.IdleProbeLimit != 18 || over.RepeatCommandLimit != 5 || over.MaxNovelRelief != 24 || !over.WriteBackReminder {
+		t.Fatalf("env override policy = %+v, want 18/5/24/true", over)
 	}
 }
 
@@ -492,6 +505,7 @@ func TestStopLossMultiToolTurnReminderHoldsAllSiblings(t *testing.T) {
 	// cannot slip through and latch no_progress before the model sees the nudge.
 	p := tightPolicy()
 	p.IdleProbeLimit = 3
+	p.WriteBackReminder = true
 	mon := NewStopLossMonitor(p)
 	hooks := WrapStopLoss(nil, mon)
 
@@ -608,6 +622,166 @@ func TestStopLossPostLatchAllowsAllWriteBackTools(t *testing.T) {
 		block, msg, _ := hooks.PreToolUse(context.Background(), tool, []byte(`{}`))
 		if !block || !strings.Contains(msg, "record_fact") || !strings.Contains(msg, "report_finding") {
 			t.Fatalf("post-stop-loss %s must be blocked with write-back guidance, block=%v msg=%q", tool, block, msg)
+		}
+	}
+}
+
+func bashJSON(cmd string) []byte {
+	b, _ := json.Marshal(map[string]string{"command": cmd})
+	return b
+}
+
+func TestStopLossLocalMultilineAndReversingBashExempt(t *testing.T) {
+	p := tightPolicy()
+	p.IdleProbeLimit = 2
+	p.RepeatCommandLimit = 3
+	mon := NewStopLossMonitor(p)
+
+	exempt := []string{
+		"cd /tmp/work\ngrep -ohE 'api' *.js 2>/dev/null",
+		"cd /tmp/work && ls -la; cat out.txt | head -n 20",
+		"objdump -d validator | head -n 30",
+		"readelf -s validator 2>&1",
+		"sed -n 80,216p jdwp.py",
+		"cd /tmp/work && python3 - <<'EOF'\nimport re\nprint(re.findall(r'a', 'aba'))\nEOF",
+	}
+	for _, cmd := range exempt {
+		mon.ObserveTool("Bash", bashJSON(cmd), false)
+	}
+	if v := mon.Recompute(); v.Fired() || mon.Signals().IdleProbes != 0 {
+		t.Fatalf("local multiline/reversing/offline-python commands must not consume IdleProbes, got %+v sig=%+v", v, mon.Signals())
+	}
+
+	// Network-enabled python3 or active curl MUST still consume IdleProbes.
+	mon.ObserveTool("Bash", bashJSON(`python3 -c "import requests; print(requests.get('http://10.0.0.1'))"`), false)
+	mon.ObserveTool("Bash", bashJSON(`curl -s http://10.0.0.1/`), false)
+	if v := mon.Recompute(); !v.Fired() || v.Kind != StopLossNoProgress || v.Signals.IdleProbes != 2 {
+		t.Fatalf("network python/curl must trip no_progress at limit=2, got %+v", v)
+	}
+
+	// Repeating the identical local command 3 times still triggers repeated_command.
+	mon2 := NewStopLossMonitor(StopLossPolicy{IdleProbeLimit: 20, RepeatCommandLimit: 3})
+	sameLocal := bashJSON("objdump -d validator")
+	mon2.ObserveTool("Bash", sameLocal, false)
+	mon2.ObserveTool("Bash", sameLocal, false)
+	mon2.ObserveTool("Bash", sameLocal, false)
+	if v := mon2.Recompute(); !v.Fired() || v.Kind != StopLossRepeatedCommand {
+		t.Fatalf("repeating identical local command 3 times must still trip repeated_command, got %+v", v)
+	}
+}
+
+func TestStopLossPostLatchAllowsSingleCleanupClose(t *testing.T) {
+	p := tightPolicy()
+	p.IdleProbeLimit = 1
+	mon := NewStopLossMonitor(p)
+	hooks := WrapStopLoss(nil, mon)
+
+	mon.ObserveTool("Bash", []byte(`{"command":"curl https://t.example.test/"}`), false)
+	if !mon.Recompute().Fired() {
+		t.Fatal("expected stop-loss to latch")
+	}
+
+	closeCmd := bashJSON(`curl -s -X POST -H "BENCHMARK_TOKEN: abc" -A "$ARTEX_UA" "https://bench.example.test/openapi/v1/challenges/close?unique_code=c-03"`)
+	if block, msg, _ := hooks.PreToolUse(context.Background(), "Bash", closeCmd); block {
+		t.Fatalf("first post-latch /close call must be allowed, got blocked: %q", msg)
+	}
+	// A second cleanup call is blocked (one-shot only).
+	if block, _, _ := hooks.PreToolUse(context.Background(), "Bash", closeCmd); !block {
+		t.Fatal("second post-latch /close call must be blocked")
+	}
+	// Non-cleanup Bash commands remain blocked even before cleanup is used.
+	mon2 := NewStopLossMonitor(p)
+	hooks2 := WrapStopLoss(nil, mon2)
+	mon2.ObserveTool("Bash", []byte(`{"command":"curl https://t.example.test/"}`), false)
+	mon2.Recompute()
+	for _, bad := range []string{
+		`curl https://bench.example.test/login`,
+		`curl -X POST https://bench.example.test/login`,
+		`rm -rf /tmp/x`,
+		`curl -X POST https://bench.example.test/close && id`,
+	} {
+		if block, _, _ := hooks2.PreToolUse(context.Background(), "Bash", bashJSON(bad)); !block {
+			t.Fatalf("non-cleanup post-latch Bash %q must be blocked", bad)
+		}
+	}
+}
+
+func TestStopLossDefaultWriteReminderDisabled(t *testing.T) {
+	t.Setenv("ARTEX_STOPLOSS_WRITE_REMINDER", "")
+	p := tightPolicy()
+	mon := NewStopLossMonitor(p)
+	hooks := WrapStopLoss(nil, mon)
+	a, _ := jsonCmd(`{"command":"curl https://a.example.test/"}`)
+	hooks.PostToolUse(context.Background(), "Bash", a, []byte("ok"), false)
+	block, msg, _ := hooks.PreToolUse(context.Background(), "Bash", []byte(`{"command":"curl https://b.example.test/"}`))
+	if block || strings.Contains(msg, StopLossWriteBackReminderPrefix) {
+		t.Fatalf("default policy must not block with pre-latch write-back reminder, got block=%v msg=%q", block, msg)
+	}
+}
+
+func TestStopLossNoveltyReliefAndNoiseNormalization(t *testing.T) {
+	p := StopLossPolicy{IdleProbeLimit: 2, RepeatCommandLimit: 5, MaxNovelRelief: 4}
+	mon := NewStopLossMonitor(p)
+	hooks := WrapStopLoss(nil, mon)
+
+	// 1st probe sets baseline (idle=1), followed by 3 genuinely distinct outputs (status/stack changes):
+	// idle must stay at 1 because novel outputs consume novelty relief rather than idle budget.
+	hooks.PostToolUse(context.Background(), "Bash", bashJSON("curl http://10.0.0.1/1"), []byte("HTTP/1.1 200 OK login form"), false)
+	hooks.PostToolUse(context.Background(), "Bash", bashJSON("curl http://10.0.0.1/2"), []byte("HTTP/1.1 500 Internal Server Error sqlite syntax"), false)
+	hooks.PostToolUse(context.Background(), "Bash", bashJSON("curl http://10.0.0.1/3"), []byte("HTTP/1.1 302 Found Location: /admin"), false)
+	hooks.PostToolUse(context.Background(), "Bash", bashJSON("curl http://10.0.0.1/4"), []byte("root:x:0:0:root:/root:/bin/bash"), false)
+	if mon.Fired() || mon.Signals().IdleProbes != 1 {
+		t.Fatalf("distinct outputs must stay unlatched with idle=1, got verdict=%+v sig=%+v", mon.Verdict(), mon.Signals())
+	}
+
+	// Homogeneous 404 responses differing only in UUID/timestamp/nonce must normalize to the same
+	// signature, advance idle on repetition, and latch no_progress cleanly.
+	hooks.PostToolUse(context.Background(), "Bash", bashJSON("curl http://10.0.0.1/a"), []byte("HTTP/1.1 404 Not Found req=123e4567-e89b-12d3-a456-426614174000 ts=2026-11-24T12:00:01Z"), false)
+	if mon.Fired() {
+		t.Fatalf("first 404 response is a novel class and should not latch yet, got %+v", mon.Verdict())
+	}
+	hooks.PostToolUse(context.Background(), "Bash", bashJSON("curl http://10.0.0.1/b"), []byte("HTTP/1.1 404 Not Found req=987e6543-e89b-12d3-a456-426614179999 ts=2026-11-24T12:00:05Z"), false)
+	if !mon.Fired() || mon.Verdict().Kind != StopLossNoProgress {
+		t.Fatalf("normalized homogeneous 404 probes must fire no_progress, got %+v", mon.Verdict())
+	}
+}
+
+func TestStopLossLocalHeredocWriteBashExemptAndClearsRepeats(t *testing.T) {
+	p := StopLossPolicy{IdleProbeLimit: 4, RepeatCommandLimit: 3, MaxNovelRelief: 0}
+	mon := NewStopLossMonitor(p)
+	hooks := WrapStopLoss(nil, mon)
+
+	// Two repeated runs of python3 exp.py...
+	runExp := bashJSON("cd /tmp/w && python3 exp.py")
+	hooks.PostToolUse(context.Background(), "Bash", runExp, []byte("try1"), false)
+	hooks.PostToolUse(context.Background(), "Bash", runExp, []byte("try1"), false)
+
+	// Writing a modified script via local heredoc cat does NOT count toward IdleProbes
+	// and resets prior Bash repeats.
+	writeScript := bashJSON("cd /tmp/w && cat > spray.php <<'EOF'\n<?php system($_GET['c']); curl_init(); ?>\nEOF")
+	hooks.PostToolUse(context.Background(), "Bash", writeScript, []byte(""), false)
+	if sig := mon.Signals(); sig.IdleProbes != 2 || sig.RepeatCount != 1 {
+		t.Fatalf("heredoc write must exempt idle and clear prior bash repeats, got %+v", sig)
+	}
+
+	// Appending an external command after closing delimiter MUST NOT be treated as pure local write.
+	unsafeHeredoc := "cat > spray.php <<'EOF'\nhello\nEOF\ncurl http://10.0.0.1/"
+	if isLocalWorkspaceWriteBash(unsafeHeredoc) {
+		t.Fatal("heredoc with trailing command must not be exempted")
+	}
+}
+
+func TestStopLossReportFindingGrantsMilestoneBonus(t *testing.T) {
+	p := StopLossPolicy{IdleProbeLimit: 2, RepeatCommandLimit: 10, MaxNovelRelief: -1}
+	mon := NewStopLossMonitor(p)
+	hooks := WrapStopLoss(nil, mon)
+
+	// report_finding grants +6 idle bonus (effective limit becomes 2+6=8).
+	hooks.PostToolUse(context.Background(), "report_finding", []byte(`{"name":"SQLi","summary":"found"}`), []byte(`{"finding_id":1}`), false)
+	for i := 0; i < 6; i++ {
+		hooks.PostToolUse(context.Background(), "Bash", bashJSON("curl http://10.0.0.1/p"), []byte("same"), false)
+		if mon.Fired() {
+			t.Fatalf("milestone bonus should keep run alive at probe %d, verdict=%+v", i+1, mon.Verdict())
 		}
 	}
 }

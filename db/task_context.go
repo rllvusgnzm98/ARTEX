@@ -9,7 +9,10 @@ import (
 	"unicode/utf8"
 )
 
-const IntentBlockedLLMQuota = "llm_quota_exhausted"
+const (
+	IntentBlockedLLMQuota   = "llm_quota_exhausted"
+	IntentBlockedGatewayWAF = "gateway_waf_blocked"
+)
 
 // TaskLLMProfile is one ordered entry in a task's explicit failover chain.
 type TaskLLMProfile struct {

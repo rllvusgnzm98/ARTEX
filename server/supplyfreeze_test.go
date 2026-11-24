@@ -187,3 +187,58 @@ func TestReleaseAllTaskSupplyConcurrentWithHold(t *testing.T) {
 	}
 }
 
+func TestAdmitPausedTaskReleasesMemorySupplyHoldButRespectsChainExhausted(t *testing.T) {
+	t.Cleanup(releaseAllTaskSupply)
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping", err)
+	}
+	defer m.Close()
+	defer restoreConcurrencySetting(t, m)()
+	if err := m.SetConcurrency(false, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	task, err := m.CreateTask("resume-unfreeze", "verify resume clears memory hold", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = m.DeleteTask(task.ID, DeleteTaskOptions{}) }()
+
+	s := newAdmissionTestServer(m, nil)
+	if err := m.ApplyTaskPause(task.ID); err != nil {
+		t.Fatal(err)
+	}
+	holdTaskSupply(task.ID)
+	if !taskSupplyFrozen(task) {
+		t.Fatal("expected memory supply hold before resume")
+	}
+	if _, err := s.admitPausedTask(task); err != nil {
+		t.Fatalf("admitPausedTask failed: %v", err)
+	}
+	if taskSupplyFrozen(task) {
+		t.Fatal("admitPausedTask must clear in-memory supplyHolds for single/global profile")
+	}
+
+	// Persisted chain_exhausted remains frozen until the chain itself is replaced.
+	task2, err := m.CreateTask("resume-chain-exhausted", "verify chain_exhausted stays frozen", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = m.DeleteTask(task2.ID, DeleteTaskOptions{}) }()
+	if err := m.ApplyTaskPause(task2.ID); err != nil {
+		t.Fatal(err)
+	}
+	holdTaskSupply(task2.ID)
+	task2.setLLMState(nil, nil, []int64{7}, 1, "chain_exhausted", "status 402")
+	if _, err := s.admitPausedTask(task2); err != nil {
+		t.Fatalf("admitPausedTask(chain_exhausted) failed: %v", err)
+	}
+	if memorySupplyHeld(task2.ID) {
+		t.Fatal("memory hold should still be cleared on resume")
+	}
+	if !taskSupplyFrozen(task2) {
+		t.Fatal("persisted chain_exhausted must keep task frozen across resume")
+	}
+}
+

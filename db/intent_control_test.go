@@ -283,3 +283,53 @@ func TestCancelIntentPreservesOutputsYieldedByAnotherIntent(t *testing.T) {
 		}
 	}
 }
+
+func TestCompareAndSetIntentStateClearsOwnerOnlyOnOpen(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping", err)
+	}
+	defer d.Close()
+	expID, err := d.CreateExploration("intent owner reset", "clear owner on park to open")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+	store := d.Exploration(expID)
+
+	parkedID, err := store.AddIntent(map[string]any{"summary": "parked"}, 1, nil, "planner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := store.ClaimIntent(parkedID, "work#3"); err != nil || !claimed {
+		t.Fatalf("claim parked: claimed=%v err=%v", claimed, err)
+	}
+	if changed, err := store.CompareAndSetIntentState(parkedID, "running", "open"); err != nil || !changed {
+		t.Fatalf("park to open: changed=%v err=%v", changed, err)
+	}
+	parkedNode, err := store.GetNode(parkedID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parkedNode.State != "open" || parkedNode.Owner != "" {
+		t.Fatalf("parked intent state=%q owner=%q, want open and empty owner", parkedNode.State, parkedNode.Owner)
+	}
+
+	doneID, err := store.AddIntent(map[string]any{"summary": "done"}, 1, nil, "planner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := store.ClaimIntent(doneID, "work#2"); err != nil || !claimed {
+		t.Fatalf("claim done: claimed=%v err=%v", claimed, err)
+	}
+	if changed, err := store.CompareAndSetIntentState(doneID, "running", "done"); err != nil || !changed {
+		t.Fatalf("finish to done: changed=%v err=%v", changed, err)
+	}
+	doneNode, err := store.GetNode(doneID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doneNode.State != "done" || doneNode.Owner != "work#2" {
+		t.Fatalf("done intent state=%q owner=%q, want done and work#2", doneNode.State, doneNode.Owner)
+	}
+}

@@ -142,3 +142,33 @@ func TestRunBudgetProvider(t *testing.T) {
 		}
 	}
 }
+
+func TestRunBudgetDynamicExtensionPreservesReserveAndExtendsDeadlines(t *testing.T) {
+	start := time.Now()
+	total, reserve := 20*time.Minute, 2*time.Minute
+	ctx, work := withRunBudget(t.Context(), start, total, reserve)
+	if work != 18*time.Minute {
+		t.Fatalf("initial work=%s, want 18m", work)
+	}
+	ctx = enableRunBudgetExtension(ctx, total)
+	b, ok := ctx.Value(runBudgetKey{}).(runBudget)
+	if !ok {
+		t.Fatal("missing runBudget in context")
+	}
+	// Crucial compatibility invariant: b.hard - b.work stays == reserve.
+	if b.hard.Sub(b.work) != reserve {
+		t.Fatalf("b.hard - b.work = %s, want %s", b.hard.Sub(b.work), reserve)
+	}
+	added, totalBonus := extendRunBudgetFromContext(ctx, 10*time.Minute)
+	if added != 10*time.Minute || totalBonus != 10*time.Minute {
+		t.Fatalf("first extend = (%s, %s), want (10m, 10m)", added, totalBonus)
+	}
+	if !b.workDeadline().Equal(start.Add(28*time.Minute)) || !b.hardDeadline().Equal(start.Add(30*time.Minute)) {
+		t.Fatalf("extended deadlines wrong: work=%s hard=%s", b.workDeadline(), b.hardDeadline())
+	}
+	// Cap at maxBonus (20m total extension).
+	added2, totalBonus2 := extendRunBudgetFromContext(ctx, 15*time.Minute)
+	if added2 != 10*time.Minute || totalBonus2 != 20*time.Minute {
+		t.Fatalf("capped extend = (%s, %s), want (10m, 20m)", added2, totalBonus2)
+	}
+}

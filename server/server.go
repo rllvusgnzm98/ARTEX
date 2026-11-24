@@ -81,12 +81,10 @@ type Server struct {
 	// immediately, so a page reload / proxy timeout can't abort a live run. This
 	// map serializes turns per task — one main-agent run at a time per task, so
 	// concurrent messages don't corrupt the shared exp<id>-main transcript.
-	chatMu   sync.Mutex
-	chatBusy map[string]bool
-	// chatCancel holds the cancel func for each in-flight conversation run (keyed by
-	// convBusyKey), so a manual stop can abort JUST that session's agent run. Set/
-	// cleared alongside chatBusy under chatMu. Aborting a run does NOT touch the P3
-	// trigger queue — the drain goroutine simply proceeds to the next queued fire.
+	chatMu     sync.Mutex
+	chatBusy   map[string]bool
+	chatAuto   map[string]bool
+	chatDone   map[string]chan struct{}
 	chatCancel map[string]context.CancelCauseFunc
 
 	// triggerQ buffers P3 trigger fires PER AGENT. A per-agent "pump" launches runs up
@@ -161,6 +159,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		log.Fatalf("[auth] JWT key: %v", err)
 	}
 	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, chatBusy: map[string]bool{},
+		chatAuto: map[string]bool{}, chatDone: map[string]chan struct{}{},
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
@@ -183,6 +182,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		b := s.agentsForTask(t)
 		return b.pl, b.wk
 	})
+	s.engine.SetCampaignOrchestrator(s.shouldKickoffCampaign, s.runCampaignPatrol)
 	// Global readiness (Ready()/llm_configured): a global active LLM provider is
 	// installed. Task-level runnability is separate (ReadyFor → the resolver above).
 	s.engine.SetReadiness(func() bool {
@@ -3821,25 +3821,68 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Admission is serialized with deletion's chat cancellation. Mark every chat
-	// turn busy before its first activity/file write, including rule-mode turns.
-	// If deletion wins the race, the second barrier check rejects this request.
-	s.chatMu.Lock()
-	if s.engine.IsDeleting(t.ID) {
+	// Admission is serialized with deletion's chat cancellation and autonomous
+	// campaign patrols. If a background MainAgent patrol holds the slot, preempt it
+	// immediately and wait for it to flush the shared transcript before running the
+	// human turn — never reject an interactive human message with HTTP 409 for an
+	// autonomous patrol.
+	var ctx context.Context
+	var cancel context.CancelCauseFunc
+	for {
+		s.chatMu.Lock()
+		if s.engine.IsDeleting(t.ID) {
+			s.chatMu.Unlock()
+			writeErr(w, 409, "任务正在删除，无法发送新消息")
+			return
+		}
+		if s.chatBusy[t.ID] {
+			if s.chatAuto != nil && s.chatAuto[t.ID] {
+				preemptCancel := s.chatCancel[t.ID]
+				var waitDone chan struct{}
+				if s.chatDone != nil {
+					waitDone = s.chatDone[t.ID]
+				}
+				s.chatMu.Unlock()
+				if preemptCancel != nil {
+					preemptCancel(agent.AbortChatStoppedByUser)
+				}
+				if waitDone != nil {
+					select {
+					case <-waitDone:
+					case <-r.Context().Done():
+						writeErr(w, 499, "request canceled")
+						return
+					case <-time.After(10 * time.Second):
+						writeErr(w, 409, "主 Agent 自动巡检正在收尾，请稍候重试")
+						return
+					}
+				}
+				continue
+			}
+			s.chatMu.Unlock()
+			writeErr(w, 409, "主 Agent 正在处理上一条消息，请稍候")
+			return
+		}
+		ctx, cancel = context.WithCancelCause(s.ctx)
+		ctx = intercept.WithReviewContext(ctx, "", intercept.ReviewBackground{Source: intercept.BackgroundUserMessage, Text: req.Message})
+		if s.chatBusy == nil {
+			s.chatBusy = map[string]bool{}
+		}
+		if s.chatCancel == nil {
+			s.chatCancel = map[string]context.CancelCauseFunc{}
+		}
+		if s.chatDone == nil {
+			s.chatDone = map[string]chan struct{}{}
+		}
+		s.chatBusy[t.ID] = true
+		if s.chatAuto != nil {
+			delete(s.chatAuto, t.ID)
+		}
+		s.chatCancel[t.ID] = cancel
+		s.chatDone[t.ID] = make(chan struct{})
 		s.chatMu.Unlock()
-		writeErr(w, 409, "任务正在删除，无法发送新消息")
-		return
+		break
 	}
-	if s.chatBusy[t.ID] {
-		s.chatMu.Unlock()
-		writeErr(w, 409, "主 Agent 正在处理上一条消息，请稍候")
-		return
-	}
-	ctx, cancel := context.WithCancelCause(s.ctx)
-	ctx = intercept.WithReviewContext(ctx, "", intercept.ReviewBackground{Source: intercept.BackgroundUserMessage, Text: req.Message})
-	s.chatBusy[t.ID] = true
-	s.chatCancel[t.ID] = cancel
-	s.chatMu.Unlock()
 
 	// The turn belongs to whichever main-agent segment the user is chatting in (any
 	// segment is interactive, like the top-level chat conversations). Stamp every
@@ -3918,13 +3961,187 @@ func (s *Server) finishTaskChat(taskID string, cancel context.CancelCauseFunc) {
 	cancel(agent.AbortChatTurnFinished)
 	s.chatMu.Lock()
 	delete(s.chatBusy, taskID)
+	delete(s.chatAuto, taskID)
 	delete(s.chatCancel, taskID)
+	var done chan struct{}
+	if s.chatDone != nil {
+		done = s.chatDone[taskID]
+		delete(s.chatDone, taskID)
+	}
 	s.chatMu.Unlock()
+	if done != nil {
+		close(done)
+	}
+}
+
+var (
+	campaignURLRe = regexp.MustCompile(`https?://[^\s"'<>()]+`)
+	campaignIPRe  = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}\b`)
+)
+
+// NeedsCampaignOrchestration reports whether a task goal describes a multi-target,
+// benchmark, or platform-controlled campaign requiring MainAgent control-plane
+// orchestration (pre-flight checks, challenge/container slots, strategic hints).
+func NeedsCampaignOrchestration(goal string) bool {
+	if strings.TrimSpace(goal) == "" {
+		return false
+	}
+	lower := strings.ToLower(goal)
+	for _, kw := range []string{"/openapi/", "benchmark", "challenges", "vpn", "预检", "容器", "靶场"} {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	hosts := map[string]bool{}
+	for _, u := range campaignURLRe.FindAllString(goal, 16) {
+		hosts[strings.ToLower(u)] = true
+		if len(hosts) >= 3 {
+			return true
+		}
+	}
+	for _, ip := range campaignIPRe.FindAllString(goal, 16) {
+		hosts[ip] = true
+		if len(hosts) >= 3 {
+			return true
+		}
+	}
+	return false
+}
+
+func campaignPatrolPrompt(trigger string) string {
+	switch trigger {
+	case "kickoff":
+		return "【系统主控巡检 · 开局统筹 kickoff】：任务刚刚启动，规划者与 worker 正在等待你接管平台控制面。请先检查 graph_overview；若任务目标含前置联通预检（如 VPN）或外部平台/靶场题目与容器槽位 API，立即完成一次前置预检并拉取题目/容器列表，回收残留无效容器（若有），按槽位上限开启首批高价值目标容器并 insert_assets 登记具体 IP:Port，用 add_hint 为规划者确立「1 意图 = 1 具体靶标」分工纪律，并用 add_intent 下发首批容器已就绪的单目标原子意图。绝不亲自向靶机发利用 payload，也不要用 sleep 挂起等待。"
+	case "blocked_check":
+		return "【系统主控巡检 · 阻断异常核查 blocked_check】：有 worker 意图以 blocked 结束（可能涉及上游网关 WAF 403 拦截或目标异常）。请先查 graph_overview（关注 recent_done_intents 中的 blocked_reason）和失败意图的 get_worker_trace / get_worker_output；若某一靶场题已连续多次 blocked 或停滞且仍占着容器槽位，关闭该低效容器释放名额并开高价值新题，同时 add_hint 指导规划者降权绕行。"
+	case "wave_settled":
+		return "【系统主控巡检 · 波次收官对账 wave_settled】：刚刚又有一批 worker 意图执行结束。请核对 graph_overview 与平台最新题目/容器账本（如有）：及时关闭已通关（is_completed=true）或卡死占位的容器槽位，补开高价值新题并 insert_assets 登记；若所有指标已达成且无剩余可推进方向，提醒规划者尽快 prove_goal 收官。推进健康时简短确认即可，绝不发多题大包干意图。"
+	default:
+		return "【系统主控巡检 · 周期全局复查 periodic】：定期检查当前任务的全局节奏。查 graph_overview 与平台控制面状态（如有），清理孤儿容器槽位并确保高价值待解目标已分配、低效死路已及时让位；若前沿队列正在健康推进，简短确认并立即结束本轮巡检。"
+	}
+}
+
+func (s *Server) shouldKickoffCampaign(t *Task) bool {
+	if s == nil || s.m == nil || t == nil {
+		return false
+	}
+	if !NeedsCampaignOrchestration(t.Goal) {
+		return false
+	}
+	expID := t.ExpID
+	if expID == 0 && t.Store != nil {
+		expID = t.Store.ID()
+	}
+	if expID > 0 && s.m.dir != "" {
+		txPath := filepath.Join(s.m.dir, "transcripts", fmt.Sprintf("exp%d-main.jsonl", expID))
+		if info, err := os.Stat(txPath); err == nil && info.Size() > 0 {
+			return false
+		}
+	}
+	if s.m.pg != nil && expID > 0 {
+		var exists bool
+		if err := s.m.pg.QueryRow(`SELECT EXISTS (SELECT 1 FROM activity WHERE exploration_id=$1 AND worker='mainagent')`, expID).Scan(&exists); err == nil && exists {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) runCampaignPatrol(ctx context.Context, t *Task, trigger string) bool {
+	if s == nil || s.m == nil || t == nil || t.Store == nil {
+		return false
+	}
+	if !s.taskRuntimeAvailable(t, "mainagent") {
+		return false
+	}
+	if trigger != "kickoff" && trigger != "periodic" && trigger != "blocked_check" && trigger != "wave_settled" {
+		trigger = "periodic"
+	}
+	if !NeedsCampaignOrchestration(t.Goal) && trigger != "blocked_check" && trigger != "periodic" {
+		return false
+	}
+	ma := s.agentsForTask(t).main
+	if ma == nil {
+		return false
+	}
+	if s.engine.IsDeleting(t.ID) || s.engine.IsPaused(t.ID) || isTerminalStatus(t.lifecycleSnapshot().Status) {
+		return false
+	}
+
+	var mainSeg int
+	if s.m.pg != nil {
+		mainSeg, _ = t.Store.CurrentMainSeg()
+	}
+	segPtr := &mainSeg
+
+	s.chatMu.Lock()
+	if s.engine.IsDeleting(t.ID) {
+		s.chatMu.Unlock()
+		return false
+	}
+	if s.chatBusy[t.ID] {
+		s.chatMu.Unlock()
+		return false
+	}
+	patrolCtx, cancel := context.WithCancelCause(ctx)
+	if s.chatBusy == nil {
+		s.chatBusy = map[string]bool{}
+	}
+	if s.chatAuto == nil {
+		s.chatAuto = map[string]bool{}
+	}
+	if s.chatCancel == nil {
+		s.chatCancel = map[string]context.CancelCauseFunc{}
+	}
+	if s.chatDone == nil {
+		s.chatDone = map[string]chan struct{}{}
+	}
+	s.chatBusy[t.ID] = true
+	s.chatAuto[t.ID] = true
+	s.chatCancel[t.ID] = cancel
+	s.chatDone[t.ID] = make(chan struct{})
+	s.chatMu.Unlock()
+
+	defer func() {
+		s.finishTaskChat(t.ID, cancel)
+	}()
+
+	s.engine.emitActivity(t, db.Activity{
+		Worker:  "mainagent",
+		Kind:    "round",
+		Summary: fmt.Sprintf("主 Agent 巡检（%s）", trigger),
+		MainSeg: segPtr,
+	})
+	emit := func(rec db.Activity) {
+		rec.MainSeg = segPtr
+		s.engine.emitActivity(t, rec)
+	}
+	maTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
+	resume := func() { s.reviveTask(t) }
+	prompt := campaignPatrolPrompt(trigger)
+	s.engine.BeginLLMCall(t.ID)
+	reply, err := ma.Patrol(patrolCtx, maTaskID, mainSeg, s.m.Assets(), t.Store, t.Goal, prompt, 12, 4*time.Minute, emit, t.Notify, resume, t.NotifyGoal, t.NotifyHint)
+	s.engine.EndLLMCall(t.ID)
+	if err != nil && patrolCtx.Err() == nil && ctx.Err() == nil {
+		s.engine.emitActivity(t, db.Activity{
+			Worker:  "mainagent",
+			Kind:    "text",
+			IsError: true,
+			Summary: "（主 Agent 巡检出错：" + err.Error() + "）",
+			MainSeg: segPtr,
+		})
+		return false
+	}
+	if strings.TrimSpace(reply) != "" {
+		log.Printf("[mainagent patrol] task %s (%s): %s", t.ID, trigger, strings.TrimSpace(reply))
+	}
+	return err == nil
 }
 
 // taskChatStatus reports the authoritative state of the task's main-agent turn.
 // Activity timestamps are not a reliable proxy because a tool or LLM call may run
-// for minutes without emitting an intermediate frame.
+// for minutes without emitting an intermediate frame. Background auto-patrols are
+// preemptible by human messages, so they keep interactive chat unblocked.
 func (s *Server) taskChatStatus(w http.ResponseWriter, r *http.Request) {
 	t := s.m.ResolveTask(r.PathValue("id"))
 	if t == nil {
@@ -3932,7 +4149,7 @@ func (s *Server) taskChatStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.chatMu.Lock()
-	running := s.chatBusy[t.ID]
+	running := s.chatBusy[t.ID] && (s.chatAuto == nil || !s.chatAuto[t.ID])
 	s.chatMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]bool{"running": running})
 }

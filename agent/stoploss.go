@@ -3,7 +3,13 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"math/bits"
+	"net/url"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,8 +26,10 @@ import (
 const DefaultSafetyCeiling = 20 * time.Minute
 
 const (
-	defaultIdleProbeLimit     = 8
-	defaultRepeatCommandLimit = 3
+	defaultIdleProbeLimit     = 14
+	defaultRepeatCommandLimit = 4
+	defaultMaxNovelRelief     = 16
+	maxMilestoneIdleBonus     = 18
 )
 
 // StopLossMessagePrefix marks a harness-enforced stop-loss in the Stop hook
@@ -46,14 +54,23 @@ type StopLossPolicy struct {
 	// DefaultSafetyCeiling. A negative value disables the cap in Evaluate
 	// (the live run still has MaxDuration from run_seconds).
 	SafetyCeiling time.Duration
-	// IdleProbeLimit is how many target-facing probe tool calls may run after
-	// the last graph write before a no-new-facts/no-new-assets stop fires.
-	// Zero uses the default (8, overridable via ARTEX_STOPLOSS_IDLE_PROBES).
+	// IdleProbeLimit is how many non-novel target-facing probe tool calls may
+	// run after the last graph write before a no_progress stop fires.
+	// Zero uses the default (14, overridable via ARTEX_STOPLOSS_IDLE_PROBES).
 	IdleProbeLimit int
 	// RepeatCommandLimit is how many times the same command fingerprint may
 	// appear within the current idle window before a repeated-command stop fires.
-	// Zero uses the default (3, overridable via ARTEX_STOPLOSS_REPEAT_LIMIT).
+	// Zero uses the default (4, overridable via ARTEX_STOPLOSS_REPEAT_LIMIT).
 	RepeatCommandLimit int
+	// MaxNovelRelief bounds how many probes with genuinely distinct output
+	// signatures in the current idle window are exempted from advancing IdleProbes.
+	// Zero uses the default (16, overridable via ARTEX_STOPLOSS_NOVEL_RELIEF);
+	// negative disables output-novelty relief.
+	MaxNovelRelief int
+	// WriteBackReminder enables the optional PreToolUse blocking reminder one
+	// probe before IdleProbeLimit. Disabled by default so workers do not spam
+	// fragmented intermediate facts; overridable via ARTEX_STOPLOSS_WRITE_REMINDER.
+	WriteBackReminder bool
 }
 
 func envPositiveInt(key string, fallback int) int {
@@ -67,14 +84,29 @@ func envPositiveInt(key string, fallback int) int {
 	return fallback
 }
 
+func envBoolFlag(key string, fallback bool) bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
 // DefaultStopLossPolicy returns the product defaults, honoring optional
-// ARTEX_STOPLOSS_IDLE_PROBES and ARTEX_STOPLOSS_REPEAT_LIMIT env overrides so
-// operators can calibrate thresholds and capture effective values in provenance.
+// ARTEX_STOPLOSS_IDLE_PROBES, ARTEX_STOPLOSS_REPEAT_LIMIT,
+// ARTEX_STOPLOSS_NOVEL_RELIEF, and ARTEX_STOPLOSS_WRITE_REMINDER env overrides
+// so operators can calibrate thresholds and capture effective values in provenance.
 func DefaultStopLossPolicy() StopLossPolicy {
 	return StopLossPolicy{
 		SafetyCeiling:      DefaultSafetyCeiling,
 		IdleProbeLimit:     envPositiveInt("ARTEX_STOPLOSS_IDLE_PROBES", defaultIdleProbeLimit),
 		RepeatCommandLimit: envPositiveInt("ARTEX_STOPLOSS_REPEAT_LIMIT", defaultRepeatCommandLimit),
+		MaxNovelRelief:     envPositiveInt("ARTEX_STOPLOSS_NOVEL_RELIEF", defaultMaxNovelRelief),
+		WriteBackReminder:  envBoolFlag("ARTEX_STOPLOSS_WRITE_REMINDER", false),
 	}
 }
 
@@ -100,6 +132,16 @@ func (p StopLossPolicy) repeatLimit() int {
 		return p.RepeatCommandLimit
 	}
 	return defaultRepeatCommandLimit
+}
+
+func (p StopLossPolicy) novelLimit() int {
+	if p.MaxNovelRelief < 0 {
+		return 0
+	}
+	if p.MaxNovelRelief == 0 {
+		return defaultMaxNovelRelief
+	}
+	return p.MaxNovelRelief
 }
 
 // ProgressSignals is the observed run progress used by Evaluate.
@@ -220,7 +262,11 @@ type StopLossMonitor struct {
 	inFlightProbes int
 	repeats        map[string]int
 	maxRepeat      int
+	seenObs        map[string]int
+	novelCount     int
+	milestoneBonus int
 	preWriteNudged bool
+	cleanupUsed    bool
 	turnSeq        int64
 	nudgedTurn     int64
 }
@@ -234,6 +280,7 @@ func NewStopLossMonitor(p StopLossPolicy) *StopLossMonitor {
 		assetsOK: true,
 		cmdsOK:   true,
 		repeats:  map[string]int{},
+		seenObs:  map[string]int{},
 	}
 }
 
@@ -281,9 +328,16 @@ func (m *StopLossMonitor) SetWriteSnapshot(fn func() (WriteCounts, bool)) {
 	}
 }
 
-// ObserveTool records one completed tool call. Empty tool names and
-// un-fingerprintable probe inputs fail-soft for that event.
+// ObserveTool records one completed tool call without its output payload.
+// Callers with tool output available should call ObserveToolResult so genuine
+// response differentials do not prematurely count as stagnation.
 func (m *StopLossMonitor) ObserveTool(name string, input []byte, isErr bool) {
+	m.ObserveToolResult(name, input, nil, isErr)
+}
+
+// ObserveToolResult records one completed tool call alongside its result output.
+// Empty tool names and un-fingerprintable probe inputs fail-soft for that event.
+func (m *StopLossMonitor) ObserveToolResult(name string, input, result []byte, isErr bool) {
 	if m == nil {
 		return
 	}
@@ -301,9 +355,15 @@ func (m *StopLossMonitor) ObserveTool(name string, input []byte, isErr bool) {
 	// event so the new idle window starts cleanly.
 	m.noteSnapshotWritesLocked()
 	if isWriteBackTool(name) && !isErr {
+		if name == "report_finding" {
+			m.milestoneBonus += 6
+			if m.milestoneBonus > maxMilestoneIdleBonus {
+				m.milestoneBonus = maxMilestoneIdleBonus
+			}
+		}
 		// Start a new idle window. Do not carry whole-run New* into it:
-		// no-progress is "idleProbeLimit consecutive probes with no new
-		// write since the last successful one", not "the run never wrote".
+		// no-progress is "idleProbeLimit consecutive non-novel probes with no
+		// new write since the last successful one", not "the run never wrote".
 		m.resetIdleWindowLocked()
 	}
 	if isProbeTool(name) {
@@ -313,26 +373,39 @@ func (m *StopLossMonitor) ObserveTool(name string, input []byte, isErr bool) {
 			return
 		}
 		if isCountableIdleProbe(name, input) {
-			m.idle++
+			sig := observationSignature(result, isErr)
+			novelCap := m.policy.novelLimit()
+			switch {
+			case sig == "" || novelCap <= 0 || len(m.seenObs) == 0:
+				if sig != "" {
+					m.seenObs[sig]++
+				}
+				m.idle++
+			case m.seenObs[sig] == 0 && m.novelCount < novelCap:
+				m.seenObs[sig] = 1
+				m.novelCount++
+			default:
+				m.seenObs[sig]++
+				m.idle++
+			}
 		}
 		m.repeats[fp]++
 		if m.repeats[fp] > m.maxRepeat {
 			m.maxRepeat = m.repeats[fp]
 		}
-		// A genuinely new local file edit (Write/Edit/MultiEdit) mutates scripts or
-		// payloads in the workspace, so re-running e.g. `python3 exploit.py` via Bash
-		// is not repeating an unchanged probe. Clear prior Bash repeat counts while
-		// preserving identical Write/Edit loop detection.
-		if isLocalEditTool(name) && !isErr && m.repeats[fp] == 1 {
-			m.clearBashRepeatsLocked()
+		// A genuinely new local file edit (Write/Edit/MultiEdit or local heredoc
+		// script creation) mutates scripts/payloads in the workspace, so re-running
+		// e.g. `python3 exploit.py` via Bash is not repeating an unchanged probe.
+		if (isLocalEditTool(name) || isLocalWorkspaceWriteBashTool(name, input)) && !isErr && m.repeats[fp] == 1 {
+			m.clearBashRepeatsLocked(fp)
 		}
 	}
 }
 
-func (m *StopLossMonitor) clearBashRepeatsLocked() {
+func (m *StopLossMonitor) clearBashRepeatsLocked(exceptFP string) {
 	m.maxRepeat = 0
 	for k, c := range m.repeats {
-		if strings.HasPrefix(k, "Bash\x00") {
+		if strings.HasPrefix(k, "Bash\x00") && k != exceptFP {
 			delete(m.repeats, k)
 			continue
 		}
@@ -349,9 +422,12 @@ func (m *StopLossMonitor) resetIdleWindowLocked() {
 	m.newAssets = 0
 	m.newFinds = 0
 	m.preWriteNudged = false
+	m.cleanupUsed = false
 	m.nudgedTurn = 0
 	m.repeats = map[string]int{}
 	m.maxRepeat = 0
+	m.seenObs = map[string]int{}
+	m.novelCount = 0
 	if m.writes == nil {
 		return
 	}
@@ -425,6 +501,16 @@ func (m *StopLossMonitor) signalsLocked() ProgressSignals {
 	return sig
 }
 
+// Signals returns the current live progress counters.
+func (m *StopLossMonitor) Signals() ProgressSignals {
+	if m == nil {
+		return ProgressSignals{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.signalsLocked()
+}
+
 // Recompute evaluates current signals and stores the verdict if stop-loss fires.
 func (m *StopLossMonitor) Recompute() StopLossVerdict {
 	if m == nil {
@@ -440,7 +526,11 @@ func (m *StopLossMonitor) recomputeLocked() StopLossVerdict {
 		return m.verdict
 	}
 	signals := m.signalsLocked()
-	v := EvaluateStopLoss(m.policy, signals)
+	eff := m.policy
+	if m.milestoneBonus > 0 {
+		eff.IdleProbeLimit = eff.idleLimit() + m.milestoneBonus
+	}
+	v := EvaluateStopLoss(eff, signals)
 	// The live hook does not enforce the wall-clock cap (MaxDuration does,
 	// and still runs settlement). Only early stop-loss is stored here.
 	if v.Fired() {
@@ -499,7 +589,7 @@ const writeBackReminderBody = "你已连续多次探测但还没有把结果写�
 
 const sameTurnWriteBackHoldBody = "本回合已发出写回提醒，同回合剩余探测已暂停执行，避免在你看到提醒前直接触发止损。请先处理上面的写回提醒（如有已观察到的新资产/事实/漏洞请先写回），再继续下一步探测。"
 
-const stopLossPostBlockWriteHint = "（仍可在本轮收尾内调用 record_fact / insert_assets / report_finding 把已真实观察到的事实、资产或漏洞写回图谱，之后结束返回。）"
+const stopLossPostBlockWriteHint = "（仍可在本轮收尾内调用 record_fact / insert_assets / report_finding 把已真实观察到的事实、资产或漏洞写回图谱，若已启动靶机容器也可发一次 /close 请求释放槽位，之后结束返回。）"
 
 // RemindWriteBack decides whether to interrupt a probe once, before the
 // no_progress latch, so the worker can persist observations it has already
@@ -513,7 +603,7 @@ func (m *StopLossMonitor) RemindWriteBack(name string) (string, bool) {
 }
 
 func (m *StopLossMonitor) remindWriteBackFor(name string, input []byte) (string, bool) {
-	if m == nil {
+	if m == nil || !m.policy.WriteBackReminder {
 		return "", false
 	}
 	m.mu.Lock()
@@ -539,7 +629,7 @@ func (m *StopLossMonitor) remindWriteBackFor(name string, input []byte) (string,
 	if sig.NewFacts != 0 || sig.NewAssets != 0 || sig.NewFindings != 0 {
 		return "", false
 	}
-	threshold := m.policy.idleLimit() - 1
+	threshold := m.policy.idleLimit() + m.milestoneBonus - 1
 	if threshold < 1 {
 		threshold = 1
 	}
@@ -591,9 +681,188 @@ func AttachStopLossWrites(hooks harness.HookRunner, fn func() (WriteCounts, bool
 	h.mon.SetWriteSnapshot(fn)
 }
 
+func (m *StopLossMonitor) allowPostLatchCleanup(name string, input []byte) bool {
+	if m == nil || name != "Bash" || len(input) == 0 {
+		return false
+	}
+	var raw struct {
+		Command string `json:"command"`
+	}
+	if json.Unmarshal(input, &raw) != nil || !isPostLatchCleanupBash(raw.Command) {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cleanupUsed {
+		return false
+	}
+	m.cleanupUsed = true
+	return true
+}
+
+// isPostLatchCleanupBash allows a single standalone curl POST/DELETE call to a
+// container/session teardown endpoint (/close, /stop, /release, /terminate,
+// /destroy) after stop-loss latches so leased benchmark slots do not leak.
+func isPostLatchCleanupBash(command string) bool {
+	words, ok := tokenizeCleanupCurl(command)
+	if !ok || len(words) < 2 || strings.Contains(words[0], "=") {
+		return false
+	}
+	if filepath.Base(words[0]) != "curl" {
+		return false
+	}
+	hasMethod := false
+	var urls []string
+	var expect string // "method" | "url" | "skip"
+	for _, w := range words[1:] {
+		switch expect {
+		case "method":
+			m := strings.ToUpper(w)
+			if m == "POST" || m == "DELETE" {
+				hasMethod = true
+			}
+			expect = ""
+			continue
+		case "url":
+			urls = append(urls, w)
+			expect = ""
+			continue
+		case "skip":
+			expect = ""
+			continue
+		}
+		if strings.HasPrefix(w, "-") {
+			switch {
+			case w == "-X" || w == "--request":
+				expect = "method"
+			case strings.HasPrefix(w, "-X") && len(w) > 2:
+				m := strings.ToUpper(w[2:])
+				if m == "POST" || m == "DELETE" {
+					hasMethod = true
+				}
+			case strings.HasPrefix(w, "--request="):
+				m := strings.ToUpper(strings.TrimPrefix(w, "--request="))
+				if m == "POST" || m == "DELETE" {
+					hasMethod = true
+				}
+			case w == "--url":
+				expect = "url"
+			case strings.HasPrefix(w, "--url="):
+				urls = append(urls, strings.TrimPrefix(w, "--url="))
+			case cleanupCurlValueFlags[w]:
+				expect = "skip"
+			}
+			continue
+		}
+		urls = append(urls, w)
+	}
+	if !hasMethod || expect != "" || len(urls) != 1 {
+		return false
+	}
+	u, err := url.Parse(urls[0])
+	if err != nil || u.Hostname() == "" {
+		return false
+	}
+	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+		return false
+	}
+	p := strings.TrimRight(strings.ToLower(u.Path), "/")
+	for _, suffix := range []string{"/close", "/stop", "/release", "/terminate", "/destroy"} {
+		if strings.HasSuffix(p, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+var cleanupCurlValueFlags = map[string]bool{
+	"-H": true, "--header": true, "-A": true, "--user-agent": true,
+	"-m": true, "--max-time": true, "--connect-timeout": true,
+	"-d": true, "--data": true, "--data-raw": true, "--data-binary": true,
+	"--data-urlencode": true, "--json": true, "-F": true, "--form": true,
+	"-u": true, "--user": true, "-b": true, "--cookie": true,
+	"-c": true, "--cookie-jar": true, "-x": true, "--proxy": true,
+	"--cacert": true, "--cert": true, "--key": true,
+	"-o": true, "--output": true, "-w": true, "--write-out": true,
+	"-D": true, "--dump-header": true, "-e": true, "--referer": true,
+}
+
+func tokenizeCleanupCurl(command string) ([]string, bool) {
+	if strings.TrimSpace(command) == "" {
+		return nil, false
+	}
+	var words []string
+	var cur strings.Builder
+	var quote byte
+	active := false
+	flush := func() {
+		if active {
+			words = append(words, cur.String())
+			cur.Reset()
+			active = false
+		}
+	}
+	for i := 0; i < len(command); i++ {
+		c := command[i]
+		if c == 0 || c == '\n' || c == '\r' {
+			return nil, false
+		}
+		if quote == '\'' {
+			if c == '\'' {
+				quote = 0
+			} else {
+				cur.WriteByte(c)
+			}
+			continue
+		}
+		if c == '\\' {
+			if i+1 == len(command) {
+				return nil, false
+			}
+			i++
+			cur.WriteByte(command[i])
+			active = true
+			continue
+		}
+		if quote == '"' {
+			switch c {
+			case '"':
+				quote = 0
+			case '`':
+				return nil, false
+			case '$':
+				if i+1 < len(command) && (command[i+1] == '(' || command[i+1] == '{') {
+					return nil, false
+				}
+				cur.WriteByte(c)
+			default:
+				cur.WriteByte(c)
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			quote = c
+			active = true
+		case ' ', '\t':
+			flush()
+		case '|', '&', ';', '<', '>', '`', '(', ')', '{', '}', '$':
+			return nil, false
+		default:
+			cur.WriteByte(c)
+			active = true
+		}
+	}
+	if quote != 0 {
+		return nil, false
+	}
+	flush()
+	return words, true
+}
+
 func (h stopLossHooks) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
 	if verdict := h.mon.Verdict(); verdict.Fired() {
-		if !isWriteBackTool(name) {
+		if !isWriteBackTool(name) && !h.mon.allowPostLatchCleanup(name, input) {
 			return true, verdict.Message() + stopLossPostBlockWriteHint, nil
 		}
 	} else if !steerPending(h.inner) {
@@ -622,7 +891,7 @@ func (h stopLossHooks) PreToolUse(ctx context.Context, name string, input []byte
 
 func (h stopLossHooks) PostToolUse(ctx context.Context, name string, input, result []byte, isErr bool) {
 	if h.mon != nil {
-		h.mon.ObserveTool(name, input, isErr)
+		h.mon.ObserveToolResult(name, input, result, isErr)
 		h.mon.Recompute()
 	}
 	if h.inner != nil {
@@ -676,9 +945,10 @@ func isProbeTool(name string) bool {
 }
 
 // isCountableIdleProbe reports whether a tool call should consume the
-// no_progress idle probe budget. Local workspace edits (Write/Edit/MultiEdit)
-// and provably local read-only Bash inspections (e.g. cat/grep/ls on spill
-// output) are preparation/parsing, not target-facing probes.
+// no_progress idle probe budget. Local workspace edits (Write/Edit/MultiEdit,
+// or local heredoc script writes via Bash) and provably local read-only Bash
+// inspections (e.g. cat/grep/ls on spill output) are preparation/parsing, not
+// target-facing probes.
 func isCountableIdleProbe(name string, input []byte) bool {
 	if !isProbeTool(name) || isLocalEditTool(name) {
 		return false
@@ -687,11 +957,202 @@ func isCountableIdleProbe(name string, input []byte) bool {
 		var raw struct {
 			Command string `json:"command"`
 		}
-		if json.Unmarshal(input, &raw) == nil && isLocalReadOnlyBash(raw.Command) {
+		if json.Unmarshal(input, &raw) == nil && (isLocalReadOnlyBash(raw.Command) || isLocalWorkspaceWriteBash(raw.Command)) {
 			return false
 		}
 	}
 	return true
+}
+
+func isLocalWorkspaceWriteBashTool(name string, input []byte) bool {
+	if name != "Bash" || len(input) == 0 {
+		return false
+	}
+	var raw struct {
+		Command string `json:"command"`
+	}
+	return json.Unmarshal(input, &raw) == nil && isLocalWorkspaceWriteBash(raw.Command)
+}
+
+var heredocSuffixRe = regexp.MustCompile(`<<-?\s*(?:'([A-Za-z_][A-Za-z0-9_]*)'|"([A-Za-z_][A-Za-z0-9_]*)"|([A-Za-z_][A-Za-z0-9_]*))\s*(?:2>/dev/null|2>&1)?\s*$`)
+
+// isLocalWorkspaceWriteBash identifies pure local workspace file creation via
+// heredoc (`[cd dir &&] [mkdir -p dir &&] cat > file <<'EOF' ... EOF` or `tee`),
+// ensuring no network/execution command sits before or after the heredoc.
+func isLocalWorkspaceWriteBash(command string) bool {
+	s := strings.ReplaceAll(command, "\r\n", "\n")
+	s = strings.TrimSpace(s)
+	idx := strings.IndexByte(s, '\n')
+	if idx <= 0 {
+		return false
+	}
+	header := strings.TrimSpace(s[:idx])
+	body := strings.TrimRight(s[idx+1:], " \t\n")
+	if body == "" || header == "" {
+		return false
+	}
+	if strings.ContainsAny(header, "|`") || strings.Contains(header, "$(") {
+		return false
+	}
+	// Check heredoc delimiter at the end of header; also check forms like
+	// `cat <<'EOF' > file.py` by stripping a trailing single output redirect first.
+	headCheck := header
+	if !heredocSuffixRe.MatchString(headCheck) {
+		// Handle `cat <<'EOF' > file` (output redirect after heredoc opener).
+		reRedirTail := regexp.MustCompile(`\s+>{1,2}\s*[^\s;&|]+\s*$`)
+		headCheck = reRedirTail.ReplaceAllString(header, "")
+	}
+	m := heredocSuffixRe.FindStringSubmatch(headCheck)
+	if m == nil {
+		return false
+	}
+	delim := m[1]
+	if delim == "" {
+		delim = m[2]
+	}
+	if delim == "" {
+		delim = m[3]
+	}
+	if delim == "" {
+		return false
+	}
+	// Ensure delim closes strictly at the very end of body with no trailing commands.
+	bodyLines := strings.Split(body, "\n")
+	if len(bodyLines) == 0 || strings.TrimSpace(bodyLines[len(bodyLines)-1]) != delim {
+		return false
+	}
+	for _, mid := range bodyLines[:len(bodyLines)-1] {
+		if strings.TrimSpace(mid) == delim {
+			return false
+		}
+	}
+
+	segs, ok := splitSimpleHeaderSegments(header)
+	if !ok || len(segs) == 0 {
+		return false
+	}
+	for i, seg := range segs {
+		fields := strings.Fields(seg)
+		if len(fields) == 0 {
+			return false
+		}
+		cmd := filepath.Base(fields[0])
+		if i < len(segs)-1 {
+			if cmd != "cd" && cmd != "mkdir" {
+				return false
+			}
+			continue
+		}
+		switch cmd {
+		case "cat":
+			if !strings.Contains(seg, ">") {
+				return false
+			}
+		case "tee":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func splitSimpleHeaderSegments(header string) ([]string, bool) {
+	var segs []string
+	var cur strings.Builder
+	var quote byte
+	escaped := false
+	for i := 0; i < len(header); i++ {
+		c := header[i]
+		if escaped {
+			cur.WriteByte(c)
+			escaped = false
+			continue
+		}
+		if quote == '\'' {
+			if c == '\'' {
+				quote = 0
+			}
+			cur.WriteByte(c)
+			continue
+		}
+		if c == '\\' {
+			cur.WriteByte(c)
+			escaped = true
+			continue
+		}
+		if quote == '"' {
+			if c == '"' {
+				quote = 0
+			}
+			cur.WriteByte(c)
+			continue
+		}
+		if c == '\'' || c == '"' {
+			quote = c
+			cur.WriteByte(c)
+			continue
+		}
+		if c == ';' || (c == '&' && i+1 < len(header) && header[i+1] == '&') {
+			part := strings.TrimSpace(cur.String())
+			if part == "" {
+				return nil, false
+			}
+			segs = append(segs, part)
+			cur.Reset()
+			if c == '&' {
+				i++
+			}
+			continue
+		}
+		if c == '&' || c == '|' || c == '<' && (i+1 >= len(header) || header[i+1] != '<') {
+			// Single `<` input redirect or background `&` / pipe `|` rejected, EXCEPT `<<` heredoc.
+			if c != '<' {
+				return nil, false
+			}
+		}
+		if c == '<' && i+1 < len(header) && header[i+1] == '<' {
+			cur.WriteString("<<")
+			i++
+			continue
+		}
+		cur.WriteByte(c)
+	}
+	if quote != 0 || escaped {
+		return nil, false
+	}
+	if part := strings.TrimSpace(cur.String()); part != "" {
+		segs = append(segs, part)
+	} else {
+		return nil, false
+	}
+	return segs, true
+}
+
+var (
+	obsUUIDRe = regexp.MustCompile(`(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b`)
+	obsTSRe   = regexp.MustCompile(`\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?\b`)
+	obsHexRe  = regexp.MustCompile(`(?i)\b(?:0x)?[0-9a-f]{8,}\b`)
+	obsNumRe  = regexp.MustCompile(`\b\d{4,}\b`)
+)
+
+func observationSignature(result []byte, isErr bool) string {
+	trimmed := strings.TrimSpace(string(result))
+	if trimmed == "" {
+		return ""
+	}
+	sample := trimmed
+	if len(sample) > 4096 {
+		sample = sample[:2048] + "\n...\n" + sample[len(sample)-2048:]
+	}
+	norm := obsUUIDRe.ReplaceAllString(sample, "<UUID>")
+	norm = obsTSRe.ReplaceAllString(norm, "<TS>")
+	norm = obsHexRe.ReplaceAllString(norm, "<HEX>")
+	norm = obsNumRe.ReplaceAllString(norm, "<NUM>")
+	norm = strings.Join(strings.Fields(norm), " ")
+	bucket := bits.Len(uint(len(trimmed)))
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(norm))
+	return fmt.Sprintf("e=%t;b=%d;h=%016x", isErr, bucket, h.Sum64())
 }
 
 func commandFingerprint(name string, input []byte) (string, bool) {

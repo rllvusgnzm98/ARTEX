@@ -5,6 +5,7 @@ import (
 	"errors"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/norma/harness"
@@ -71,6 +72,33 @@ type SupplyClass struct {
 	Signal string
 }
 
+// IsGatewayWAFBlock reports whether err is an HTML block page returned by an
+// upstream WAF/CDN (such as Cloudflare) on HTTP 403 rather than an API account
+// or billing rejection. Those blocks are triggered by payload content and should
+// fail/isolate the single intent without freezing the whole task.
+func IsGatewayWAFBlock(err error) bool {
+	if err == nil || HTTPStatusOf(err) != 403 {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	hasHTML := strings.Contains(s, "<!doctype html") ||
+		strings.Contains(s, "<html") ||
+		strings.Contains(s, "<head>") ||
+		strings.Contains(s, "<title>")
+	if !hasHTML {
+		return false
+	}
+	for _, marker := range []string{
+		"cloudflare", "cf-error", "cf-wrapper", "attention required",
+		"ray id", "just a moment", "akamai", "sucuri", "incapsula", "waf",
+	} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // ClassifySupplyFailure identifies a supply failure. ok is false for nil,
 // cancellations, and non-supply errors (429, 5xx, transport, 400, etc.).
 func ClassifySupplyFailure(err error) (SupplyClass, bool) {
@@ -89,6 +117,9 @@ func ClassifySupplyFailure(err error) (SupplyClass, bool) {
 	case 402:
 		return SupplyClass{Signal: SupplyHTTP402}, true
 	case 403:
+		if IsGatewayWAFBlock(err) {
+			return SupplyClass{}, false
+		}
 		return SupplyClass{Signal: SupplyHTTP403}, true
 	}
 	if IsQuotaExhaustedMessage(err.Error()) {

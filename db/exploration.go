@@ -424,7 +424,11 @@ func (s *ExplorationStore) CompareAndSetIntentState(id int64, expected, state st
 func (s *ExplorationStore) CompareAndSetIntentStateCtx(ctx context.Context, id int64, expected, state string) (bool, error) {
 	terminal := state == "done" || state == "blocked" || state == "exhausted" || state == "stopped"
 	res, err := s.db.ExecContext(ctx, `UPDATE exploration_nodes
-SET state=$1, blocked_reason=NULL, content_version=content_version+1, completed_at = CASE WHEN $5 THEN now() ELSE NULL END
+SET state=$1,
+    owner = CASE WHEN $1 = 'open' THEN '' ELSE owner END,
+    blocked_reason=NULL,
+    content_version=content_version+1,
+    completed_at = CASE WHEN $5 THEN now() ELSE NULL END
 WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state=$4`, state, id, s.expID, expected, terminal)
 	if err != nil {
 		return false, err

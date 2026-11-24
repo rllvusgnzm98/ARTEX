@@ -100,3 +100,79 @@ func TestBashFetchHostsIgnoresEchoAndNmap(t *testing.T) {
 		t.Fatalf("absolute curl, got %v", got)
 	}
 }
+
+func TestGuardTarpitSkipsMutationsCapsStaticPollingAndSplitsPorts(t *testing.T) {
+	g := New()
+	var hints []string
+	g.SetTarpit(TarpitConfig{
+		Budget: func() int { return 4 },
+		Hint:   func(host string, count int) { hints = append(hints, host) },
+	})
+	pre := func(name string, input []byte) bool {
+		blocked, _, _ := g.Hooks().PreToolUse(context.Background(), name, input)
+		return blocked
+	}
+
+	// 1. State-changing curl calls (POST/-d) do not count toward tarpit.
+	for i := 0; i < 10; i++ {
+		if pre("Bash", bashInput(`curl -s -X POST "https://bench.example/openapi/v1/challenges/start?unique_code=c-03"`)) {
+			t.Fatal("POST curl must not be blocked")
+		}
+		if pre("Bash", bashInput(`curl -s -d '{"flag":"x"}' "https://bench.example/openapi/v1/challenges/submit"`)) {
+			t.Fatal("-d curl must not be blocked")
+		}
+	}
+	// 2. Polling the identical static GET URL 50 times caps at 3 (< budget 4).
+	for i := 0; i < 50; i++ {
+		if pre("Bash", bashInput(`curl -s "https://bench.example/openapi/v1/challenges"`)) {
+			t.Fatal("static GET polling must not be blocked")
+		}
+	}
+	if len(hints) != 0 {
+		t.Fatalf("POST + static GET polling must not trip tarpit, got hints=%v", hints)
+	}
+
+	// 3. Non-default ports on the same IP are tracked separately.
+	for i := 0; i < 4; i++ {
+		pre("Bash", bashInput("curl -s http://10.0.164.138:8080/p"+string(rune('a'+i))))
+		pre("Bash", bashInput("curl -s http://10.0.164.138:9011/p"+string(rune('a'+i))))
+	}
+	if len(hints) != 0 {
+		t.Fatalf("4 distinct fetches per port (<= budget 4) must not trip, got hints=%v", hints)
+	}
+	// 5th distinct path on :8080 trips only 10.0.164.138:8080.
+	pre("Bash", bashInput("curl -s http://10.0.164.138:8080/pe"))
+	if len(hints) != 1 || hints[0] != "10.0.164.138:8080" {
+		t.Fatalf("expected tarpit hint on 10.0.164.138:8080 only, got %v", hints)
+	}
+}
+
+func TestGuardTarpitIsolatedByScopeKey(t *testing.T) {
+	g := New()
+	var hints []string
+	g.SetTarpit(TarpitConfig{
+		Budget: func() int { return 3 },
+		Hint:   func(host string, count int) { hints = append(hints, host) },
+	})
+	ctx1 := WithScopeKey(context.Background(), "intent:101")
+	ctx2 := WithScopeKey(context.Background(), "intent:102")
+
+	// Two intents reuse the same recycled benchmark IP on :80, each doing 3 fetches (== budget 3).
+	for i := 0; i < 3; i++ {
+		if b, _, _ := g.Hooks().PreToolUse(ctx1, "Bash", bashInput("curl -s http://10.0.164.136/p"+string(rune('a'+i)))); b {
+			t.Fatal("ctx1 probe blocked unexpectedly")
+		}
+		if b, _, _ := g.Hooks().PreToolUse(ctx2, "Bash", bashInput("curl -s http://10.0.164.136/q"+string(rune('a'+i)))); b {
+			t.Fatal("ctx2 probe blocked unexpectedly")
+		}
+	}
+	if len(hints) != 0 {
+		t.Fatalf("scoped intents must not accumulate tarpit across recycled :80 IP, got hints=%v", hints)
+	}
+
+	// Exceeding budget within a single intent trips once and reports clean hostname.
+	g.Hooks().PreToolUse(ctx1, "Bash", bashInput("curl -s http://10.0.164.136/overflow"))
+	if len(hints) != 1 || hints[0] != "10.0.164.136" {
+		t.Fatalf("expected single clean host hint on scope budget overflow, got %v", hints)
+	}
+}

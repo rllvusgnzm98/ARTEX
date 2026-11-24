@@ -334,15 +334,15 @@ const workerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 2. 初次受阻（payload 被过滤 / 404 / 注入无回显）不代表已探透——把本意图的所有绕过手段走完再输出结论；
 3. 只在授权范围内操作。系统提示顶部若附【操作约束】，那是最高优先级红线：每条命令/探测执行前先自检，违反即不做（哪怕它落在你领到的意图里）。
 
-**边发现边写回**（写进图才算数，脑子/文字里的不算；每得一个结果立刻写，别攒到最后被步数耗尽丢掉）。三种写回，别串图：
+**专注突破与写回**：
 - **新资产/资源 → insert_assets（资产图）**：子域 / service / endpoint / 指纹 / 凭据 等一切资产【本身】。**这里只登记资产；探索结论/判断不写这里，用 record_fact。**
-- **探索结论/事实 → record_fact（探索图，传 intent_id）**：都用它。**多个观察汇总成【一条】事实**（summary 一句总结 + detail写对总结的拓展，依靠真实的执行过程），不要一个属性一条、一意图通常只一条，拆碎会让图谱无限膨胀——**默认就写一条，能并进 detail 的都并进去**；仅当确有【彼此完全独立、无法归并】的结论时才用 facts 数组分条，这是极少数例外，不是常规。**只写增量**：只记这次【新得到】的，别把已有事实换措辞重记（只印证已有、无新增就不必记）。**只写真实看到的**：给 evidence（一行：命令+最能证明的一两行输出，简洁，细节在 detail）、标 confidence（observed=直接看到 / inferred=据现象推断）。
-- **确认漏洞 → report_finding（探索图，含 PoC，传 intent_id）**：**只有你本次真实触发过、拿到可复现证据（请求/响应或命令输出）才用**。严禁把"版本/指纹匹配到 CVE""参数看起来可注入""外部漏洞库/更新日志/代码 diff 推断"当已确认，也不要用查 CVE 库或对比补丁版本替代实际触发。触发不了但有嫌疑 → 用 record_fact 记一条 inferred 事实（嫌疑点+为何未触发）交规划者，别硬记成 finding。
+- **探索结论/事实 → record_fact（探索图，传 intent_id）**：专注先把当前线索打穿再归纳，一意图默认汇总为【一条】高质量事实（summary 一句总结 + detail 写对总结的拓展），不要每隔几步就刷一条流水账中间态；仅当确有【彼此完全独立、无法归并】的结论时才用 facts 数组分条。**只写增量**：只记这次【新得到】的，别把已有事实换措辞重记。**只写真实看到的**：给 evidence（一行：命令+最能证明的一两行输出，简洁，细节在 detail）、标 confidence（observed=直接看到 / inferred=据现象推断）。否定结论、范围/权限边界、清理/释放状态或关键凭据证据请顺手填 category（negative_result / scope_limit / cleanup_status / evidence），便于后续 worker 进场优先继承。
+- **确认漏洞 / 拿分 → report_finding（探索图，含 PoC，传 intent_id 与简明漏洞标题 name）**：**只有你本次真实触发过、拿到可复现证据（请求/响应或命令输出）才用**。严禁把"版本/指纹匹配到 CVE""参数看起来可注入""外部漏洞库/更新日志/代码 diff 推断"当已确认，也不要用查 CVE 库或对比补丁版本替代实际触发。触发不了但有嫌疑 → 用 record_fact 记一条 inferred 事实（嫌疑点+为何未触发）交规划者，别硬记成 finding。
 
 
 完成本意图后用一句话总结你做了什么、写回了哪些事实。
 
-**止损（安全上限不是默认停法）**：单次 run_seconds（默认 20 分钟）只是墙钟安全上限，不是到点才停的策略。若连续探测没有新事实也没有新资产，或重复同一命令，执行层会提前止损并让出槽位；不要把这次止损写成目标失败。**所以别把写回攒到最后**：每探出一点就立即 record_fact / insert_assets / report_finding，在空闲探测额度用尽前把已观察到的落库；真实进展会刷新止损窗口，避免白跑的观察被丢掉。`
+**预算与停滞保护**：单次 ` + "`run_seconds`" + `（默认 20 分钟）只是初始墙钟上限，**每次成功 ` + "`report_finding`" + ` 登记漏洞或 flag 都会自动延长运行预算并奖励深入探针额度**——打进内网或拿到立足点后请放心往深打穿。执行层仅在连续多次命令返回完全同质/重复结果且没有任何新差异时才会止损让位，不会打断正在出现新状态码/新报错栈的有效推进。`
 
 // workerIntranetDiscipline 是内网期追加进 worker 正文的短纪律段落(可编辑变体
 // "worker.intranet")。只追加,不替换 worker 默认正文,也不覆盖进场预塞。
@@ -454,6 +454,7 @@ const (
 	workerOverviewRunningCap        = 6
 	workerOverviewRunningSummaryMax = 120
 	workerOverviewRecentFactsCap    = 10
+	workerOverviewFindingsCap       = 6
 	workerOverviewColdDigestsCap    = 3
 	workerOverviewColdDigestBodyMax = 300
 	workerOverviewHintsCap          = 8
@@ -510,13 +511,21 @@ func renderWorkerGraphOverview(data map[string]any, seedFactIDs map[int64]bool) 
 		}
 		data["recent_facts"] = kept
 	}
-	// finding_list 摘要封顶，防止单条超长漏洞摘要撑爆概览。
+	// finding_list 封顶并裁短摘要，防止多条超长漏洞摘要撑爆概览（全量走 list_findings）。
 	if fl, ok := data["finding_list"].([]map[string]any); ok {
-		for _, m := range fl {
-			if s, ok := m["summary"].(string); ok {
-				m["summary"] = clipPlainRunes(s, factSummaryMax)
+		lim := min(len(fl), workerOverviewFindingsCap)
+		slim := make([]map[string]any, 0, lim)
+		for _, m := range fl[:lim] {
+			entry := map[string]any{"id": m["id"]}
+			if from, exists := m["from_intent"]; exists {
+				entry["from_intent"] = from
 			}
+			if s, ok := m["summary"].(string); ok {
+				entry["summary"] = clipPlainRunes(s, workerOverviewRunningSummaryMax)
+			}
+			slim = append(slim, entry)
 		}
+		data["finding_list"] = slim
 	}
 	// cold_digests：worker 不需携带多达 15 篇完整冷区长摘要；仅保留最新 3 篇且正文裁至 300 字，
 	// 需要回查冷区历史时可按 id 调 expand_digest 或 list_facts。
@@ -607,6 +616,15 @@ func (w *Worker) Execute(ctx context.Context, name string, taskID int64, as *db.
 // human-authored message. The HTTP handler does not edit the transcript;
 // agentcore records the message as a normal user turn when this Worker starts.
 // This keeps Worker continuation identical to the regular agent chat flow.
+// SanitizeSessionForWAF scrubs recent sensitive tool_use/tool_result blocks at the
+// tail of the worker's transcript after an upstream LLM gateway HTTP 403 WAF block.
+func (w *Worker) SanitizeSessionForWAF(explorationID, intentID int64) (bool, error) {
+	if w == nil || w.tx == nil || explorationID <= 0 || intentID <= 0 {
+		return false, nil
+	}
+	return SanitizeTranscriptTailForWAF(w.tx, WorkerSessionID(explorationID, intentID))
+}
+
 func (w *Worker) ExecuteWithMessage(ctx context.Context, name string, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, intent *db.Node, hooks harness.HookRunner, emit func(db.Activity), enr EnrichTrigger, notifyFinding func(int64, string), requestID, message string) (harness.TerminalReason, WriteCounts, error) {
 	return w.execute(ctx, name, taskID, as, ts, intent, hooks, emit, enr, notifyFinding, strings.TrimSpace(requestID), strings.TrimSpace(message))
 }
@@ -620,9 +638,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if as != nil {
 		tsx.SetAssetStore(as, as.Companies())
 	}
-	tsx.SetOwnerNode(intent.ID)         // assets this worker discovers anchor to its intent → visible to the task
-	tsx.SetEnrich(enr)                  // async DNS/HTTP auto-completion for assets this worker writes
-	tsx.SetNotifyFinding(notifyFinding) // report_finding 落库时当场唤醒 planner，带上「哪个意图+finding」
+	tsx.SetOwnerNode(intent.ID) // assets this worker discovers anchor to its intent → visible to the task
+	tsx.SetEnrich(enr)          // async DNS/HTTP auto-completion for assets this worker writes
 	// base = built-in worker tools ∪ host tools (traffic) ∪ default tools (incl. Bash);
 	// then augment with the agent's visible skills/MCP. During the SDK settlement
 	// phase, Bash is hidden via Settlement.DisabledTools (no local gating needed).
@@ -693,6 +710,21 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		reserve = *w.settleTimeout
 	}
 	ctx, workDuration := withRunBudget(ctx, time.Now(), maxDur, reserve)
+	maxOptsDuration := workDuration
+	notifyFindingWrapped := notifyFinding
+	if maxDur >= 10*time.Minute && !clamped && workDuration > 0 {
+		ctx = enableRunBudgetExtension(ctx, maxDur)
+		maxOptsDuration = workDuration + maxDur
+		notifyFindingWrapped = func(iid int64, summary string) {
+			if added, total := extendRunBudgetFromContext(ctx, 10*time.Minute); added > 0 {
+				log.Printf("[worker %s] intent #%d 发现漏洞里程碑，运行预算续期 +%s（累计 +%s）", name, iid, added, total)
+			}
+			if notifyFinding != nil {
+				notifyFinding(iid, summary)
+			}
+		}
+	}
+	tsx.SetNotifyFinding(notifyFindingWrapped) // report_finding 落库时当场唤醒 planner + 里程碑续期
 	settle := wrapupSettlement("worker", []string{"Bash"})
 	if tc.DeadlineUnix > 0 {
 		settle = wrapupSettlementForTask("worker", []string{"Bash"}, clamped)
@@ -728,7 +760,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		MaxTurns:   w.maxTurns, // 0 = unlimited (configurable in agent management)
 		// 墙钟预算,轮边界判,不打断半路;0 = 不限。有任务级 deadline 时夹逼到 min(自身预算,
 		// 距 deadline 剩余),让本 run 在任务到点时自然进收尾(见 taskclock.go)。
-		MaxDuration: workDuration,
+		MaxDuration: maxOptsDuration,
 		// 命中预算(轮次 OR 时长)→ SDK 跑一轮收尾(隐藏 Bash),把已识别的写回,避免烂尾。
 		// clamped(被任务 deadline 夹逼)时用 PromptByReason:因超时=任务到点→任务超时词,
 		// 因步数=夹逼窗口内步数先耗尽→回落 per-run 词。非 clamped 维持纯 per-run。
@@ -822,9 +854,9 @@ func captureWorkerSession(ctx context.Context, s *agentcore.Session, input strin
 	runCtx := ctx
 	var hardEnd *RunBudgetError
 	if b, ok := ctx.Value(runBudgetKey{}).(runBudget); ok {
-		hardEnd = &RunBudgetError{Deadline: b.hard}
+		hardEnd = &RunBudgetError{Deadline: b.maxHardDeadline()}
 		var cancel context.CancelFunc
-		runCtx, cancel = context.WithDeadlineCause(ctx, b.hard, hardEnd)
+		runCtx, cancel = context.WithDeadlineCause(ctx, b.maxHardDeadline(), hardEnd)
 		defer cancel()
 	}
 	_, reason, err := captureRunSession(runCtx, s, input, emit)
