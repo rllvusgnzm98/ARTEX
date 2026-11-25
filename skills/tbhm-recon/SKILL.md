@@ -1,6 +1,6 @@
 ---
 name: tbhm-recon
-description: 当需要对目标企业进行全范围外部资产测绘、顶级域名发现、DMARC逆向组织关联、ASN拥有段与子域盲区挖掘时使用。只负责「发现资产面」；不适用于对单个 Web 应用的漏洞挖掘与利用（那是 tbhm-app-analysis 的职责），也不适用于已知目标的 API 接口逆向（那是 api-recon 的职责）。
+description: 当需要对目标企业进行全范围外部资产测绘、顶级域名发现、DMARC逆向组织关联、ASN拥有段与子域盲区挖掘时使用。只负责「发现资产面」；不适用于对单个 Web 应用的漏洞挖掘与利用（那是 tbhm-app-analysis 的职责），也不适用于已知目标的 JS/API 接口逆向（那是 js-api-recon 的职责）。
 ---
 
 # TBHM Recon（资产侦察与组织测绘）

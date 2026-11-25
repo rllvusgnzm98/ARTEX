@@ -1,8 +1,3 @@
----
-name: content-discovery-wordlist
-description: 为目标生成定制内容发现词表。结合技术栈公开资料与可选的 JS 路径种子，去重后写入当前目录 custom_list.txt，供 ffuf 等路径发现工具使用。在要自定义 wordlist、fuzz 列表或从 JS 提取路径时使用。
----
-
 # 内容发现词表
 
 只生成词表，不发起扫描。产出是当前目录的 `custom_list.txt`。用哪一个路径发现工具由使用者另选，本技能不绑定仓库里没有的扫描器。

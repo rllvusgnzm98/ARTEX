@@ -1,6 +1,6 @@
 ---
 name: tbhm-app-analysis
-description: 当需要对具体Web应用进行深层架构分析、7大核心问题推演、8大热点漏洞测绘（Heat Mapping）以及敏感配置泄露金丝雀探针审计时使用。只负责「单应用深度分析」；不适用于组织级外部资产测绘与根域名发现（那是 tbhm-recon 的职责），也不适用于前端 API 接口的系统性枚举与权限树还原（那是 api-recon 的职责）。
+description: 当需要对单个 Web 应用进行深层架构分析、7 大核心问题推演、8 大热点漏洞测绘（Heat Mapping）、敏感配置金丝雀探针审计，以及按目标技术栈生成定制内容发现词表（custom_list.txt 供 ffuf/feroxbuster 使用）时使用。只负责「单应用深度分析与内容发现」；不适用于组织级外部资产测绘（见 tbhm-recon）或前端 JS/API 逆向采集（见 js-api-recon）。
 ---
 
 # TBHM Application Analysis（应用深度分析与热点测绘）
@@ -16,7 +16,7 @@ description: 当需要对具体Web应用进行深层架构分析、7大核心问
 |---|---|---|
 | **架构推演** | 请求头/响应体分析、身份凭证传递逆向、前端路由解析、技术栈指纹识别 | 暴力破解他人账户密码、大字典无差别扫描 |
 | **热点测试** | 低噪声金丝雀探针、参数边界探测、反射输入无害标记验证、权限矩阵对比 | 破坏性注入测试、DROP TABLE、向生产环境写入恶意后门、破坏业务数据完整性 |
-| **漏洞记录** | 当金丝雀探针命中敏感文件（如 `.env`, `.git/HEAD`, Actuator）时，提取证据并立即调用 `record_finding` | 凭空臆测无复现证据的漏洞、虚高漏洞危害等级 |
+| **漏洞记录** | 当金丝雀探针命中敏感文件（如 `.env`, `.git/HEAD`, Actuator）时，提取证据并立即调用 `report_finding` | 凭空臆测无复现证据的漏洞、虚高漏洞危害等级 |
 
 ---
 
@@ -79,9 +79,15 @@ python3 scripts/canary_scan.py <target_url>
 
 ---
 
-### Phase 4: 规范化证据与漏洞录入 (Record Finding)
+### Phase 3.5: 定制内容发现词表（Custom Discovery Wordlist，按需）
 
-一旦在金丝雀扫描或热点测试中确认存在真实安全漏洞，**必须严格按以下标准结构记录证据并调用 `record_finding`**：
+当通用大字典漏报或识别出特定框架/组件技术栈时，结合目标响应头、框架特征与已提取的 JS 路径种子，在当前工作目录生成去重、排序后的定制词表 `custom_list.txt`，再交由 `ffuf` / `feroxbuster` 精准枚举（切忌只把通用字典抄一遍）。两阶段生成方法与排查维度见 `${SKILL_DIR}/references/content-discovery-wordlist.md`。
+
+---
+
+### Phase 4: 规范化证据与漏洞录入 (Report Finding)
+
+一旦在金丝雀扫描、定制词表命中或热点测试中确认存在真实安全漏洞，**必须严格按以下标准结构记录证据并调用 `report_finding`**：
 
 ```markdown
 # Technical Issue - [受影响资源与参数]
@@ -107,8 +113,8 @@ Server responded with HTTP 200 containing [敏感环境变量/未授权数据/�
 
 - [ ] 完成目标站点架构 7 问推演，形成基础认知。
 - [ ] 标记出目标站点的 8 大热点交互区域（如上传点、API 列表、认证中心）。
-- [ ] 运行 `canary_scan.py` 完成基础配置泄露与高危端点金丝雀审计。
-- [ ] 所有确认的配置暴露或逻辑缺陷已按标准格式调用 `record_finding` 上报平台。
+- [ ] 运行 `canary_scan.py` 完成基础配置泄露与高危端点金丝雀审计（必要时生成 `custom_list.txt` 配合 `ffuf` 补测）。
+- [ ] 所有确认的配置暴露或逻辑缺陷已按标准格式调用 `report_finding` 上报平台。
 
 ---
 
@@ -117,5 +123,6 @@ Server responded with HTTP 200 containing [敏感环境变量/未授权数据/�
 | 文件 | 内容 |
 |---|---|
 | [reference.md](reference.md) | 技术参考手册：SSTI 万能探针与引擎确认表、反序列化格式特征识别、常见默认高危调试与管理端点、文件上传关键安全检查项（40+ 维度） |
+| [references/content-discovery-wordlist.md](references/content-discovery-wordlist.md) | 按目标技术栈与 JS 路径种子构建定制 `custom_list.txt` 的两阶段流程（合并自原 `content-discovery-wordlist` 技能） |
 | [scripts/canary_scan.py](scripts/canary_scan.py) | 高并发非破坏性金丝雀探针（Phase 3，5 大高危类别） |
 | [scripts/quick-hits-wordlist.txt](scripts/quick-hits-wordlist.txt) | 快速命中路径字典（配合 canary_scan.py） |

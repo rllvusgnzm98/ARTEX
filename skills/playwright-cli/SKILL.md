@@ -1,9 +1,22 @@
 ---
 name: playwright-cli
-description: Automate browser interactions, test web pages and work with Playwright tests.
+description: 真实浏览器交互自动化技能：优先通过 ARTEX 内置 browser MCP（mcp__browser__*，已自动挂载平台流量捕获代理）操作无头浏览器完成 SPA 渲染、复杂登录/CSRF/前端加密交互、DOM XSS 验证与网络抓包；无 MCP 时可回退 playwright-cli 命令行。
 ---
 
-# Browser Automation with playwright-cli
+# Browser Automation（内置 browser MCP 优先 / playwright-cli 备选）
+
+## 优先路径：直接调用平台内置 `browser` MCP
+
+ARTEX 已为当前 Agent 直绑 `browser` MCP（全局延迟工具，无需额外安装或启动浏览器进程，且已自动接入平台 MITM 抓包代理）。遇到 **SPA 动态渲染、前端 JS 加密登录、复杂多步表单、弹窗/Dialog、DOM XSS 验证、动态 API 请求抓包** 时：
+
+1. 先用 `SearchExtraTools`（关键字 `browser`）查看参数 schema，再用 `ExecuteExtraTool` 直接调用：
+   - 导航与状态：`mcp__browser__browser_navigate`、`mcp__browser__browser_snapshot`（获取可交互元素 ref，优于盲截图）、`mcp__browser__browser_wait_for`
+   - 交互操作：`mcp__browser__browser_click`、`mcp__browser__browser_fill_form`、`mcp__browser__browser_type`、`mcp__browser__browser_select_option`、`mcp__browser__browser_file_upload`、`mcp__browser__browser_handle_dialog`
+   - 审计取证：`mcp__browser__browser_network_requests`（查动态发起的 XHR/Fetch API）、`mcp__browser__browser_console_messages`、`mcp__browser__browser_evaluate`（查 DOM / Cookie / localStorage）、`mcp__browser__browser_take_screenshot`
+   - 收尾释放：任务结束调 `mcp__browser__browser_close`
+2. 仅当需要导出测试脚本或离线命令行批量操作时，再使用下方 `playwright-cli` CLI。
+
+## 备选路径：playwright-cli 命令行
 
 本仓库技能 frontmatter 只记录 name、description、license、compatibility、mcps（兼容 whenToUse、mcp）。上游 `allowed-tools` 不是已文档化字段，原值保留如下：`Bash(playwright-cli:*) Bash(npx:*) Bash(npm:*)`。
 
