@@ -320,3 +320,146 @@ func TestEntrySeedFallbackMatchesPayloadHostWithBoundaries(t *testing.T) {
 		t.Fatalf("fallback host match mismatch: got %+v, want only fact #%d", seed.ConfirmedFacts, factMatched.ID)
 	}
 }
+
+func TestEntrySeedIsolatesUnrelatedHostKeyFactsAndSharedIP(t *testing.T) {
+	// Scenario: blog.acme.test and pay.acme.test sit behind shared IP 104.18.0.1.
+	// Testing pay.acme.test must NOT pull blog.acme.test's host-anchored negative_result,
+	// evidence-bearing facts, or sibling NextHops / shared CDN IP, while still retaining
+	// scope_limit and unanchored task-global key facts.
+	const (
+		blogID   = int64(10)
+		payID    = int64(20)
+		sharedIP = int64(30)
+	)
+	intentPay := node(500, db.KindIntent, "open", map[string]any{
+		"summary":   "审计 pay.acme.test 支付接口越权",
+		"asset_ids": []int64{payID},
+	})
+	factBlogNeg := node(501, db.KindFact, "confirmed", map[string]any{
+		"summary":    "blog.acme.test 登录接口未发现注入",
+		"category":   "negative_result",
+		"confidence": "observed",
+	})
+	factBlogEv := node(502, db.KindFact, "confirmed", map[string]any{
+		"summary":      "blog.acme.test CMS 版本响应包",
+		"confidence":   "observed",
+		"evidence_ids": []string{"traffic:101"},
+	})
+	factBlogGeneral := node(503, db.KindFact, "confirmed", map[string]any{
+		"summary":    "blog.acme.test 使用 Ghost 运行在 104.18.0.1",
+		"confidence": "observed",
+	})
+	factPayGeneral := node(504, db.KindFact, "confirmed", map[string]any{
+		"summary":    "pay.acme.test 解析至 104.18.0.1",
+		"confidence": "observed",
+	})
+	factScope := node(505, db.KindFact, "confirmed", map[string]any{
+		"summary":    "全任务 WAF 限速 5 req/s（测试 blog.acme.test 时观测）",
+		"category":   "scope_limit",
+		"confidence": "observed",
+	})
+	factGlobalNeg := node(506, db.KindFact, "confirmed", map[string]any{
+		"summary":    "全局禁止测试 /admin/shutdown 破坏性端点",
+		"category":   "negative_result",
+		"confidence": "observed",
+	})
+
+	g := EntryGraph{
+		Intent:         intentPay,
+		IntentAssetIDs: []int64{payID},
+		Facts:          []*db.Node{factBlogNeg, factBlogEv, factBlogGeneral, factPayGeneral, factScope, factGlobalNeg},
+		Anchors: map[int64][]int64{
+			factBlogNeg.ID:     {blogID},
+			factBlogEv.ID:      {blogID},
+			factBlogGeneral.ID: {blogID, sharedIP},
+			factPayGeneral.ID:  {payID, sharedIP},
+			factScope.ID:       {blogID},
+		},
+		Assets: map[int64]string{
+			blogID:   "blog.acme.test",
+			payID:    "pay.acme.test",
+			sharedIP: "104.18.0.1",
+		},
+		AssetTypes: map[int64]string{
+			blogID:   "subdomain",
+			payID:    "subdomain",
+			sharedIP: "ip",
+		},
+	}
+
+	seed := BuildWorkerEntrySeed(g)
+	gotFacts := map[int64]bool{}
+	for _, f := range seed.ConfirmedFacts {
+		gotFacts[f.ID] = true
+	}
+	for _, want := range []int64{factPayGeneral.ID, factScope.ID, factGlobalNeg.ID} {
+		if !gotFacts[want] {
+			t.Errorf("expected fact #%d in pay.acme.test seed, got %v", want, gotFacts)
+		}
+	}
+	for _, unwanted := range []int64{factBlogNeg.ID, factBlogEv.ID, factBlogGeneral.ID} {
+		if gotFacts[unwanted] {
+			t.Errorf("unrelated-host fact #%d leaked into pay.acme.test seed: %+v", unwanted, gotFacts)
+		}
+	}
+	for _, hop := range seed.NextHops {
+		if hop.AssetID == blogID || hop.AssetID == sharedIP {
+			t.Errorf("unrelated host or shared CDN IP leaked into NextHops: %+v", hop)
+		}
+	}
+}
+
+func TestEntrySeedIsolatesWorkerYieldedUnanchoredCleanupAndNegativeFacts(t *testing.T) {
+	intentOther := node(100, db.KindIntent, "done", map[string]any{"summary": "test target A"})
+	intentNew := node(101, db.KindIntent, "open", map[string]any{"summary": "test unrelated target B"})
+	intentCont := node(102, db.KindIntent, "open", map[string]any{"summary": "continue target A"})
+
+	factCleanup := node(201, db.KindFact, "confirmed", map[string]any{
+		"summary":    "target A container stopped",
+		"category":   "cleanup_status",
+		"confidence": "observed",
+	})
+	factNeg := node(202, db.KindFact, "confirmed", map[string]any{
+		"summary":    "target A /login not sqli",
+		"category":   "negative_result",
+		"confidence": "observed",
+	})
+	factScope := node(203, db.KindFact, "confirmed", map[string]any{
+		"summary":    "rate limit max 3 concurrent",
+		"category":   "scope_limit",
+		"confidence": "observed",
+	})
+
+	edges := []db.Edge{
+		{From: intentOther.ID, Rel: db.RelYields, To: factCleanup.ID},
+		{From: intentOther.ID, Rel: db.RelYields, To: factNeg.ID},
+		{From: intentOther.ID, Rel: db.RelYields, To: factScope.ID},
+		{From: factNeg.ID, Rel: db.RelDerivedFrom, To: intentCont.ID},
+	}
+	facts := []*db.Node{factCleanup, factNeg, factScope}
+
+	// Unrelated intentNew receives ONLY scope_limit, not worker-yielded cleanup_status / negative_result.
+	seedNew := BuildWorkerEntrySeed(EntryGraph{Intent: intentNew, Facts: facts, Edges: edges})
+	gotNew := map[int64]bool{}
+	for _, f := range seedNew.ConfirmedFacts {
+		gotNew[f.ID] = true
+	}
+	if !gotNew[factScope.ID] {
+		t.Fatalf("unrelated intent must receive scope_limit, got %v", gotNew)
+	}
+	if gotNew[factCleanup.ID] || gotNew[factNeg.ID] {
+		t.Fatalf("worker-yielded unanchored cleanup/negative leaked to unrelated intent: %v", gotNew)
+	}
+
+	// Continuation intentCont linked via derived_from still receives sibling facts from intentOther.
+	seedCont := BuildWorkerEntrySeed(EntryGraph{Intent: intentCont, Facts: facts, Edges: edges})
+	gotCont := map[int64]bool{}
+	for _, f := range seedCont.ConfirmedFacts {
+		gotCont[f.ID] = true
+	}
+	for _, id := range []int64{factCleanup.ID, factNeg.ID, factScope.ID} {
+		if !gotCont[id] {
+			t.Fatalf("continuation intent missing lineage fact #%d: got %v", id, gotCont)
+		}
+	}
+}

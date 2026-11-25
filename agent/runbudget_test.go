@@ -172,3 +172,51 @@ func TestRunBudgetDynamicExtensionPreservesReserveAndExtendsDeadlines(t *testing
 		t.Fatalf("capped extend = (%s, %s), want (10m, 20m)", added2, totalBonus2)
 	}
 }
+
+func TestRunBudgetFreezeStopsSettlementExtensions(t *testing.T) {
+	start := time.Now()
+	total, reserve := 20*time.Minute, 2*time.Minute
+	ctx, _ := withRunBudget(t.Context(), start, total, reserve)
+	ctx = enableRunBudgetExtension(ctx, total)
+
+	if added, totalBonus := extendRunBudgetFromContext(ctx, 10*time.Minute); added != 10*time.Minute || totalBonus != 10*time.Minute {
+		t.Fatalf("pre-freeze extend = (%s, %s), want (10m, 10m)", added, totalBonus)
+	}
+
+	freezeRunBudgetExtension(ctx)
+
+	if added, totalBonus := extendRunBudgetFromContext(ctx, 10*time.Minute); added != 0 || totalBonus != 10*time.Minute {
+		t.Fatalf("post-freeze extend = (%s, %s), want (0, 10m)", added, totalBonus)
+	}
+	if added, totalBonus := ExtendWorkerProgressFromContext(ctx, 5*time.Minute); added != 0 || totalBonus != 10*time.Minute {
+		t.Fatalf("post-freeze progress extend = (%s, %s), want (0, 10m)", added, totalBonus)
+	}
+}
+
+func TestRunBudgetProgressExtensionCooldownAndSubCap(t *testing.T) {
+	start := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+	total, reserve := 20*time.Minute, 2*time.Minute
+	ctx, _ := withRunBudget(t.Context(), start, total, reserve)
+	ctx = enableRunBudgetExtension(ctx, total) // progressCap = 10m
+
+	now := start.Add(2 * time.Minute)
+	if added, tot := extendWorkerProgressAt(ctx, 5*time.Minute, now); added != 5*time.Minute || tot != 5*time.Minute {
+		t.Fatalf("first progress = (%s, %s), want (5m, 5m)", added, tot)
+	}
+	// Within 5m cooldown -> blocked.
+	if added, tot := extendWorkerProgressAt(ctx, 5*time.Minute, now.Add(4*time.Minute)); added != 0 || tot != 5*time.Minute {
+		t.Fatalf("within cooldown = (%s, %s), want (0, 5m)", added, tot)
+	}
+	// After 5m cooldown -> granted up to 10m progress sub-cap.
+	if added, tot := extendWorkerProgressAt(ctx, 5*time.Minute, now.Add(5*time.Minute)); added != 5*time.Minute || tot != 10*time.Minute {
+		t.Fatalf("second progress = (%s, %s), want (5m, 10m)", added, tot)
+	}
+	// Progress sub-cap exhausted -> 0, even after another cooldown.
+	if added, tot := extendWorkerProgressAt(ctx, 5*time.Minute, now.Add(15*time.Minute)); added != 0 || tot != 10*time.Minute {
+		t.Fatalf("beyond subcap = (%s, %s), want (0, 10m)", added, tot)
+	}
+	// Finding extension still gets the remaining 10m out of 20m maxBonus.
+	if added, tot := extendRunBudgetFromContext(ctx, 10*time.Minute); added != 10*time.Minute || tot != 20*time.Minute {
+		t.Fatalf("remaining finding budget = (%s, %s), want (10m, 20m)", added, tot)
+	}
+}

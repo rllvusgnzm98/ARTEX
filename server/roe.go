@@ -35,7 +35,8 @@ func newRoEConfig(pg *db.DB) guard.RoEConfig {
 			if err != nil {
 				return nil, err // 读失败交给 guard:strict 不得当成空范围放行
 			}
-			return scopeRulesFromRows(rows), nil
+			modeVal, _, _ := pg.GetSetting(settingRoEEnforcement)
+			return scopeRulesFromRowsForMode(rows, modeVal), nil
 		},
 		TaskIDOf: func(ctx context.Context) int64 {
 			return agent.RunInfoFrom(ctx).TaskID
@@ -93,7 +94,7 @@ func (s *Server) roeVerdictFor(taskID int64, host string) (guard.ScopeVerdict, s
 	if err != nil {
 		return guard.ScopeUnknown, mode, err
 	}
-	return guard.NewScopeMatcher(scopeRulesFromRows(rows)).Check(host), mode, nil
+	return guard.NewScopeMatcher(scopeRulesFromRowsForMode(rows, mode)).Check(host), mode, nil
 }
 
 // sessionRoECheck 在登记会话前校验目标 URL 的 host 是否在本任务官方范围内:

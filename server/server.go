@@ -182,7 +182,11 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		b := s.agentsForTask(t)
 		return b.pl, b.wk
 	})
-	s.engine.SetCampaignOrchestrator(s.shouldKickoffCampaign, s.runCampaignPatrol)
+	// 默认摘除 MainAgent 自动巡检循环（恢复 e6ec5699 单一规划大脑 + 人工按需驱动主 Agent 形态），
+	// 消除与 planner 的双监工重叠与开局双派竞态；如需启用自动巡检可显式设 ARTEX_ENABLE_CAMPAIGN_PATROL=1。
+	if envEnabledFlag("ARTEX_ENABLE_CAMPAIGN_PATROL") {
+		s.engine.SetCampaignOrchestrator(s.shouldKickoffCampaign, s.runCampaignPatrol)
+	}
 	// Global readiness (Ready()/llm_configured): a global active LLM provider is
 	// installed. Task-level runnability is separate (ReadyFor → the resolver above).
 	s.engine.SetReadiness(func() bool {

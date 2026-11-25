@@ -980,7 +980,8 @@ func (m *Manager) proxyRoEDeps() roeGateDeps {
 			if err != nil {
 				return nil, err
 			}
-			return scopeRulesFromRows(rows), nil
+			modeVal, _, _ := m.pg.GetSetting(settingRoEEnforcement)
+			return scopeRulesFromRowsForMode(rows, modeVal), nil
 		},
 		warn: m.recordProxyRoEWarn,
 	}
@@ -2064,13 +2065,24 @@ func (t *Task) NotifyDone(intentID int64) {
 // edit, or user intent cancellation) is pending so planner cooldown should not
 // delay this round.
 func (t *Task) hasUrgentWake() bool {
+	return t.hasImmediateWake(false)
+}
+
+// hasImmediateWake reports whether pending triggers require bypassing the
+// planner cooldown. When poolSaturated is true (all worker slots busy and open
+// intents already queued), "finding" behaves like "done" and coalesces into the
+// cooldown window unless an operator/explicit urgent signal is pending.
+func (t *Task) hasImmediateWake(poolSaturated bool) bool {
 	t.trigMu.Lock()
 	defer t.trigMu.Unlock()
 	if t.urgentNotify {
 		return true
 	}
 	for _, ev := range t.pendingTriggers {
-		if ev.Kind != "done" {
+		if ev.Kind != "done" && ev.Kind != "finding" {
+			return true
+		}
+		if ev.Kind == "finding" && !poolSaturated {
 			return true
 		}
 	}
@@ -2078,12 +2090,13 @@ func (t *Task) hasUrgentWake() bool {
 }
 
 // NotifyFinding records that a worker reported a finding on intentID (summary),
-// then wakes the planner — so the round spells out which intent found what.
+// then signals the planner — immediate when slots/frontier need attention,
+// coalesced during cooldown when workers are saturated with queued open intents.
 func (t *Task) NotifyFinding(intentID int64, summary string) {
 	t.trigMu.Lock()
 	t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "finding", IntentID: intentID, Detail: summary})
 	t.trigMu.Unlock()
-	t.Notify()
+	t.signalNotify()
 }
 
 // NotifyGoal records that one OR MORE goals were added in a single set_goals call —

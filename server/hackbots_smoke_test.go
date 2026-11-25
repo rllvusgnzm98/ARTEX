@@ -18,7 +18,7 @@ func TestHackbotsScriptSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	extract := filepath.Join(root, "js-endpoint-extraction", "scripts", "extract_endpoints.py")
+	extract := filepath.Join(root, "js-api-recon", "scripts", "regex", "extract_endpoints.py")
 	if _, err := os.Stat(extract); err != nil {
 		t.Skip("本树没有 Hackbots 脚本，跳过冒烟")
 	}
@@ -39,14 +39,14 @@ func TestHackbotsScriptSmoke(t *testing.T) {
 		t.Fatalf("extract_endpoints 未抽出端点:\n%s", out)
 	}
 
-	plan := filepath.Join(root, "api-fingerprint-caido", "scripts", "plan_http_fingerprint_probes.py")
+	plan := filepath.Join(root, "js-api-recon", "scripts", "caido", "plan_http_fingerprint_probes.py")
 	out = runSmoke(t, dir, py, plan, "https://example.com")
 	if !strings.Contains(out, "requires_user_authorization") || !strings.Contains(out, "banner-grabbing") {
 		t.Fatalf("指纹计划不像预期:\n%s", out)
 	}
 
 	missing := filepath.Join(dir, "no-such-caido-cli")
-	caido := filepath.Join(root, "api-fingerprint-caido", "scripts", "collect_caido_api_traffic.py")
+	caido := filepath.Join(root, "js-api-recon", "scripts", "caido", "collect_caido_api_traffic.py")
 	out, err = runSmokeRaw(dir, py, caido, "example.com", "--caido-cli", missing)
 	if err == nil {
 		t.Fatalf("Caido CLI 缺失时应失败，输出:\n%s", out)
@@ -60,7 +60,7 @@ func TestHackbotsScriptSmoke(t *testing.T) {
 		t.Log("未检测到 node，跳过 lazy chunk dry-run")
 		return
 	}
-	script := filepath.Join(root, "lazy-chunk-downloader", "scripts", "fetch_lazy_chunks.js")
+	script := filepath.Join(root, "js-api-recon", "scripts", "chunks", "fetch_lazy_chunks.js")
 	out = runSmoke(t, dir, node, script, "https://example.com/", "--dir", dir, "--dry-run")
 	if !strings.Contains(out, "static/js/vendor.chunk.js") {
 		t.Fatalf("dry-run 未列出 chunk:\n%s", out)

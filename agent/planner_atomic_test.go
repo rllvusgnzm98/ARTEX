@@ -13,15 +13,29 @@ import (
 func TestPlannerAddIntentRejectsBroadSweepAllowsAtomic(t *testing.T) {
 	_, store := retentionStore(t)
 	plannerTools := NewToolSet(store, "planner")
+	// Default (detached): planner is not blocked by broad-sweep keyword guard.
+	if id, err := plannerTools.addOneIntentCtx(context.Background(), intentItem{
+		Summary: "对账兜底收割未被覆盖题：先 GET challenges 再依次解题",
+	}); err != nil || id <= 0 {
+		t.Fatalf("default detached planner add_intent should succeed, got id=%d err=%v", id, err)
+	}
+
+	// Opt-in guard enabled: omnibus sweep intents are rejected while atomic intents pass.
+	t.Setenv("ARTEX_ENABLE_PLANNER_ATOMIC_GUARD", "1")
 	if _, err := plannerTools.addOneIntentCtx(context.Background(), intentItem{
 		Summary: "对账兜底收割未被覆盖题：先 GET challenges 再依次解题",
 	}); err == nil || !strings.Contains(err.Error(), "1 意图 = 1 个明确目标") {
-		t.Fatalf("planner omnibus sweep intent must be rejected, got err=%v", err)
+		t.Fatalf("planner omnibus sweep intent must be rejected when guard enabled, got err=%v", err)
 	}
 	if _, err := plannerTools.addOneIntentCtx(context.Background(), intentItem{
 		Summary: "从 hard 难度题切入高分区，自动挑题拿分",
 	}); err == nil {
-		t.Fatal("planner difficulty sweep intent must be rejected")
+		t.Fatal("planner difficulty sweep intent must be rejected when guard enabled")
+	}
+	if _, err := plannerTools.addOneIntentCtx(context.Background(), intentItem{
+		Summary: "TSecBench 滚动补位线（占未来空出的容器位）",
+	}); err == nil {
+		t.Fatal("planner rolling slot-filler sweep intent must be rejected when guard enabled")
 	}
 
 	// Single atomic target passes for planner.

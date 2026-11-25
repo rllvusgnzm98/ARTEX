@@ -725,6 +725,15 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	main.SetUAResolver(s.uaForTask) // WebFetch 与 worker 共用按任务稳定 UA
 	main.SetWebSearch(s.webSearchFor("mainagent"))
 	main.SetSteerWork(s.engine.SteerWork) // steer_work：人对运行中 work 实时纠偏
+	main.SetKillWork(s.engine.killWorkAttributed)
+	main.SetTodoResolver(pl.TodoFor)
+	main.SetGuardResolver(func(tid int64) harness.HookRunner {
+		if task, ok := s.m.Task(strconv.FormatInt(tid, 10)); ok && task != nil && task.Guard != nil {
+			return task.Guard.Hooks()
+		}
+		return nil
+	})
+	main.SetConstraintInject(s.constraintInjectPlanner)
 	bundle := &taskAgentBundle{
 		runtime: goalRuntime, plannerRuntime: plannerRuntime, workerRuntime: workerRuntime,
 		mainRuntime: mainRuntime, pl: pl, wk: wk, main: main,

@@ -55,11 +55,11 @@ func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 		return tools, nil
 	}
 	tools = append(tools, custom...)
-	// deferred custom tools → name -> its bound agent keys. ToolAugment turns a
-	// name into a deferred entry only for agents it's actually bound to (so we don't
-	// advertise a tool the per-agent binding will drop from the callable set).
+	// deferred tools (both custom & opted-in low-frequency builtins, excluding shell
+	// hints) → name -> bound agent keys. ToolAugment turns a name into a deferred
+	// entry only for agents it's actually bound to.
 	deferred := map[string][]string{}
-	rows, _ := s.m.pg.ListCustomTools()
+	rows, _ := s.m.pg.ListTools()
 	for _, t := range rows {
 		if t.Deferred && t.Enabled && t.Kind != "shell" {
 			deferred[t.Key] = t.Agents
@@ -497,6 +497,7 @@ func (s *Server) seedOrchestrationTools() {
 	s.refreshBuiltinToolSchemas()
 	s.seedAutoDefaultBindings()
 	s.seedPlannerDefaultBindings()
+	s.seedMainAgentLeadBindings()
 	s.seedPlannerListAssetsBinding()
 	s.seedCompanyScopeRebind()
 	s.seedWorkerReadToolsUnbind() // list_facts/list_companies/list_worker_traces 从 worker 默认解绑(一次性)
@@ -512,9 +513,55 @@ func (s *Server) seedOrchestrationTools() {
 	s.upgradeReporterTriggerMessage() // 老库补迁移:让 reporter 回传 evidence_version(一次性)
 	s.seedFindingTrafficTools()       // 增加可选证据参数及只读证据工具，保留用户配置
 	s.seedFindingWorkflowTools()
+	s.migrateToolDeferredAndArsenalHints() // 低频内置工具折叠 deferred + 军火库 CLI 提示与 mainagent 绑定(一次性)
 	// 注：pentest 的默认工具绑定无需迁移——BuiltinToolSeeds 在全新初始化时就把
 	// list_assets/insert_assets/report_finding/list_findings/list_companies 连同
 	// pentest 一起 seed 好了（项目尚无旧库，不做迁移）。
+}
+
+func (s *Server) migrateToolDeferredAndArsenalHints() {
+	const flag = "tools_deferred_arsenal_v1"
+	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
+		return
+	}
+	defer func() { _ = s.m.pg.SetSetting(flag, "true") }()
+	// 1. 折叠极低频内置高阶验证/投递工具 schema（仍保留在 worker 绑定中，按需经 SearchExtraTools/ExecuteExtraTool 调用）
+	if _, err := s.m.pg.Exec(`
+UPDATE tools SET deferred = true, updated_at = now()
+WHERE key IN ('dual_account_verify', 'patch_verify', 'stage_share')`); err != nil {
+		log.Printf("[tools] 折叠低频内置工具 deferred 失败: %v", err)
+	}
+	// 2. 补充 data/tools/ 已落地的军火库 CLI 声明（fscan/gogo/naabu），供 Bash 说明动态按 PATH 检测后提示给 agent
+	arsenalAgents := []string{"worker", "pentest", "mainagent"}
+	for _, item := range []struct {
+		key  string
+		desc string
+	}{
+		{"fscan", "用于已授权内网综合扫描（端口、常见服务指纹、弱口令与已知组件检测）。Bash 说明里已列出时优先用它，不要在内网手写 Python 端口/服务扫描循环。"},
+		{"gogo", "用于已授权内网高速端口扫描与精细服务指纹识别。Bash 说明里已列出时优先用它，不要手写端口探测循环。"},
+		{"naabu", "用于已授权目标的高速全端口发现。Bash 说明里已列出时优先用它快速摸清开放端口，再交由 nmap/httpx 深化识别。"},
+	} {
+		_ = s.m.pg.SeedCustomTool(&db.Tool{
+			Key:         item.key,
+			Description: item.desc,
+			Schema:      json.RawMessage(`{}`),
+			Agents:      arsenalAgents,
+			Enabled:     true,
+			Kind:        "shell",
+			Deferred:    false,
+		})
+	}
+	// 3. 让 mainagent 同样能看到已安装的 shell CLI 提示（便于主 Agent 自由参与解题时优先调用专业安全工具）
+	if _, err := s.m.pg.Exec(`
+UPDATE tools
+SET agents = (
+  SELECT jsonb_agg(DISTINCT elem)
+  FROM jsonb_array_elements_text(COALESCE(agents, '[]'::jsonb) || '["mainagent"]'::jsonb) AS elem
+), updated_at = now()
+WHERE kind = 'shell' AND enabled = true AND NOT (COALESCE(agents, '[]'::jsonb) @> '["mainagent"]'::jsonb)`); err != nil {
+		log.Printf("[tools] 补绑 mainagent shell hints 失败: %v", err)
+	}
+	log.Printf("[tools] 已完成低频工具 deferred 折叠、军火库 shell 提示补录与 mainagent 绑定(一次性)")
 }
 
 // refreshBuiltinToolSchemas propagates code schema/description changes on the
@@ -608,7 +655,7 @@ func (s *Server) reseedGoalsPrompt() {
 // 保留在历史里,用户若自定义过可从版本记录找回。settings flag 守卫 → 只做一次。全新库无需处理
 // (SeedPromptIfEmpty 已 seed 最新默认)。与 reseedGoalsPrompt 完全同构。
 func (s *Server) reseedMainAgentPrompt() {
-	const flag = "mainagent_prompt_campaign_v2"
+	const flag = "mainagent_prompt_redteam_v4"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
@@ -632,11 +679,11 @@ func (s *Server) reseedMainAgentPrompt() {
 		log.Printf("[prompts] mainagent 提示词重刷为新默认失败: %v", err)
 		return
 	}
-	log.Printf("[prompts] mainagent 提示词已追加新默认版本(加入战役总控巡检职责,一次性)")
+	log.Printf("[prompts] mainagent 提示词已升级为红队队长直通指挥席默认版本(一次性)")
 }
 
 func (s *Server) reseedPlannerPrompt() {
-	const flag = "planner_prompt_atomic_trace_waf_v3"
+	const flag = "planner_prompt_redteam_v5"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
@@ -660,11 +707,11 @@ func (s *Server) reseedPlannerPrompt() {
 		log.Printf("[prompts] planner 提示词重刷为新默认失败: %v", err)
 		return
 	}
-	log.Printf("[prompts] planner 提示词已追加新默认版本(单目标原子粒度+强制看trace+WAF403绕行,一次性)")
+	log.Printf("[prompts] planner 提示词已升级为红队队长条令版本(严禁盲盒自调度+禁止空刷待办,一次性)")
 }
 
 func (s *Server) reseedWorkerPrompt() {
-	const flag = "worker_prompt_milestone_stoploss_v5"
+	const flag = "worker_prompt_redteam_v7"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
@@ -688,7 +735,7 @@ func (s *Server) reseedWorkerPrompt() {
 		log.Printf("[prompts] worker 提示词重刷为新默认失败: %v", err)
 		return
 	}
-	log.Printf("[prompts] worker 提示词已追加新默认版本(去掉碎片写回催促+里程碑续期指引,一次性)")
+	log.Printf("[prompts] worker 提示词已升级为红队突击手默认版本(单目标纪律+Signal门禁+技能引导,一次性)")
 }
 
 // reporterToolCallMessage 必须无条件要求先读一次 get_finding_traffic 再写报告。
@@ -811,6 +858,21 @@ func (s *Server) seedPlannerDefaultBindings() {
 	}
 	if err := s.m.pg.AddAgentToToolBinding("planner", []string{"report_finding"}); err != nil {
 		log.Printf("[planner] report_finding 默认绑定失败: %v", err)
+		return
+	}
+	_ = s.m.pg.SetSetting(flag, "true")
+}
+
+// seedMainAgentLeadBindings backfills kill_work / prove_goal / list_goals onto
+// mainagent ONCE on existing DBs so the unified Red Team command seat shares
+// the planner's authority.
+func (s *Server) seedMainAgentLeadBindings() {
+	const flag = "mainagent_lead_tools_v1"
+	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
+		return
+	}
+	if err := s.m.pg.AddAgentToToolBinding("mainagent", []string{"kill_work", "prove_goal", "list_goals"}); err != nil {
+		log.Printf("[mainagent] 红队指挥工具绑定失败: %v", err)
 		return
 	}
 	_ = s.m.pg.SetSetting(flag, "true")

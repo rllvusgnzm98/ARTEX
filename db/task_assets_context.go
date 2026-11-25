@@ -37,6 +37,13 @@ target AS (
        ))
   )
   JOIN context_tasks ctx ON ctx.task_id=ts.task_id
+  WHERE NOT EXISTS (
+    SELECT 1 FROM task_scope ex
+    JOIN context_tasks ex_ctx ON ex_ctx.task_id = ex.task_id
+    WHERE (ex.kind='exclude_root_domain' AND (a.root_domain = ex.domain OR a.domain = ex.domain OR a.domain LIKE '%.' || ex.domain))
+       OR (ex.kind='exclude_subdomain'   AND a.domain = ex.domain)
+       OR (ex.kind IN ('exclude_ip','exclude_cidr') AND (ex.net >>= try_inet(a.ip) OR ex.net >>= try_inet(a.domain)))
+  )
 	UNION
 	SELECT a.id, a.type,
 	       COALESCE(a.url, a.domain, a.ip, a.app_name, a.root_domain, '') AS label
@@ -86,6 +93,13 @@ target AS (
        ))
   )
   JOIN context_tasks ctx ON ctx.task_id=ts.task_id
+  WHERE NOT EXISTS (
+    SELECT 1 FROM task_scope ex
+    JOIN context_tasks ex_ctx ON ex_ctx.task_id = ex.task_id
+    WHERE (ex.kind='exclude_root_domain' AND (a.root_domain = ex.domain OR a.domain = ex.domain OR a.domain LIKE '%.' || ex.domain))
+       OR (ex.kind='exclude_subdomain'   AND a.domain = ex.domain)
+       OR (ex.kind IN ('exclude_ip','exclude_cidr') AND (ex.net >>= try_inet(a.ip) OR ex.net >>= try_inet(a.domain)))
+  )
 )`
 
 // ListTaskScopeWithSources returns the current task's scope followed by the

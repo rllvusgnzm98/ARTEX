@@ -26,10 +26,15 @@ func ModelRetriesStopped(ctx context.Context) bool {
 }
 
 type budgetExtension struct {
-	mu       sync.Mutex
-	bonus    time.Duration
-	maxBonus time.Duration
+	mu             sync.Mutex
+	bonus          time.Duration
+	maxBonus       time.Duration
+	frozen         bool
+	progressBonus  time.Duration
+	lastProgressAt time.Time
 }
+
+const workerProgressExtendCooldown = 5 * time.Minute
 
 type runBudget struct {
 	work, hard time.Time
@@ -64,6 +69,9 @@ func (b runBudget) extend(delta time.Duration) (added, total time.Duration) {
 	}
 	b.ext.mu.Lock()
 	defer b.ext.mu.Unlock()
+	if b.ext.frozen {
+		return 0, b.ext.bonus
+	}
 	rem := b.ext.maxBonus - b.ext.bonus
 	if rem <= 0 {
 		return 0, b.ext.bonus
@@ -73,6 +81,16 @@ func (b runBudget) extend(delta time.Duration) (added, total time.Duration) {
 	}
 	b.ext.bonus += delta
 	return delta, b.ext.bonus
+}
+
+func freezeRunBudgetExtension(ctx context.Context) {
+	b, ok := ctx.Value(runBudgetKey{}).(runBudget)
+	if !ok || b.ext == nil {
+		return
+	}
+	b.ext.mu.Lock()
+	b.ext.frozen = true
+	b.ext.mu.Unlock()
 }
 
 func enableRunBudgetExtension(ctx context.Context, maxBonus time.Duration) context.Context {
@@ -90,6 +108,45 @@ func extendRunBudgetFromContext(ctx context.Context, delta time.Duration) (time.
 		return 0, 0
 	}
 	return b.extend(delta)
+}
+
+// ExtendWorkerProgressFromContext grants a bounded, cooldown-gated run budget
+// extension when a worker achieves high-signal concrete progress (e.g. a live
+// session foothold or observed evidence), capped at maxBonus/2 in total.
+func ExtendWorkerProgressFromContext(ctx context.Context, delta time.Duration) (time.Duration, time.Duration) {
+	return extendWorkerProgressAt(ctx, delta, time.Now())
+}
+
+func extendWorkerProgressAt(ctx context.Context, delta time.Duration, now time.Time) (time.Duration, time.Duration) {
+	b, ok := ctx.Value(runBudgetKey{}).(runBudget)
+	if !ok || b.ext == nil || delta <= 0 {
+		return 0, 0
+	}
+	b.ext.mu.Lock()
+	defer b.ext.mu.Unlock()
+	if b.ext.frozen {
+		return 0, b.ext.bonus
+	}
+	progressCap := b.ext.maxBonus / 2
+	if progressCap <= 0 {
+		return 0, b.ext.bonus
+	}
+	if !b.ext.lastProgressAt.IsZero() && now.Sub(b.ext.lastProgressAt) < workerProgressExtendCooldown {
+		return 0, b.ext.bonus
+	}
+	remTotal := b.ext.maxBonus - b.ext.bonus
+	remProgress := progressCap - b.ext.progressBonus
+	rem := min(remTotal, remProgress)
+	if rem <= 0 {
+		return 0, b.ext.bonus
+	}
+	if delta > rem {
+		delta = rem
+	}
+	b.ext.bonus += delta
+	b.ext.progressBonus += delta
+	b.ext.lastProgressAt = now
+	return delta, b.ext.bonus
 }
 
 func withRunBudget(ctx context.Context, start time.Time, total, reserve time.Duration) (context.Context, time.Duration) {

@@ -21,22 +21,58 @@ import (
 	"github.com/Autumn-27/artex/guard"
 )
 
-// scopeRulesFromRows 把官方 task_scope 行归一成 ScopeMatcher 规则。
-// RoE 出界判定与 pending_scope 发现侧共用此函数。pending_scope 本身仍是
-// 范围扩张队列,不是出界行动硬闸。
+// scopeRulesFromRows 把官方 task_scope 行归一成 ScopeMatcher 规则（warn 默认语义）。
+// RoE 出界判定应优先使用带模式的 scopeRulesFromRowsForMode，strict 下忽略 auto/agent 扩权行。
 func scopeRulesFromRows(rows []db.TaskScope) []guard.ScopeRule {
+	return scopeRulesFromRowsForMode(rows, "warn")
+}
+
+// scopeRulesFromRowsForMode normalizes task_scope rows into guard ScopeRules for
+// a given RoE mode. In strict mode, agent/auto-discovered inclusion rows cannot
+// widen the authorized boundary (only manual/empty-source inclusions are trusted),
+// while exclusion rules apply unconditionally.
+func scopeRulesFromRowsForMode(rows []db.TaskScope, mode string) []guard.ScopeRule {
+	strict := normalizeRoEMode(mode) == "strict"
 	out := make([]guard.ScopeRule, 0, len(rows))
 	for _, r := range rows {
 		switch r.Kind {
-		case "root_domain", "subdomain":
+		case "exclude_root_domain":
+			if r.Domain != "" {
+				out = append(out, guard.ScopeRule{Kind: "domain", Value: r.Domain, Exclude: true})
+			}
+		case "exclude_subdomain":
+			if r.Domain != "" {
+				out = append(out, guard.ScopeRule{Kind: "exact_domain", Value: r.Domain, Exclude: true})
+			}
+		case "exclude_ip", "exclude_cidr":
+			if r.Net != "" {
+				out = append(out, guard.ScopeRule{Kind: "cidr", Value: r.Net, Exclude: true})
+			}
+		case "root_domain":
+			if strict && (r.Source == "auto" || r.Source == "agent") {
+				continue
+			}
 			if r.Domain != "" {
 				out = append(out, guard.ScopeRule{Kind: "domain", Value: r.Domain})
 			}
+		case "subdomain":
+			if strict && (r.Source == "auto" || r.Source == "agent") {
+				continue
+			}
+			if r.Domain != "" {
+				out = append(out, guard.ScopeRule{Kind: "exact_domain", Value: r.Domain})
+			}
 		case "ip", "cidr":
+			if strict && (r.Source == "auto" || r.Source == "agent") {
+				continue
+			}
 			if r.Net != "" {
 				out = append(out, guard.ScopeRule{Kind: "cidr", Value: r.Net})
 			}
 		case "icp":
+			if strict && (r.Source == "auto" || r.Source == "agent") {
+				continue
+			}
 			if r.Value != "" {
 				out = append(out, guard.ScopeRule{Kind: "icp", Value: r.Value})
 			}

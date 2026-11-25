@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -446,5 +447,16 @@ func TestInsertAssetsRejectsHostnameIPPerItem(t *testing.T) {
 	}
 	if stored != 0 {
 		t.Fatalf("rejected hostname still stored in assets.ip (%d rows)", stored)
+	}
+	if ts.Writes().Assets != 2 || ts.Writes().Failures != 0 {
+		t.Fatalf("client input validation error must not increment Failures: got %+v", ts.Writes())
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if !isAssetStorageFailure(cancelled, errors.New("domain is required")) {
+		t.Fatal("cancelled context must still be treated as storage failure")
+	}
+	if !isAssetStorageFailure(context.Background(), errors.New("connection refused")) {
+		t.Fatal("DB/connection error must be treated as storage failure")
 	}
 }

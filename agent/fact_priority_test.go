@@ -249,3 +249,56 @@ func TestReportFindingRequiresAndFallsBackName(t *testing.T) {
 		t.Fatalf("explicit finding name=%q, want 'Explicit Finding Title'", name2)
 	}
 }
+
+func TestRecordFactInheritsIntentAssetAnchorsWhenOmitted(t *testing.T) {
+	d, es := retentionStore(t)
+	a1, err := d.Assets().UpsertSubdomain(db.UpsertSubdomainReq{Domain: "inherit1.acme.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a2, err := d.Assets().UpsertSubdomain(db.UpsertSubdomainReq{Domain: "explicit2.acme.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM assets WHERE id IN ($1, $2)`, a1, a2)
+
+	intentID, err := es.AddIntent(map[string]any{"summary": "audit inherit1.acme.test"}, 5, []int64{a1}, "planner")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ts := NewToolSet(es, "worker")
+	// 1. Omitting asset_ids inherits intentID's exploration_anchors ([a1]).
+	fInherited, err := ts.recordOneFactCtx(t.Context(), factItem{
+		Summary:    "inherit1.acme.test 返回 500 堆栈",
+		Confidence: "observed",
+		Category:   "negative_result",
+	}, intentID)
+	if err != nil {
+		t.Fatalf("recordOneFactCtx inherited failed: %v", err)
+	}
+	anchors, err := es.NodeAssets([]int64{fInherited})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(anchors[fInherited]) != 1 || anchors[fInherited][0] != a1 {
+		t.Fatalf("inherited anchors=%v, want [%d]", anchors[fInherited], a1)
+	}
+
+	// 2. Explicit asset_ids override intent anchor inheritance.
+	fExplicit, err := ts.recordOneFactCtx(t.Context(), factItem{
+		Summary:    "explicit2.acme.test 关联测试",
+		Confidence: "observed",
+		AssetIDs:   []json.RawMessage{json.RawMessage(fmt.Sprintf("%d", a2))},
+	}, intentID)
+	if err != nil {
+		t.Fatalf("recordOneFactCtx explicit failed: %v", err)
+	}
+	anchors2, err := es.NodeAssets([]int64{fExplicit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(anchors2[fExplicit]) != 1 || anchors2[fExplicit][0] != a2 {
+		t.Fatalf("explicit anchors=%v, want [%d]", anchors2[fExplicit], a2)
+	}
+}

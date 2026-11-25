@@ -16,7 +16,7 @@ import (
 type TaskScope struct {
 	ID        int64  `json:"id"`
 	TaskID    int64  `json:"task_id"`
-	Kind      string `json:"kind"` // company|root_domain|subdomain|ip|cidr|icp|keyword
+	Kind      string `json:"kind"` // company|root_domain|subdomain|ip|cidr|icp|keyword|exclude_root_domain|exclude_subdomain|exclude_ip|exclude_cidr
 	CompanyID *int64 `json:"company_id,omitempty"`
 	// CompanyName is resolved for kind=company so callers can label a scope row
 	// without a second lookup. Empty when the row is not a company reference.
@@ -80,7 +80,11 @@ func (s *AssetStore) upsertTaskScopeResult(ts TaskScope) (bool, error) {
 	query := `
 INSERT INTO task_scope(task_id, kind, company_id, domain, net, value, source, reason)
 VALUES ($1,$2,$3,$4,$5::cidr,$6,$7,NULLIF($8,''))
-ON CONFLICT DO NOTHING`
+ON CONFLICT (task_id, kind, COALESCE(domain,''), COALESCE(net::text,''), COALESCE(company_id,0), COALESCE(value,''))
+DO UPDATE SET
+    source = 'manual',
+    reason = COALESCE(NULLIF(EXCLUDED.reason,''), task_scope.reason)
+WHERE EXCLUDED.source = 'manual' AND task_scope.source <> 'manual'`
 	var (
 		result sql.Result
 		err    error
@@ -195,19 +199,34 @@ func (s *AssetStore) AddAgentScopeCtx(ctx context.Context, taskID int64, kind, v
 			return ts, fmt.Errorf("无效根域: %s", value)
 		}
 		ts.Domain = root
-	case "subdomain":
+	case "exclude_root_domain":
+		d := DomainKey(stripHostPort(value))
+		if d == "" {
+			return ts, fmt.Errorf("无效排除根域: %s", value)
+		}
+		ts.Domain = d
+	case "subdomain", "exclude_subdomain":
 		d := DomainKey(stripHostPort(value))
 		if d == "" {
 			return ts, fmt.Errorf("无效子域: %s", value)
 		}
 		ts.Domain = d
-	case "ip", "cidr":
+	case "ip", "cidr", "exclude_ip", "exclude_cidr":
+		isExclude := strings.HasPrefix(kind, "exclude_")
 		v := value
 		if !strings.Contains(v, "/") {
 			v = ipToHostCIDR(stripHostPort(v))
-			ts.Kind = "ip"
+			if isExclude {
+				ts.Kind = "exclude_ip"
+			} else {
+				ts.Kind = "ip"
+			}
 		} else {
-			ts.Kind = "cidr"
+			if isExclude {
+				ts.Kind = "exclude_cidr"
+			} else {
+				ts.Kind = "cidr"
+			}
 		}
 		if v == "" {
 			return ts, fmt.Errorf("无效 ip/cidr: %s", value)
@@ -223,7 +242,7 @@ func (s *AssetStore) AddAgentScopeCtx(ctx context.Context, taskID int64, kind, v
 		}
 		ts.Value = parsed.Value
 	default:
-		return ts, fmt.Errorf("不支持的 kind: %s（company/root_domain/subdomain/ip/cidr/icp/keyword）", kind)
+		return ts, fmt.Errorf("不支持的 kind: %s（company/root_domain/subdomain/ip/cidr/icp/keyword/exclude_root_domain/exclude_subdomain/exclude_ip/exclude_cidr）", kind)
 	}
 	if err := s.upsertTaskScope(ts); err != nil {
 		return ts, err
@@ -325,6 +344,14 @@ target AS (
          lower(regexp_replace(COALESCE(a.icp,''), '[[:space:]]+', '', 'g')) = ts.value
          OR lower(regexp_replace(COALESCE(a.app_icp,''), '[[:space:]]+', '', 'g')) = ts.value
        ))
+  )
+  WHERE NOT EXISTS (
+    SELECT 1 FROM task_scope ex
+    WHERE ex.task_id = $1 AND (
+         (ex.kind='exclude_root_domain' AND (a.root_domain = ex.domain OR a.domain = ex.domain OR a.domain LIKE '%.' || ex.domain))
+      OR (ex.kind='exclude_subdomain'   AND a.domain = ex.domain)
+      OR (ex.kind IN ('exclude_ip','exclude_cidr') AND ex.net >>= try_inet(a.ip))
+    )
   )
 ),
 tested AS (

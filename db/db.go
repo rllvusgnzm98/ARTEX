@@ -423,28 +423,19 @@ ON CONFLICT DO NOTHING`, r.kind, r.pattern, r.note); err != nil {
 	return d.SetSetting("asset_intercept_default_rules_v1", "done")
 }
 
-// builtinSkillVisibility maps a shipped skill's directory name → the built-in
-// agent keys that should see it by default. The skill FILES themselves live on the
-// filesystem (SkillDir, loaded by norma at runtime); DB only carries this visibility
-// binding. Skills omitted here (e.g. playwright-cli, scopesentry) ship invisible by
-// default — the user turns them on per-agent when needed. scopesentry additionally
-// declares `mcps: ScopeSentry`, which only takes effect once it's made visible and
-// that MCP is enabled/configured.
+// builtinSkillVisibility maps a normalized shipped skill's directory name → the
+// built-in agent keys that should see it by default.
 //
-// Hackbots Toolkit 落地的技能默认绑定如下。种子是 ON CONFLICT DO NOTHING，
-// 用户在页面关闭后，重启不会把绑定写回去。
-//
-//	auto + pentest + worker：js-endpoint-extraction、lazy-chunk-downloader、jshero、
-//	  content-discovery-wordlist、api-surface-recon（以及既有的 api-recon）
-//	pentest + auto：api-fingerprint-caido（依赖可选的本机 Caido，未启动时技能自己返回 blocked）
+// 归一化后的 5 个正交技能默认可见性：
+//   - worker：仅看单目标高频实战技能（js-api-recon / tbhm-app-analysis / playwright-cli）
+//   - mainagent / pentest / auto：全 5 个可见（含外部测绘 tbhm-recon 与 ScopeSentry 平台管理）
+//   - planner / goals / reporter / retester：不绑技能，保持轻量高速
 var builtinSkillVisibility = map[string][]string{
-	"api-recon":                  {"auto", "pentest", "worker"},
-	"api-surface-recon":          {"auto", "pentest", "worker"},
-	"content-discovery-wordlist": {"auto", "pentest", "worker"},
-	"js-endpoint-extraction":     {"auto", "pentest", "worker"},
-	"jshero":                     {"auto", "pentest", "worker"},
-	"lazy-chunk-downloader":      {"auto", "pentest", "worker"},
-	"api-fingerprint-caido":      {"pentest", "auto"},
+	"js-api-recon":      {"worker", "mainagent", "pentest", "auto"},
+	"tbhm-app-analysis": {"worker", "mainagent", "pentest", "auto"},
+	"playwright-cli":    {"worker", "mainagent", "pentest", "auto"},
+	"tbhm-recon":        {"mainagent", "pentest", "auto"},
+	"scopesentry":       {"mainagent", "pentest", "auto"},
 }
 
 // seedBuiltinSkillVisibility binds the shipped built-in skills to their default
@@ -460,6 +451,36 @@ ON CONFLICT (agent_id, skill_name) DO NOTHING`, key, skillName); err != nil {
 				return fmt.Errorf("skill %s → agent %s: %w", skillName, key, err)
 			}
 		}
+	}
+	// 一次性迁移：清理已归并的 7 个冗余旧技能可见性行、修正 worker 无关外网技能绑定，
+	// 并为 worker / mainagent / pentest 直绑内置 browser MCP（全局延迟可用，不再被 auto 独占）。
+	if v, _, _ := d.GetSetting("skill_mcp_visibility_norm_v1"); v != "done" {
+		if _, err := d.Exec(`
+DELETE FROM agent_skill_visibility
+WHERE skill_name IN (
+  'api-recon', 'api-surface-recon', 'api-fingerprint-caido',
+  'js-endpoint-extraction', 'jshero', 'lazy-chunk-downloader',
+  'content-discovery-wordlist'
+)`); err != nil {
+			return fmt.Errorf("cleanup legacy skills visibility: %w", err)
+		}
+		if _, err := d.Exec(`
+DELETE FROM agent_skill_visibility
+WHERE agent_id = (SELECT id FROM agents WHERE key = 'worker')
+  AND skill_name IN ('tbhm-recon', 'scopesentry')`); err != nil {
+			return fmt.Errorf("trim worker non-target skills: %w", err)
+		}
+		for _, agentKey := range []string{"worker", "mainagent", "pentest", "auto"} {
+			if _, err := d.Exec(`
+INSERT INTO agent_visibility(agent_id, resource_kind, resource_id, mcp_tool_name, enabled)
+SELECT a.id, 'mcp', m.id, '', true
+FROM agents a, mcp_servers m
+WHERE a.key = $1 AND m.name = 'browser'
+ON CONFLICT (agent_id, resource_kind, resource_id, mcp_tool_name) DO UPDATE SET enabled = true`, agentKey); err != nil {
+				return fmt.Errorf("bind browser mcp to %s: %w", agentKey, err)
+			}
+		}
+		_ = d.SetSetting("skill_mcp_visibility_norm_v1", "done")
 	}
 	return nil
 }

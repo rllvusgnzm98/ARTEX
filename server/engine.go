@@ -925,9 +925,13 @@ func (e *Engine) SetCampaignOrchestrator(shouldKickoff func(t *Task) bool, patro
 	e.campaignPatrol = patrol
 }
 
-func envCampaignDisabled() bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv("ARTEX_CAMPAIGN_DISABLED")))
+func envEnabledFlag(key string) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
 	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+func envCampaignDisabled() bool {
+	return envEnabledFlag("ARTEX_CAMPAIGN_DISABLED")
 }
 
 func (e *Engine) campaignInterval() time.Duration {
@@ -1155,14 +1159,21 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			if ctx.Err() != nil {
 				return false
 			}
-			if e.IsPaused(t.ID) || e.IsDeleting(t.ID) || e.isSettling(t.ID) || taskSupplyFrozen(t) || t.hasUrgentWake() {
+			open, oerr := -1, error(nil)
+			if t.Store != nil {
+				open, oerr = t.Store.CountOpenIntents()
+			}
+			saturated := false
+			if oerr == nil && open > 0 && t.Store != nil && e.m != nil && e.m.Workers() > 0 {
+				if running, rerr := t.Store.CountRunningIntents(); rerr == nil && running >= e.m.Workers() {
+					saturated = true
+				}
+			}
+			if e.IsPaused(t.ID) || e.IsDeleting(t.ID) || e.isSettling(t.ID) || taskSupplyFrozen(t) || t.hasImmediateWake(saturated) {
 				return true
 			}
-			if t.Store != nil {
-				open, err := t.Store.CountOpenIntents()
-				if err != nil || open == 0 {
-					return true
-				}
+			if t.Store != nil && (oerr != nil || open == 0) {
+				return true
 			}
 			rem := e.PlanCooldown() - time.Since(lastPlanAt)
 			if rem <= 0 {
@@ -1429,15 +1440,22 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	workCtx = intercept.WithTaskContext(workCtx, t.ID, label, taskEmit)
 	// nudges 有意建在 model_error 重跑循环之外:空转续跑的上限是「这条意图」的总量，
 	// 重跑一轮不该把额度清零重来。
-	loss := agent.NewStopLossMonitor(agent.DefaultStopLossPolicy())
-	hooks := agent.WrapStopLoss(steerHooks{
+	// 默认摘除 Stop-Loss 早期止损钩子（保留墙钟上限 + 里程碑续期 + 正常收尾），避免多步利用链
+	// 在突破前被空转计数误杀；如需恢复旧止损策略可显式设 ARTEX_ENABLE_STOPLOSS=1。
+	baseHooks := steerHooks{
 		inner:   t.Guard.Hooks(),
 		drain:   func() (string, bool) { return e.drainSteer(iid) },
 		pending: func() bool { return e.hasSteer(iid) },
 		nudges:  &atomic.Int64{},
 		limit:   e.emptyTurnNudgeLimit(),
 		label:   label,
-	}, loss)
+	}
+	var loss *agent.StopLossMonitor
+	var hooks harness.HookRunner = baseHooks
+	if envEnabledFlag("ARTEX_ENABLE_STOPLOSS") {
+		loss = agent.NewStopLossMonitor(agent.DefaultStopLossPolicy())
+		hooks = agent.WrapStopLoss(baseHooks, loss)
+	}
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)
 	var reason harness.TerminalReason
@@ -1752,7 +1770,7 @@ func taskExecutionPaused(cause error) bool {
 	}
 	switch abort.Code {
 	case "paused_by_user", "paused_by_orchestrator", "paused_on_reload", "paused_race_guard",
-		"queued_for_admission", "llm_unavailable_queued", "task_deleted":
+		"queued_for_admission", "llm_unavailable_queued", "task_deleted", "shutdown":
 		return true
 	default:
 		return false

@@ -30,6 +30,7 @@ func (w *Worker) recoverSettlement(ctx context.Context, previous *agentcore.Sess
 		return
 	}
 	b.hard = hard
+	freezeRunBudgetExtension(ctx)
 	b.ext = nil
 	start, before := time.Now(), tsx.Writes()
 	var calls atomic.Int64

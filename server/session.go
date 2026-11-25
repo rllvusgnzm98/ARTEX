@@ -241,6 +241,9 @@ func (s *Server) registerSessionTool() actool.CoreTool {
 			}
 			sh.SetID(id)
 			s.sessReg.Add(sh)
+			if added, total := agent.ExtendWorkerProgressFromContext(ctx, 5*time.Minute); added > 0 {
+				log.Printf("[session] task %d intent #%d 建立立足点会话，运行预算续期 +%s（累计 +%s）", ri.TaskID, ri.IntentID, added, total)
+			}
 			var assetID int64
 			if s.m != nil && s.m.Assets() != nil {
 				if aid, aerr := s.m.Assets().UpsertEndpoint(db.UpsertEndpointReq{

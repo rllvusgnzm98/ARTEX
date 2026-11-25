@@ -757,7 +757,7 @@ func (d *DB) IsPromptSystemManaged(agentID int64) (bool, error) {
 		return false, err
 	}
 	by := strings.TrimSpace(updatedBy.String)
-	return by == "" || by == "system", nil
+	return by == "" || by == "system" || strings.HasPrefix(by, "skill-fix-"), nil
 }
 
 // SeedPromptIfEmpty writes the code-default template as the agent's first prompt

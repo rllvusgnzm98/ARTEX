@@ -125,3 +125,29 @@ func TestExtractHostsIgnoresLocalFilenamesRedirectsAndDownstreamCode(t *testing.
 		}
 	}
 }
+
+func TestExtractHostsShellVarsAndNewReconCLIs(t *testing.T) {
+	cases := []struct {
+		name string
+		cmd  string
+		want []string
+	}{
+		{"ip with shell var suffix", `curl "http://10.0.173.80$u"`, []string{"10.0.173.80"}},
+		{"domain with brace var suffix", `curl "http://evil.com${path}"`, []string{"evil.com"}},
+		{"pure shell var url", `curl "http://$h/api"`, nil},
+		{"pure brace shell var host", `curl "http://${HOST}/api"`, nil},
+		{"bare shell var token", `nmap $TARGET`, nil},
+		{"naabu -host", `naabu -host sub.target.com -p 80,443`, []string{"sub.target.com"}},
+		{"fscan -h", `fscan -h 10.0.0.5 -p 80,443`, []string{"10.0.0.5"}},
+		{"gogo -i", `gogo -i 10.0.0.6 -p 80`, []string{"10.0.0.6"}},
+	}
+	for _, c := range cases {
+		got := ExtractHosts(c.cmd)
+		if len(got) == 0 {
+			got = nil
+		}
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: ExtractHosts(%q) = %v, want %v", c.name, c.cmd, got, c.want)
+		}
+	}
+}

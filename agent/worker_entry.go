@@ -71,6 +71,7 @@ type EntryGraph struct {
 	Edges          []db.Edge
 	Anchors        map[int64][]int64 // node id → asset ids
 	Assets         map[int64]string  // asset id → stable label
+	AssetTypes     map[int64]string  // asset id → asset type (ip/subdomain/service/...)
 	CompressErr    error
 	PrefetchErr    error
 }
@@ -205,8 +206,10 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 	}
 
 	intentAssets := uniqueIDs(append([]int64(nil), g.IntentAssetIDs...))
+	inferredIntentAssets := false
 	if len(intentAssets) == 0 && len(parentFacts) == 0 && g.Intent != nil && len(g.Assets) > 0 {
 		intentAssets = inferIntentAssetIDs(string(g.Intent.Payload), g.Assets)
+		inferredIntentAssets = true
 	}
 	anchorOf := func(id int64) []int64 {
 		if g.Anchors == nil {
@@ -279,6 +282,77 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 
 	seed.EmptyGraph = g.PrefetchErr == nil && !seed.GraphIncomplete && len(confirmed) == 0
 
+	ipNonIPPeers := map[int64]map[int64]bool{}
+	collectPeers := func(ids []int64) {
+		var ips, nonIPs []int64
+		for _, id := range uniqueIDs(ids) {
+			if isBareIPAsset(g, id) {
+				ips = append(ips, id)
+			} else {
+				nonIPs = append(nonIPs, id)
+			}
+		}
+		for _, ipID := range ips {
+			if ipNonIPPeers[ipID] == nil {
+				ipNonIPPeers[ipID] = map[int64]bool{}
+			}
+			for _, nid := range nonIPs {
+				ipNonIPPeers[ipID][nid] = true
+			}
+		}
+	}
+	for _, fv := range confirmed {
+		collectPeers(fv.assets)
+	}
+	for _, ids := range g.Anchors {
+		collectPeers(ids)
+	}
+	sharedIPs := map[int64]bool{}
+	for ipID, peers := range ipNonIPPeers {
+		if len(peers) >= 2 {
+			sharedIPs[ipID] = true
+		}
+	}
+
+	explicitIntentIPs := map[int64]bool{}
+	for _, id := range uniqueIDs(g.IntentAssetIDs) {
+		if isBareIPAsset(g, id) {
+			explicitIntentIPs[id] = true
+		}
+	}
+	hasNonIPTarget := false
+	for _, id := range intentAssets {
+		if !isBareIPAsset(g, id) {
+			hasNonIPTarget = true
+			break
+		}
+	}
+	if !hasNonIPTarget {
+		for fid := range parentFacts {
+			for _, id := range byID[fid].assets {
+				if !isBareIPAsset(g, id) {
+					hasNonIPTarget = true
+					break
+				}
+			}
+			if hasNonIPTarget {
+				break
+			}
+		}
+	}
+	// If intent_assets were inferred from text and already resolved non-IP hosts
+	// (e.g. "pay.acme.test (104.18.0.1)"), drop bare IP tokens from fallback matching
+	// so CDN/shared ingress IPs never cross-match sibling virtual hosts.
+	if inferredIntentAssets && hasNonIPTarget {
+		filtered := intentAssets[:0]
+		for _, id := range intentAssets {
+			if !isBareIPAsset(g, id) {
+				filtered = append(filtered, id)
+			}
+		}
+		intentAssets = filtered
+	}
+
 	relevant := map[int64]bool{}
 	intentRelevant := map[int64]bool{}
 	seedAnchors := map[int64]bool{}
@@ -314,16 +388,44 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 	}
 	// One expansion: confirmed facts that share an anchor with the seed set
 	// (prior-stage observations on a host this hop is continuing from).
-	for _, fv := range confirmed {
-		if overlapsSet(fv.assets, seedAnchors) {
-			mark(fv.node.ID, true)
+	// Isolate bare IPs that are shared across multiple VHosts (e.g. CDN/ALB) or
+	// collateral to a non-IP target unless the caller explicitly anchored that bare IP.
+	expandAnchors := map[int64]bool{}
+	for a := range seedAnchors {
+		if isBareIPAsset(g, a) && (hasNonIPTarget || sharedIPs[a]) && !explicitIntentIPs[a] {
+			continue
 		}
+		expandAnchors[a] = true
 	}
-	// Task-wide key facts (scope limits, negative results, cleanup status,
-	// evidence-bearing facts) are always included even when on other hosts,
-	// without widening seedAnchors or marking them intent-relevant.
+	intentAssetSet := map[int64]bool{}
+	for _, id := range intentAssets {
+		intentAssetSet[id] = true
+	}
 	for _, fv := range confirmed {
-		if isKeyFact(fv.category, fv.evidenceIDs) {
+		if !overlapsSet(fv.assets, expandAnchors) {
+			continue
+		}
+		if hasNonIPTarget {
+			var fvNonIPs []int64
+			for _, id := range fv.assets {
+				if !isBareIPAsset(g, id) {
+					fvNonIPs = append(fvNonIPs, id)
+				}
+			}
+			// If fv carries non-IP hosts (e.g. sibling VHost + shared IP), require
+			// at least one non-IP overlap so a shared IP never bridges unrelated VHosts.
+			if len(fvNonIPs) > 0 && !overlapsSet(fvNonIPs, expandAnchors) && !overlapsSet(fvNonIPs, intentAssetSet) {
+				continue
+			}
+		}
+		mark(fv.node.ID, true)
+	}
+	// Task-wide key facts: scope_limit (authorizations/global constraints) or
+	// unanchored task-root key facts (fromIntent==0) apply globally across all
+	// workers. Worker-yielded per-target cleanup_status / negative_result / evidence
+	// stay scoped to their lineage (parentFacts/siblingFacts) or anchored hosts.
+	for _, fv := range confirmed {
+		if isTaskGlobalKeyFact(fv.category, fv.evidenceIDs, fv.assets, fv.from) {
 			mark(fv.node.ID, false)
 		}
 	}
@@ -371,6 +473,9 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 	var hops []EntryTarget
 	for a := range seedAnchors {
 		if delivered[a] {
+			continue
+		}
+		if isBareIPAsset(g, a) && (hasNonIPTarget || sharedIPs[a]) && !explicitIntentIPs[a] {
 			continue
 		}
 		hops = append(hops, EntryTarget{
@@ -554,7 +659,7 @@ func LoadWorkerEntrySeed(ts *db.ExplorationStore, as *db.AssetStore, intent *db.
 
 // loadWorkerEntrySeedFrom is LoadWorkerEntrySeed reading through a shared snapshot.
 func loadWorkerEntrySeedFrom(ts *db.ExplorationStore, snap *graphSnapshot, as *db.AssetStore, intent *db.Node) WorkerEntrySeed {
-	g := EntryGraph{Intent: intent, Anchors: map[int64][]int64{}, Assets: map[int64]string{}}
+	g := EntryGraph{Intent: intent, Anchors: map[int64][]int64{}, Assets: map[int64]string{}, AssetTypes: map[int64]string{}}
 	if intent != nil {
 		g.IntentAssetIDs = intentAssetIDs(intent)
 	}
@@ -622,6 +727,7 @@ func loadWorkerEntrySeedFrom(ts *db.ExplorationStore, snap *graphSnapshot, as *d
 		for _, a := range assets {
 			if a != nil {
 				g.Assets[a.ID] = describeAsset(a)
+				g.AssetTypes[a.ID] = a.Type
 			}
 		}
 	}
@@ -666,6 +772,23 @@ func factPriorityFields(n *db.Node) (category string, evidenceIDs []string) {
 
 func isKeyFact(category string, evidenceIDs []string) bool {
 	return category != "" && category != "general" || len(evidenceIDs) > 0
+}
+
+func isTaskGlobalKeyFact(category string, evidenceIDs []string, assets []int64, fromIntent int64) bool {
+	if category == "scope_limit" {
+		return true
+	}
+	return len(assets) == 0 && fromIntent == 0 && isKeyFact(category, evidenceIDs)
+}
+
+func isBareIPAsset(g EntryGraph, id int64) bool {
+	if g.AssetTypes != nil {
+		if typ := strings.TrimSpace(g.AssetTypes[id]); typ != "" {
+			return typ == "ip"
+		}
+	}
+	lbl := strings.TrimSpace(g.Assets[id])
+	return lbl != "" && net.ParseIP(lbl) != nil
 }
 
 func assetLabelOf(labels map[int64]string, id int64) string {

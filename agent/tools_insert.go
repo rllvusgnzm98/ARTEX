@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -63,6 +64,38 @@ func assetInputLabel(item assetInputItem) string {
 		return fmt.Sprintf("[%s] %s", typ, target)
 	}
 	return target
+}
+
+func isAssetInputValidationErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, db.ErrAssetIPInvalid) {
+		return true
+	}
+	switch err.Error() {
+	case "domain is required",
+		"ip is required",
+		"app name is required",
+		"url is required",
+		"domain or ip is required",
+		"port is required",
+		"service_name is required",
+		"method is required":
+		return true
+	default:
+		return false
+	}
+}
+
+func isAssetStorageFailure(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return true
+	}
+	return !isAssetInputValidationErr(err)
 }
 
 // =====================================================================
@@ -347,7 +380,9 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 				}
 
 				if err != nil {
-					t.countWrites(WriteCounts{Failures: 1})
+					if isAssetStorageFailure(ctx, err) {
+						t.countWrites(WriteCounts{Failures: 1})
+					}
 					errs = append(errs, errEntry{Index: i, Error: err.Error()})
 					continue
 				}
@@ -375,7 +410,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 						summary = fmt.Sprintf("Worker 意图 #%d 通过 insert_assets 登记", t.ownerNode)
 					}
 					if err := t.as.SetTaskAssetSourceCtx(ctx, taskID, id, "agent", summary, sourceNodeID); err != nil {
-						t.countWrites(WriteCounts{Failures: 1})
+						log.Printf("[insert_assets] 资产 #%d 辅助元数据写入告警(task_asset_sources): %v", id, err)
 					}
 				}
 				// 自动入测试范围(source='auto')：只对 worker 顶层显式插入的这一项，按其
@@ -388,7 +423,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 						svcIP = item.IP
 					}
 					if err := t.as.AddAutoScopeCtx(ctx, taskID, typ, item.Domain, item.URL, svcIP); err != nil {
-						t.countWrites(WriteCounts{Failures: 1})
+						log.Printf("[insert_assets] 资产 #%d 辅助元数据写入告警(auto_scope): %v", id, err)
 					}
 				}
 			}
@@ -705,6 +740,10 @@ func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 		t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(), t.addHint(), t.addIntent(),
 		// steer_work：人可对某条正在运行的意图(work)实时注入纠偏指令（不打断、不丢进展）。
 		t.steerWorkTool(),
+		// kill_work / prove_goal / list_goals：红队队长直通指挥席与规划者共享的止损及目标验收权。
+		t.killWorkTool(),
+		t.proveGoal(),
+		t.listGoals(),
 		// set_goals：人可在运行时给本任务补一个新的最终目标（规划者据此重判是否达成）。
 		t.setGoals(),
 		// set_constraints：人可在运行时给本任务补/改操作约束（allow/deny），约束 planner/worker 的探索边界。

@@ -196,3 +196,40 @@ func TestPlannerNextHopDisciplineWording(t *testing.T) {
 		t.Fatalf("不得宣称读取侧已闭环:\n%s", got)
 	}
 }
+
+func TestRedTeamCommandSeatSharesPlannerWhiteboardAndTools(t *testing.T) {
+	// 1. MainAgentTools includes Red Team Lead authority tools alongside human ops.
+	names := map[string]bool{}
+	for _, tool := range NewToolSet(nil, "").MainAgentTools() {
+		names[tool.Name()] = true
+	}
+	for _, want := range []string{"kill_work", "prove_goal", "list_goals", "steer_work", "add_intent", "add_task_scope"} {
+		if !names[want] {
+			t.Errorf("MainAgentTools missing Red Team Lead tool %q", want)
+		}
+	}
+
+	// 2. Planner.TodoFor(expID) returns the exact shared TodoStore across command seat & planner.
+	p := NewPlanner(nil, "m", t.TempDir(), nil, 0, 0)
+	s1 := p.TodoFor(42)
+	s2 := p.TodoFor(42)
+	if s1 == nil || s1 != s2 {
+		t.Fatalf("TodoFor must return the same per-exploration whiteboard store")
+	}
+
+	// 3. Red Team doctrine wording checks on planner, worker, mainagent templates.
+	t.Cleanup(func() { PromptOverride = nil })
+	PromptOverride = nil
+	plan := plannerSystem("Auditing *.acme.com", "/data", "/data")
+	if !strings.Contains(plan, `严禁下发"让 worker 自己拉目标列表挑一个打`) || !strings.Contains(plan, "严禁调 TodoWrite 空刷清单") {
+		t.Errorf("planner prompt missing anti-self-scheduling or anti-TodoWrite-spam doctrine:\n%s", plan)
+	}
+	work := workerSystem("", "", "/data", "/data", false, DefaultFootprint())
+	if !strings.Contains(work, "一单只打一靶") || !strings.Contains(work, "Signal Gate") || !strings.Contains(work, "js-api-recon") {
+		t.Errorf("worker prompt missing Red Team operator / H1 Signal / Skill guidance:\n%s", work)
+	}
+	main := mainAgentSystem("Auditing *.acme.com", "/data", "/data")
+	if !strings.Contains(main, "红队队长") || !strings.Contains(main, "kill_work") {
+		t.Errorf("mainagent prompt missing Red Team command seat wording:\n%s", main)
+	}
+}

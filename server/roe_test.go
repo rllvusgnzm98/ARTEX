@@ -196,3 +196,80 @@ func TestRoENonTaskRunAllows(t *testing.T) {
 		t.Fatalf("存储未就绪应放行: msg=%q err=%v calls=%d", msg, err, calls)
 	}
 }
+
+func TestRoEStrictIgnoresAutoAndAgentScopeExpansionAndHonorsExclusions(t *testing.T) {
+	pg := openTestPG(t)
+	withRoEMode(t, pg, "strict")
+	task, err := pg.CreateTask("roe strict h1", "bounty isolation", nil, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	t.Cleanup(func() { _ = pg.DeleteTask(task.ID) })
+	as := pg.Assets()
+	if _, err := as.AddAgentScope(task.ID, "root_domain", "acme.test", "H1 program scope", "manual"); err != nil {
+		t.Fatalf("manual root_domain: %v", err)
+	}
+	if _, err := as.AddAgentScope(task.ID, "exclude_subdomain", "blog.acme.test", "H1 out-of-scope", "manual"); err != nil {
+		t.Fatalf("manual exclude_subdomain: %v", err)
+	}
+	// Simulate worker insert_assets auto-scope and agent add_task_scope attempting to widen into evil.other.test.
+	if err := as.AddAutoScope(task.ID, "subdomain", "evil.other.test", "", ""); err != nil {
+		t.Fatalf("AddAutoScope: %v", err)
+	}
+	if _, err := as.AddAgentScope(task.ID, "subdomain", "agent-added.other.test", "discovered in JS", "agent"); err != nil {
+		t.Fatalf("agent AddAgentScope: %v", err)
+	}
+
+	s := &Server{m: &Manager{pg: pg, assets: as}}
+	ctx := agent.WithRunInfo(context.Background(), agent.RunInfo{TaskID: task.ID})
+	cfg := newRoEConfig(pg)
+	rules, err := cfg.Scope(task.ID)
+	if err != nil {
+		t.Fatalf("cfg.Scope: %v", err)
+	}
+	matcher := guard.NewScopeMatcher(rules)
+	if got := matcher.Check("api.acme.test"); got != guard.ScopeIn {
+		t.Fatalf("manual root_domain child should be ScopeIn, got %v", got)
+	}
+	if got := matcher.Check("blog.acme.test"); got != guard.ScopeOut {
+		t.Fatalf("excluded subdomain should be ScopeOut, got %v", got)
+	}
+	if got := matcher.Check("evil.other.test"); got != guard.ScopeOut {
+		t.Fatalf("auto-scoped domain must stay ScopeOut in strict mode, got %v", got)
+	}
+	if got := matcher.Check("agent-added.other.test"); got != guard.ScopeOut {
+		t.Fatalf("agent-scoped domain must stay ScopeOut in strict mode, got %v", got)
+	}
+
+	// Verify roeCheckHost and proxyRoEDeps agree.
+	if msg, err := s.roeCheckHost(ctx, "api.acme.test", "target"); err != nil || msg != "" {
+		t.Fatalf("api.acme.test should pass: msg=%q err=%v", msg, err)
+	}
+	for _, blockedHost := range []string{"blog.acme.test", "evil.other.test", "agent-added.other.test"} {
+		if _, err := s.roeCheckHost(ctx, blockedHost, "target"); err == nil {
+			t.Errorf("%s should be blocked in strict mode", blockedHost)
+		}
+	}
+	tp := &taskProxyManager{}
+	tp.useRoE(s.m.proxyRoEDeps())
+	gate := tp.hostGate(task.ID)
+	if err := gate("api.acme.test"); err != nil {
+		t.Errorf("proxy gate should allow api.acme.test: %v", err)
+	}
+	if err := gate("evil.other.test"); err == nil {
+		t.Errorf("proxy gate should block auto-scoped evil.other.test in strict mode")
+	}
+
+	// Manual approval of subdomain grants exact access (while still rejecting its children).
+	if _, err := as.AddAgentScope(task.ID, "subdomain", "evil.other.test", "operator approved", "manual"); err != nil {
+		t.Fatalf("manual approve subdomain: %v", err)
+	}
+	s.m.InvalidateProxyRoE(task.ID)
+	tp.invalidateRoE(task.ID)
+	if _, err := s.roeCheckHost(ctx, "evil.other.test", "target"); err != nil {
+		t.Fatalf("manually approved subdomain should pass: %v", err)
+	}
+	if _, err := s.roeCheckHost(ctx, "deep.evil.other.test", "target"); err == nil {
+		t.Fatalf("manual subdomain must match exact host, not child deep.evil.other.test")
+	}
+}

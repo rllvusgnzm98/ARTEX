@@ -121,3 +121,56 @@ func TestScopeMatcherLocalOption(t *testing.T) {
 		t.Errorf("AllowLocal=false 时 127.0.0.1 应走范围匹配, got %v", got)
 	}
 }
+
+func TestScopeMatcherExclusionsAndExactDomain(t *testing.T) {
+	// HackerOne typical pattern: *.acme.com + exclude blog.acme.com / *.status.acme.com + exact_domain partner.other.com.
+	m := NewScopeMatcher([]ScopeRule{
+		{Kind: "domain", Value: "acme.com"},
+		{Kind: "exact_domain", Value: "partner.other.com"},
+		{Kind: "cidr", Value: "10.10.0.0/16"},
+		{Kind: "exact_domain", Value: "blog.acme.com", Exclude: true},
+		{Kind: "domain", Value: "status.acme.com", Exclude: true},
+		{Kind: "cidr", Value: "10.10.99.0/24", Exclude: true},
+	})
+	cases := []struct {
+		host string
+		want ScopeVerdict
+	}{
+		{"acme.com", ScopeIn},
+		{"api.acme.com", ScopeIn},
+		{"blog.acme.com", ScopeOut},           // excluded exact host
+		{"v2.blog.acme.com", ScopeIn},         // exact exclude only excludes blog.acme.com
+		{"status.acme.com", ScopeOut},         // excluded subtree root
+		{"api.status.acme.com", ScopeOut},     // excluded subtree child
+		{"partner.other.com", ScopeIn},        // exact_domain match
+		{"dev.partner.other.com", ScopeOut},   // exact_domain must NOT match subdomains
+		{"other.com", ScopeOut},               // exact_domain must NOT match parent
+		{"10.10.1.5", ScopeIn},                // included CIDR
+		{"10.10.99.5", ScopeOut},              // excluded CIDR overrides included CIDR
+		{"127.0.0.1", ScopeIn},                // AllowLocal still passes unless excluded
+	}
+	for _, c := range cases {
+		if got := m.Check(c.host); got != c.want {
+			t.Errorf("Check(%q) = %v, want %v", c.host, got, c.want)
+		}
+	}
+
+	// Exclusion-only rules: excluded hosts return ScopeOut, unrelated return ScopeUnknown.
+	exclOnly := NewScopeMatcher([]ScopeRule{
+		{Kind: "exclude_root_domain", Value: "outofscope.com"},
+		{Kind: "exclude_subdomain", Value: "bad.target.com"},
+		{Kind: "exclude_ip", Value: "127.0.0.1"},
+	})
+	if got := exclOnly.Check("sub.outofscope.com"); got != ScopeOut {
+		t.Errorf("exclusion-only domain Check = %v, want ScopeOut", got)
+	}
+	if got := exclOnly.Check("bad.target.com"); got != ScopeOut {
+		t.Errorf("exclusion-only exact Check = %v, want ScopeOut", got)
+	}
+	if got := exclOnly.Check("127.0.0.1"); got != ScopeOut {
+		t.Errorf("exclusion must override AllowLocal: got %v, want ScopeOut", got)
+	}
+	if got := exclOnly.Check("allowed.target.com"); got != ScopeUnknown {
+		t.Errorf("non-excluded with no inclusion rules = %v, want ScopeUnknown", got)
+	}
+}

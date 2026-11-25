@@ -215,3 +215,43 @@ func TestBootstrapAdmissionClearsQueuedPauseBarrier(t *testing.T) {
 		t.Fatal("bootstrap admission left the queued task behind the pause barrier")
 	}
 }
+
+func TestShutdownCancellationReturnsRunningIntentToFrontier(t *testing.T) {
+	if !taskExecutionPaused(agent.AbortShutdown) {
+		t.Fatal("shutdown cancellation must return an in-flight intent to open for seamless resume")
+	}
+	if taskExecutionPaused(agent.AbortRunHardTimeout) {
+		t.Fatal("run hard timeout must not be misclassified as a task pause")
+	}
+}
+
+func TestTaskImmediateWakeWithSaturatedPool(t *testing.T) {
+	task := &Task{ID: "t1", notify: make(chan struct{}, 1)}
+
+	// NotifyFinding uses signalNotify, so when saturated only finding/done coalesce.
+	task.NotifyFinding(10, "sqli")
+	if task.hasImmediateWake(true) {
+		t.Fatal("finding wake must coalesce into cooldown when worker pool is saturated")
+	}
+	if !task.hasImmediateWake(false) {
+		t.Fatal("finding wake must bypass cooldown when worker slots are not saturated")
+	}
+
+	task.NotifyDone(11)
+	if task.hasImmediateWake(true) {
+		t.Fatal("done + finding must stay coalesced when worker pool is saturated")
+	}
+
+	// Goal/hint updates or explicit Notify still wake immediately even when saturated.
+	task.NotifyGoal([]string{"new goal"})
+	if !task.hasImmediateWake(true) {
+		t.Fatal("goal change must bypass cooldown even when saturated")
+	}
+
+	task2 := &Task{ID: "t2", notify: make(chan struct{}, 1)}
+	task2.NotifyFinding(12, "rce")
+	task2.Notify()
+	if !task2.hasImmediateWake(true) {
+		t.Fatal("explicit Notify() must bypass cooldown even when saturated")
+	}
+}

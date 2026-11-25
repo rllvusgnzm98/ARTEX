@@ -23,6 +23,7 @@ var hostTools = map[string]bool{
 	"xfreerdp": true,
 	"ffuf":     true, "feroxbuster": true, "gobuster": true, "sqlmap": true,
 	"nuclei": true, "whatweb": true, "commix": true, "katana": true, "nxc": true,
+	"naabu": true, "fscan": true, "gogo": true,
 	"impacket-secretsdump": true, "impacket-psexec": true,
 	"impacket-wmiexec": true, "impacket-smbclient": true,
 	"impacket-getuserspns": true,
@@ -40,6 +41,9 @@ var hostValueFlags = map[string]map[string]bool{
 	"nuclei":      {"-u": true, "--target": true, "-target": true},
 	"commix":      {"-u": true, "--url": true},
 	"katana":      {"-u": true, "--url": true},
+	"naabu":       {"-host": true},
+	"fscan":       {"-h": true},
+	"gogo":        {"-i": true},
 }
 
 // valueFlags take a non-host value as the next token; that token must not be
@@ -84,8 +88,8 @@ func ExtractHosts(command string) []string {
 
 	// Pass 1: URLs anywhere in the command.
 	for _, raw := range reScheme.FindAllString(command, -1) {
-		if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
-			add(u.Hostname())
+		if h := extractURLHost(raw); h != "" {
+			add(h)
 		}
 	}
 
@@ -193,8 +197,43 @@ func baseOf(tok string) string {
 	return tok
 }
 
+func stripShellVarSuffix(s string) string {
+	idx := strings.IndexByte(s, '$')
+	if idx < 0 {
+		if strings.IndexAny(s, "{}") >= 0 {
+			return ""
+		}
+		return s
+	}
+	s = s[:idx]
+	if strings.IndexAny(s, "{}") >= 0 {
+		return ""
+	}
+	s = strings.TrimRight(s, ".")
+	if !strings.HasSuffix(s, "::") {
+		s = strings.TrimRight(s, ":")
+	}
+	return s
+}
+
+func extractURLHost(raw string) string {
+	if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
+		return stripShellVarSuffix(u.Hostname())
+	}
+	if idx := strings.IndexByte(raw, '$'); idx >= 0 {
+		if u, err := url.Parse(raw[:idx]); err == nil && u.Hostname() != "" {
+			return stripShellVarSuffix(u.Hostname())
+		}
+	}
+	return ""
+}
+
 // parseBareIP returns the normalized IP if tok is an IP literal or ip:port.
 func parseBareIP(tok string) string {
+	tok = stripShellVarSuffix(tok)
+	if tok == "" {
+		return ""
+	}
 	if host, _, err := net.SplitHostPort(tok); err == nil {
 		tok = host
 	}
@@ -226,12 +265,16 @@ func addHostCandidate(add func(string), tok string) {
 		tok = tok[at+1:] // ssh / impacket user@host
 	}
 	if strings.Contains(tok, "://") {
-		if u, err := url.Parse(tok); err == nil && u.Hostname() != "" {
-			add(u.Hostname())
+		if h := extractURLHost(tok); h != "" {
+			add(h)
 		}
 		return
 	}
 	if isCIDRLiteral(tok) {
+		return
+	}
+	tok = stripShellVarSuffix(tok)
+	if tok == "" {
 		return
 	}
 	if ip := parseBareIP(tok); ip != "" {

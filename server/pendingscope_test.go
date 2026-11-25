@@ -111,3 +111,34 @@ func TestScopeRulesFromRows(t *testing.T) {
 		t.Fatalf("keyword 不应进入匹配规则: %+v", rules)
 	}
 }
+
+func TestScopeRulesFromRowsForModeStrictAndExclusions(t *testing.T) {
+	rows := []db.TaskScope{
+		{Kind: "root_domain", Domain: "acme.test", Source: "manual"},
+		{Kind: "subdomain", Domain: "api.partner.test", Source: "manual"},
+		{Kind: "subdomain", Domain: "auto-leak.other.test", Source: "auto"},
+		{Kind: "ip", Net: "10.0.0.5/32", Source: "agent"},
+		{Kind: "exclude_subdomain", Domain: "blog.acme.test", Source: "manual"},
+		{Kind: "exclude_root_domain", Domain: "status.acme.test", Source: "agent"},
+		{Kind: "exclude_cidr", Net: "10.9.0.0/16", Source: "manual"},
+	}
+
+	warnRules := scopeRulesFromRowsForMode(rows, "warn")
+	if len(warnRules) != 7 {
+		t.Fatalf("warn mode should keep all 7 rules, got %d: %+v", len(warnRules), warnRules)
+	}
+	strictRules := scopeRulesFromRowsForMode(rows, "strict")
+	// Strict drops the 2 auto/agent inclusions, keeps 2 manual inclusions + 3 exclusions = 5.
+	if len(strictRules) != 5 {
+		t.Fatalf("strict mode should keep 5 rules (2 manual + 3 exclusions), got %d: %+v", len(strictRules), strictRules)
+	}
+	var sawExact bool
+	for _, r := range strictRules {
+		if r.Value == "api.partner.test" && r.Kind == "exact_domain" && !r.Exclude {
+			sawExact = true
+		}
+	}
+	if !sawExact {
+		t.Fatalf("subdomain row should normalize to exact_domain: %+v", strictRules)
+	}
+}
