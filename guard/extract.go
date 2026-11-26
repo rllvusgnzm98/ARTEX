@@ -44,6 +44,7 @@ var hostValueFlags = map[string]map[string]bool{
 	"naabu":       {"-host": true},
 	"fscan":       {"-h": true},
 	"gogo":        {"-i": true},
+	"ssh":         {"-J": true},
 }
 
 // valueFlags take a non-host value as the next token; that token must not be
@@ -54,6 +55,7 @@ var valueFlags = map[string]bool{
 	"-H": true, "-A": true, "-U": true, "-d": true, "-x": true, "-u": true,
 	"-F": true, "-b": true, "-m": true, "-l": true, "-L": true, "-P": true,
 	"-C": true, "-O": true, "-T": true, "-D": true, "-K": true,
+	"-R": true, "-S": true, "-W": true, "-E": true, "-I": true, "-Q": true,
 	"--data": true, "--data-binary": true, "--data-raw": true, "--data-urlencode": true,
 	"--header": true, "--proxy": true, "--user-agent": true,
 	"--connect-timeout": true, "--max-time": true, "--output": true,
@@ -153,6 +155,11 @@ func ExtractHosts(command string) []string {
 					continue
 				}
 				addHostCandidate(add, tok)
+				// ssh takes one positional destination ([user@]host); subsequent tokens
+				// are the remote command string rather than additional ssh hosts.
+				if curTool == "ssh" {
+					curTool = ""
+				}
 				continue
 			}
 			// 非工具参数位置:只收独立 IP 字面量(裸主机名歧义太大,宁缺勿滥)。
@@ -216,13 +223,41 @@ func stripShellVarSuffix(s string) string {
 	return s
 }
 
+func isNonNetworkScheme(raw string) bool {
+	idx := strings.Index(raw, "://")
+	if idx <= 0 {
+		return false
+	}
+	scheme := strings.ToLower(raw[:idx])
+	if strings.HasPrefix(scheme, "compress.") {
+		return true
+	}
+	switch scheme {
+	case "file", "php", "phar", "data", "zip", "rar", "ogg", "glob", "expect",
+		"javascript", "mailto", "about", "blob", "chrome", "view-source":
+		return true
+	}
+	return false
+}
+
+func cleanExtractedHost(rawHost string) string {
+	h := strings.Trim(stripShellVarSuffix(rawHost), "[]")
+	if h == "" || h == "." || h == ".." {
+		return ""
+	}
+	return h
+}
+
 func extractURLHost(raw string) string {
+	if isNonNetworkScheme(raw) {
+		return ""
+	}
 	if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
-		return stripShellVarSuffix(u.Hostname())
+		return cleanExtractedHost(u.Hostname())
 	}
 	if idx := strings.IndexByte(raw, '$'); idx >= 0 {
 		if u, err := url.Parse(raw[:idx]); err == nil && u.Hostname() != "" {
-			return stripShellVarSuffix(u.Hostname())
+			return cleanExtractedHost(u.Hostname())
 		}
 	}
 	return ""

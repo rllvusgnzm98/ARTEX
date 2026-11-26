@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -74,5 +75,41 @@ func TestCompactIntentsIncludesBlockedReasonAndWAFReasonText(t *testing.T) {
 	}, &runTrace{})
 	if !strings.Contains(sum, "gateway_waf_blocked") || !strings.Contains(detail, "Cloudflare WAF") {
 		t.Fatalf("terminalText must surface gateway_waf_blocked, got sum=%q detail=%q", sum, detail)
+	}
+}
+
+func TestAddIntentSchemaExposesItemPropsAndRejectsNestedOrPlaceholder(t *testing.T) {
+	_, store := retentionStore(t)
+	ts := NewToolSet(store, "planner")
+	tool := ts.addIntent()
+	props, _ := tool.InputSchema()["properties"].(map[string]any)
+	intentsSchema, _ := props["intents"].(map[string]any)
+	itemsSchema, _ := intentsSchema["items"].(map[string]any)
+	itemProps, _ := itemsSchema["properties"].(map[string]any)
+	for _, wantKey := range []string{"summary", "asset_ids", "parent_ids", "priority", "chain_tags"} {
+		if _, ok := itemProps[wantKey]; !ok {
+			t.Fatalf("add_intent intents.items.properties missing %q: %+v", wantKey, itemProps)
+		}
+	}
+
+	nestedRaw := json.RawMessage(`{"intents":[{"summary":"批量派单","intents":[{"summary":"针对 192.168.52.30 打内网纵深"}]}]}`)
+	res, err := tool.Call(t.Context(), nestedRaw, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Flatten(), "禁止再次嵌套") {
+		t.Fatalf("double-nested intents must be rejected cleanly, got: %s", res.Flatten())
+	}
+	if n, err := store.CountByKind(db.KindIntent); err != nil || n != 0 {
+		t.Fatalf("nested shell intent leaked into DB: count=%d err=%v", n, err)
+	}
+
+	placeholderRaw := json.RawMessage(`{"intents":[{"summary":"批量派单"}]}`)
+	res2, err := tool.Call(t.Context(), placeholderRaw, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res2.Flatten(), "疑似包装标题") {
+		t.Fatalf("placeholder summary must be rejected cleanly, got: %s", res2.Flatten())
 	}
 }

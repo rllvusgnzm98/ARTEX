@@ -302,3 +302,127 @@ func TestRecordFactInheritsIntentAssetAnchorsWhenOmitted(t *testing.T) {
 		t.Fatalf("explicit anchors=%v, want [%d]", anchors2[fExplicit], a2)
 	}
 }
+
+func TestDanglingAssetAnchorDoesNotPoisonEvidenceFailureCount(t *testing.T) {
+	d, es := retentionStore(t)
+	var taskID int64
+	if err := d.QueryRow(`SELECT id FROM tasks WHERE exploration_id=$1`, es.ID()).Scan(&taskID); err != nil {
+		t.Fatal(err)
+	}
+	intentID, err := es.AddIntent(map[string]any{"summary": "verify dangling anchor error accounting"}, 5, nil, "planner")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ts := NewToolSet(es, "worker")
+	ts.SetTaskID(taskID)
+	ts.SetAssetStore(d.Assets(), d.Companies())
+
+	factIn, _ := json.Marshal(map[string]any{
+		"summary":   "dangling anchor test fact",
+		"intent_id": intentID,
+		"asset_ids": []int64{999999999},
+	})
+	factRes, err := ts.recordFact().Call(t.Context(), factIn, nil)
+	if err != nil || !factRes.IsError {
+		t.Fatalf("expected record_fact to reject dangling asset anchor: res=%v err=%v", factRes.Flatten(), err)
+	}
+
+	findIn, _ := json.Marshal(map[string]any{
+		"vulnclass": "RCE",
+		"name":      "dangling anchor finding",
+		"severity":  "high",
+		"summary":   "finding with nonexistent asset anchor",
+		"intent_id": intentID,
+		"asset_ids": []int64{999999999},
+		"evidence":  "uid=0(root)",
+	})
+	findRes, err := ts.addFinding().Call(t.Context(), findIn, nil)
+	if err != nil || !findRes.IsError {
+		t.Fatalf("expected report_finding to reject dangling asset anchor: res=%v err=%v", findRes.Flatten(), err)
+	}
+
+	if ts.Writes().Failures != 0 {
+		t.Fatalf("dangling anchor client validation error must not increment Failures: got %+v", ts.Writes())
+	}
+}
+
+func TestRecordFactArtifactPathsReachNextIntentSeed(t *testing.T) {
+	_, es := retentionStore(t)
+	ts := NewToolSet(es, "worker")
+	intentA, err := es.AddIntent(map[string]any{"summary": "拿边界机 root"}, 5, nil, "planner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	factID, err := ts.recordOneFactCtx(t.Context(), factItem{
+		Summary:       "边界机 root SSH 私钥已写入共享目录",
+		Confidence:    "observed",
+		ArtifactPaths: []string{"/data/tasks/253/shared/id_rsa", "/data/tasks/253/shared/id_rsa", "  "},
+	}, intentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := es.GetNode(factID)
+	if err != nil || node == nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Paths []string `json:"artifact_paths"`
+	}
+	if err := json.Unmarshal(node.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Paths) != 1 || payload.Paths[0] != "/data/tasks/253/shared/id_rsa" {
+		t.Fatalf("artifact_paths = %#v", payload.Paths)
+	}
+	nextID, err := ts.addOneIntentCtx(t.Context(), intentItem{
+		Summary:   "从 192.168.52.20 容器逃逸到宿主机",
+		ParentIDs: []json.RawMessage{json.RawMessage(fmt.Sprintf("%d", factID))},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := es.GetNode(nextID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := RenderWorkerEntrySeed(LoadWorkerEntrySeed(es, nil, next))
+	if !strings.Contains(out, "/data/tasks/253/shared/id_rsa") {
+		t.Fatalf("downstream entry seed missing shared artifact:\n%s", out)
+	}
+}
+
+func TestPlannerOverviewExposesTaskAssetIndex(t *testing.T) {
+	d, es := retentionStore(t)
+	var taskID int64
+	if err := d.QueryRow(`SELECT id FROM tasks WHERE exploration_id=$1`, es.ID()).Scan(&taskID); err != nil {
+		t.Fatal(err)
+	}
+	assetID, err := d.Assets().UpsertIP(db.UpsertIPReq{IP: "203.0.113.20", TaskID: taskID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := NewToolSet(es, "planner")
+	ts.SetTaskID(taskID)
+	ts.SetAssetStore(d.Assets(), d.Companies())
+	ov := ts.graphOverviewData()
+	list, _ := ov["task_assets"].([]map[string]any)
+	found := false
+	for _, item := range list {
+		id, _ := item["id"].(int64)
+		if id != assetID {
+			continue
+		}
+		found = true
+		if item["type"] != "ip" || item["host"] != "203.0.113.20" {
+			t.Fatalf("asset index item = %+v", item)
+		}
+	}
+	if !found {
+		t.Fatalf("asset %d missing from task_assets: %+v", assetID, list)
+	}
+	rendered := renderWorkerGraphOverview(ov, nil)
+	if strings.Contains(rendered, "task_assets") || strings.Contains(rendered, "203.0.113.20") {
+		t.Fatalf("worker overview leaked planner asset index:\n%s", rendered)
+	}
+}

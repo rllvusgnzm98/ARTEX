@@ -3,12 +3,14 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/agent/chainskel"
 	"github.com/Autumn-27/artex/db"
@@ -586,6 +588,39 @@ func (t *ToolSet) graphOverviewDataFrom(g *graphSnapshot) map[string]any {
 			}
 			out["honeypot_assets"] = plist
 		}
+		// task_assets：面向 planner 的本任务活跃资产速查表（最近活跃前 30 条，
+		// 只留 id/type/target/service/crown_jewel），便于 add_intent 精准绑定
+		// asset_ids 而不必盲猜或跨主机错绑；renderWorkerGraphOverview 会剔除它。
+		const taskAssetsOverviewCap = 30
+		if assets, err := t.as.QueryByTask(t.taskID, "", taskAssetsOverviewCap, 0); err == nil && len(assets) > 0 {
+			alist := make([]map[string]any, 0, len(assets))
+			for _, a := range assets {
+				item := map[string]any{
+					"id":     a.ID,
+					"type":   a.Type,
+					"target": clipPlainRunes(compactAssetTarget(a), 120),
+				}
+				if host := assetOverviewHost(a); host != "" {
+					item["host"] = host
+				}
+				if a.Port != nil && *a.Port > 0 {
+					item["port"] = *a.Port
+				}
+				if a.ServiceName != "" {
+					item["service"] = a.ServiceName
+				}
+				if a.CrownJewel {
+					item["crown_jewel"] = true
+				}
+				alist = append(alist, item)
+			}
+			out["task_assets"] = alist
+			if total, err := t.as.CountByTask(t.taskID, ""); err == nil {
+				out["task_assets_total"] = total
+			} else {
+				out["task_assets_total"] = len(alist)
+			}
+		}
 	}
 	// crown jewels (目标导向分析): operator-marked high-value target assets + this
 	// task's standing toward each (reached by finding/fact? graph distance from the
@@ -710,6 +745,49 @@ func (t *ToolSet) graphOverviewDataFrom(g *graphSnapshot) map[string]any {
 		}
 	}
 	return out
+}
+
+func assetOverviewHost(a *db.Asset) string {
+	if a == nil {
+		return ""
+	}
+	if a.Domain != "" {
+		return a.Domain
+	}
+	if a.IP != "" {
+		return a.IP
+	}
+	if a.AppName != "" {
+		return a.AppName
+	}
+	return a.RootDomain
+}
+
+func compactAssetTarget(a *db.Asset) string {
+	if a == nil {
+		return ""
+	}
+	if a.URL != "" {
+		return a.URL
+	}
+	if a.Port != nil && *a.Port > 0 {
+		if a.Domain != "" {
+			return fmt.Sprintf("%s:%d", a.Domain, *a.Port)
+		}
+		if a.IP != "" {
+			return fmt.Sprintf("%s:%d", a.IP, *a.Port)
+		}
+	}
+	if a.Domain != "" {
+		return a.Domain
+	}
+	if a.IP != "" {
+		return a.IP
+	}
+	if a.AppName != "" {
+		return a.AppName
+	}
+	return a.RootDomain
 }
 
 func inheritedMap(m map[string]any, sourceTaskID int64) map[string]any {
@@ -1180,11 +1258,25 @@ func (t *ToolSet) nodeDetail() actool.CoreTool {
 
 // intentItem 是 add_intent 批量/单条的一条探索方向。
 type intentItem struct {
-	Summary   string            `json:"summary"`
-	AssetIDs  []json.RawMessage `json:"asset_ids"`
-	ParentIDs []json.RawMessage `json:"parent_ids"`
-	Priority  int               `json:"priority"`
-	ChainTags []string          `json:"chain_tags"`
+	Summary       string            `json:"summary"`
+	AssetIDs      []json.RawMessage `json:"asset_ids"`
+	ParentIDs     []json.RawMessage `json:"parent_ids"`
+	Priority      int               `json:"priority"`
+	ChainTags     []string          `json:"chain_tags"`
+	NestedIntents json.RawMessage   `json:"intents"`
+}
+
+func isPlaceholderIntentSummary(s string) bool {
+	trimmed := strings.TrimSpace(strings.Trim(s, " \t\r\n.,:;!?，。：；！？-—_[]【】()（）\"'`"))
+	if trimmed == "" {
+		return true
+	}
+	collapsed := strings.ToLower(strings.Join(strings.Fields(trimmed), ""))
+	switch collapsed {
+	case "批量派单", "派单", "新增意图", "批量新增意图", "batchintents", "batchintent":
+		return true
+	}
+	return utf8.RuneCountInString(trimmed) < 3
 }
 
 // addOneIntent 创建一条意图节点并连上游血缘，返回 id。
@@ -1196,8 +1288,14 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 }
 
 func (t *ToolSet) addOneIntentCtx(ctx context.Context, it intentItem) (int64, error) {
+	if rawNested := strings.TrimSpace(string(it.NestedIntents)); rawNested != "" && rawNested != "null" {
+		return 0, fmt.Errorf("intents 数组元素内禁止再次嵌套 intents 字段：请将每条探索方向直接平铺在顶层 intents 数组中")
+	}
 	if strings.TrimSpace(it.Summary) == "" {
 		return 0, fmt.Errorf("summary 不能为空")
+	}
+	if isPlaceholderIntentSummary(it.Summary) {
+		return 0, fmt.Errorf("summary %q 过于笼统（疑似包装标题）：请写出【动作类型 + 唯一目标资产 + 具体攻击假设】", it.Summary)
 	}
 	if t.worker == "planner" && envBoolFlag("ARTEX_ENABLE_PLANNER_ATOMIC_GUARD", false) {
 		if err := validateAtomicPlannerIntent(it.Summary); err != nil {
@@ -1296,16 +1394,25 @@ func validateAtomicPlannerIntent(summary string) error {
 }
 
 func (t *ToolSet) addIntent() actool.CoreTool {
+	itemProps := map[string]any{
+		"summary":    str("一句话描述本条意图（动作类型 + 唯一目标资产 + 要验证的具体假设/关注点）；禁止只写“批量派单”之类空壳标题或让 worker 自行挑选目标。"),
+		"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（凡针对已知具体资产必传，0/1/多个；是 graph_overview.task_assets 或 list_assets 返回的资产 id，不是探索节点 id）：只要方向围绕某些具体资产就务必传上——用于覆盖去重、把意图连入资产链路，并让执行结论自动回锚到对应资产。仅当纯开局全局侦察、确实没有具体目标资产时才留空。"},
+		"parent_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
+		"priority":   intp("优先级 0-10，默认5"),
+		"chain_tags": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "【强烈建议传】本方向的主要攻击面标签，决定 worker 进场注入哪套反问决策链骨架（" + strings.Join(chainskel.Categories, "/") + "）。**至多 2 个**，仅首个合法标签注入主骨架，主要攻击面放首位；取值非法或超过 2 个会直接报错。只描述攻击面，不是优先级。"},
+	}
+	props := make(map[string]any, len(itemProps)+1)
+	for k, v := range itemProps {
+		props[k] = v
+	}
+	props["intents"] = map[string]any{
+		"type":        "array",
+		"description": "【优先用这个】要新增的探索方向数组，直接平铺各条方向对象（禁止在数组元素内再嵌套 intents）。返回 ids 与本数组等长、同序。",
+		"items":       obj(itemProps, "summary"),
+	}
 	return t.writeExpTool("add_intent", "生成【单目标原子探索方向】写入 frontier，并连入探索链路。每条意图必须锁定【单一具体目标资产（或单一明确阶段假设）】，严禁下发“滚动补位/接力补位/让 worker 自行拉列表挑目标连续切换”的自调度总包单。\n"+
 		"★优先批量：一轮筛出的多个互不依赖单目标放进 intents 数组一次提交（比逐条调用省往返）。返回 ids 数组，与 intents 等长同序（失败项 id=0，详情见 errors）。单条则省略 intents 直接给顶层 summary。",
-		obj(map[string]any{
-			"intents":    map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
-			"summary":    str("[单条] 一句话描述本条意图（动作类型 + 唯一目标资产 + 要验证的具体假设/关注点）；禁止让 worker 自行挑选目标或连打多个无关目标。"),
-			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（凡针对已知具体资产必传，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：只要方向围绕某些具体资产就务必传上——用于覆盖去重、把意图连入资产链路，并让执行结论自动回锚到对应资产。仅当纯开局全局侦察、确实没有具体目标资产时才留空。"},
-			"parent_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
-			"priority":   intp("优先级 0-10，默认5"),
-			"chain_tags": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "【强烈建议传】本方向的主要攻击面标签，决定 worker 进场注入哪套反问决策链骨架（" + strings.Join(chainskel.Categories, "/") + "）。**至多 2 个**，仅首个合法标签注入主骨架，主要攻击面放首位；取值非法或超过 2 个会直接报错。只描述攻击面，不是优先级。"},
-		}),
+		obj(props),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				Intents    []intentItem `json:"intents"`
@@ -1480,7 +1587,9 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			recorded, err = t.ts.RecordFinding(ctx, input)
 		}
 		if err != nil {
-			t.countWrites(WriteCounts{Failures: 1})
+			if !isClientEvidenceInputError(err) {
+				t.countWrites(WriteCounts{Failures: 1})
+			}
 			return actool.Errorf(err.Error()), nil
 		}
 		t.countWrites(WriteCounts{Findings: 1})
@@ -1541,14 +1650,15 @@ func deriveFindingName(vulnClass, summary string) string {
 // must NOT be stuffed into the asset graph via upsert_asset.
 // factItem 是 record_fact 批量/单条的一条事实。
 type factItem struct {
-	Summary     string            `json:"summary"`
-	Detail      string            `json:"detail"`
-	Evidence    string            `json:"evidence"`   // 一行关键证据（命令+关键输出行），支撑结论、便于事后核对
-	Confidence  string            `json:"confidence"` // observed（直接看到）| inferred（据现象推断）
-	Category    string            `json:"category"`
-	EvidenceIDs []string          `json:"evidence_ids"`
-	IntentID    json.RawMessage   `json:"intent_id"`
-	AssetIDs    []json.RawMessage `json:"asset_ids"`
+	Summary       string            `json:"summary"`
+	Detail        string            `json:"detail"`
+	Evidence      string            `json:"evidence"`   // 一行关键证据（命令+关键输出行），支撑结论、便于事后核对
+	Confidence    string            `json:"confidence"` // observed（直接看到）| inferred（据现象推断）
+	Category      string            `json:"category"`
+	EvidenceIDs   []string          `json:"evidence_ids"`
+	ArtifactPaths []string          `json:"artifact_paths"`
+	IntentID      json.RawMessage   `json:"intent_id"`
+	AssetIDs      []json.RawMessage `json:"asset_ids"`
 }
 
 // recordOneFact 写一条 fact 节点并连到意图（intent→yields→fact）。defaultIntent 为
@@ -1579,6 +1689,9 @@ func (t *ToolSet) recordOneFactCtx(ctx context.Context, it factItem, defaultInte
 	if e := strings.TrimSpace(it.Evidence); e != "" {
 		payload["evidence"] = e
 	}
+	if paths := cleanArtifactPaths(it.ArtifactPaths); len(paths) > 0 {
+		payload["artifact_paths"] = paths
+	}
 	if c := strings.TrimSpace(it.Confidence); c != "" {
 		payload["confidence"] = c
 	}
@@ -1605,7 +1718,9 @@ func (t *ToolSet) recordOneFactCtx(ctx context.Context, it factItem, defaultInte
 	// a fact is its OWN node kind (distinct from a vuln finding).
 	id, err := t.ts.AddFactCtx(ctx, payload, t.worker, factAssets, intent)
 	if err != nil {
-		t.countWrites(WriteCounts{Failures: 1})
+		if !isClientEvidenceInputError(err) {
+			t.countWrites(WriteCounts{Failures: 1})
+		}
 		return 0, err
 	}
 	t.countWrites(WriteCounts{Facts: 1})
@@ -1617,16 +1732,57 @@ func (t *ToolSet) recordOneFactCtx(ctx context.Context, it factItem, defaultInte
 	return id, nil
 }
 
+func cleanArtifactPaths(in []string) []string {
+	const maxN = 8
+	const maxRunes = 240
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, min(len(in), maxN))
+	seen := map[string]bool{}
+	for _, raw := range in {
+		p := strings.Join(strings.Fields(strings.TrimSpace(raw)), " ")
+		if p == "" || p == "." || seen[p] {
+			continue
+		}
+		if utf8.RuneCountInString(p) > maxRunes {
+			p = string([]rune(p)[:maxRunes])
+		}
+		seen[p] = true
+		out = append(out, p)
+		if len(out) == maxN {
+			break
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func isClientEvidenceInputError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, db.ErrDanglingAnchor) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "intent_id 必须是本任务的意图") ||
+		strings.Contains(msg, "漏洞所属任务与探索记录不匹配")
+}
+
 func (t *ToolSet) recordFact() actool.CoreTool {
 	itemProps := map[string]any{
-		"summary":      str("对本次探索结论的【总结性一句话】（是对 detail 的概括）"),
-		"intent_id":    idp("产生本事实的意图 id（你领到的意图；批量时作为各条默认）"),
-		"detail":       str("本事实的相关细节：把这次探索的多个观察事实都写进这里"),
-		"evidence":     str("【一行】关键证据：命令 + 最能证明结论的那一两行输出。务必简洁，不要粘大段输出（细节放 detail）。"),
-		"confidence":   str("observed（输出里直接看到）| inferred（据现象推断）。否定结论务必如实标注。"),
-		"asset_ids":    map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "相关资产 id（可选，0/1/多个）：该事实涉及哪些资产"},
-		"category":     map[string]any{"type": "string", "enum": []string{"negative_result", "scope_limit", "cleanup_status", "evidence"}, "description": "可选关键事实类别：否定结果 / 授权范围限制 / 清理状态 / 关键证据。省略表示 general 普通事实；漏洞 finding 仍用 report_finding 单独记录。"},
-		"evidence_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选：支撑结论的已有证据记录 ID 或工件引用，保留可恢复的准确标识；不要编造。"},
+		"summary":        str("对本次探索结论的【总结性一句话】（是对 detail 的概括）"),
+		"intent_id":      idp("产生本事实的意图 id（你领到的意图；批量时作为各条默认）"),
+		"detail":         str("本事实的相关细节：把这次探索的多个观察事实都写进这里"),
+		"evidence":       str("【一行】关键证据：命令 + 最能证明结论的那一两行输出。务必简洁，不要粘大段输出（细节放 detail）。"),
+		"confidence":     str("observed（输出里直接看到）| inferred（据现象推断）。否定结论务必如实标注。"),
+		"asset_ids":      map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "相关资产 id（可选，0/1/多个）：该事实涉及哪些资产"},
+		"category":       map[string]any{"type": "string", "enum": []string{"negative_result", "scope_limit", "cleanup_status", "evidence"}, "description": "可选关键事实类别：否定结果 / 授权范围限制 / 清理状态 / 关键证据。省略表示 general 普通事实；漏洞 finding 仍用 report_finding 单独记录。"},
+		"evidence_ids":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选：支撑结论的已有证据记录 ID 或工件引用，保留可恢复的准确标识；不要编造。"},
+		"artifact_paths": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选：本事实依赖的跨单兵制品绝对路径，且文件已经放在任务 shared/ 目录（SSH 私钥、路由表、字典）。下游意图的进场预塞会原样带上这些路径。"},
 	}
 	props := make(map[string]any, len(itemProps)+1)
 	for key, value := range itemProps {

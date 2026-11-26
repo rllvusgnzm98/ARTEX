@@ -10,6 +10,24 @@ import (
 	actool "github.com/Autumn-27/norma/tool"
 )
 
+func TestEntrySeedRendersSharedArtifactPaths(t *testing.T) {
+	intent := node(20, db.KindIntent, "open", map[string]any{"summary": "从 192.168.52.20 逃逸"})
+	fact := node(10, db.KindFact, "confirmed", map[string]any{
+		"summary":        "边界机 root SSH 私钥已写入共享目录",
+		"confidence":     "observed",
+		"artifact_paths": []string{"/data/tasks/253/shared/id_rsa"},
+	})
+	seed := BuildWorkerEntrySeed(EntryGraph{
+		Intent: intent,
+		Facts:  []*db.Node{fact},
+		Edges:  []db.Edge{{From: fact.ID, To: intent.ID, Rel: db.RelDerivedFrom}},
+	})
+	out := RenderWorkerEntrySeed(seed)
+	if !strings.Contains(out, "/data/tasks/253/shared/id_rsa") {
+		t.Fatalf("entry seed dropped artifact path:\n%s", out)
+	}
+}
+
 // multiStageGraph is the acceptance fixture: two hosts, a prior worker's
 // confirmed fact, and an undelivered follow-on target. No challenge/recipe data.
 func multiStageGraph() (EntryGraph, []int64) {

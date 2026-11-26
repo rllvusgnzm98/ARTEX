@@ -135,8 +135,10 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 				if ev.Terminal.Reason != harness.ReasonAbortedStreaming {
 					sidequestion.Finish(ctx, ev.Terminal.Messages)
 				}
+				rawErr := ev.Terminal.Err
+				normTerm, isErr := normalizeTerminalForActivity(ev.Terminal)
 				finalText = ev.Terminal.Text
-				reason = ev.Terminal.Reason
+				reason = normTerm.Reason
 				// the buffered tail text usually equals Terminal.Text (final answer);
 				// drop it to avoid a duplicate record, the result row carries it.
 				if tkind == "text" && strings.TrimSpace(tbuf.String()) == strings.TrimSpace(ev.Terminal.Text) {
@@ -144,17 +146,17 @@ func captureRunSession(ctx context.Context, s *agentcore.Session, input string, 
 					tkind = ""
 				}
 				flush() // flush any trailing thinking / non-final text
-				sum, detail := ev.Terminal.Text, ev.Terminal.Text
-				if sum == "" || ev.Terminal.Reason == harness.ReasonAbortedTools || ev.Terminal.Reason == harness.ReasonAbortedStreaming {
-					sum, detail = terminalText(ctx, ev.Terminal, lastTool)
+				sum, detail := normTerm.Text, normTerm.Text
+				if sum == "" || normTerm.Reason == harness.ReasonAbortedTools || normTerm.Reason == harness.ReasonAbortedStreaming {
+					sum, detail = terminalText(ctx, &normTerm, lastTool)
 				}
-				u := ev.Terminal.Usage // cumulative token usage for this session
-				rec(db.Activity{Kind: "result", IsError: ev.Terminal.Err != nil,
+				u := normTerm.Usage // cumulative token usage for this session
+				rec(db.Activity{Kind: "result", IsError: isErr,
 					Summary: firstLine(sum, 400), Detail: detail,
 					InputTokens: &u.InputTokens, OutputTokens: &u.OutputTokens,
 					CacheReadTokens: &u.CacheReadTokens, CacheWriteTokens: &u.CacheWriteTokens})
-				if ev.Terminal.Err != nil {
-					rerr = ev.Terminal.Err
+				if rawErr != nil {
+					rerr = rawErr
 				}
 			}
 		}

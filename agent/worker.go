@@ -225,7 +225,7 @@ func (w *Worker) SetSettleTimeout(reserve time.Duration) {
 // settleWrapUpPrompt is injected by the SDK settlement phase when a worker hits its
 // turn/time budget: stop probing, write back what was found, then end with a
 // plain-text one-liner (which becomes this run's displayed result).
-const settleWrapUpPrompt = "你即将因预算耗尽被终止。不要再运行任何命令/探测。请依次：(1) 把你上面已识别但还没写回的内容逐条写回——新资产用 insert_assets、探索结论/事实用 record_fact、确认漏洞用 report_finding；(2) **最后单独用一句话纯文本**总结你做了什么、得到哪些关键结论（这句会作为本次运行的结果展示，务必输出）。"
+const settleWrapUpPrompt = "当前为纯写库结算轮，Bash 已卸载，请直接调 record_fact / report_finding / insert_assets，不要再调用 Bash。你即将因预算耗尽被终止。不要再运行任何命令/探测。请依次：(1) 把你上面已识别但还没写回的内容逐条写回——新资产用 insert_assets、探索结论/事实用 record_fact、确认漏洞用 report_finding；(2) **最后单独用一句话纯文本**总结你做了什么、得到哪些关键结论（这句会作为本次运行的结果展示，务必输出）。"
 
 func NewWorker(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int, extra ...actool.CoreTool) *Worker {
 	return &Worker{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns, extraTools: extra}
@@ -382,15 +382,44 @@ func workerTrafficBlock(recording bool) string {
 // artifactSpec is 段 [C]: the code-owned, non-editable tail appended to every
 // pentest agent's prompt — intermediate artifacts must land in the shared work
 // dir, never /tmp. Guaranteed present regardless of how the DB body is edited.
+// Cross-worker files (SSH keys, route tables, wordlists) go to <task>/shared,
+// not the task root: workers do not share a CWD with the planner.
 func artifactSpec(dir string) string {
-	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等一切中间产物，**一律写到本任务工作目录 " + dir + "**（相对路径即写在这里，也可用该绝对路径）——**不要写 /tmp、不要用其它绝对路径**。"
+	shared := sharedDirForRun(dir)
+	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等本角色自己的中间产物，**一律写到工作目录 " + dir + "**（相对路径即写在这里，也可用该绝对路径）——**不要写 /tmp、不要用其它绝对路径**。" +
+		"\n**跨单兵共享制品**（SSH 私钥、提取好的 API 路由表、字典、凭据文件等后续意图还要用的文件）只增写入 **" + shared + "**。意图正文和命令里引用这些文件时写该目录下的绝对路径。" +
+		"每个 worker 的私有目录是同级的 `i<意图id>/`，任务根目录里没有它们的产物；密钥路径以 shared 目录为准，并要求产出方用 record_fact 的 artifact_paths 记下绝对路径。"
 }
 
 // workerArtifactSpec is the worker's 段 [C]: its per-intent run dir is pre-created
 // by the engine (ensureRunDir), so it just writes relative paths there — no manual
-// mkdir, no cross-worker name collisions.
+// mkdir, no cross-worker name collisions. Reusable artifacts go to the sibling
+// shared/ directory so the next intent can open them without guessing i*/ paths.
 func workerArtifactSpec(runDir string) string {
-	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等一切中间产物，**一律写到本次意图的专属工作目录 " + runDir + "**（已自动建好，直接用相对路径写在这里即可，无需再手动建目录）——**不要写 /tmp、不要用其它绝对路径**。"
+	shared := sharedDirForRun(runDir)
+	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等本次意图的私有中间产物，**一律写到本次意图的专属工作目录 " + runDir + "**（已自动建好，直接用相对路径写在这里即可，无需再手动建目录）——**不要写 /tmp、不要用其它绝对路径**。" +
+		"\n后续单兵还要用的制品（SSH 私钥、路由表、字典、凭据文件）写到跨单兵共享目录 **" + shared + "**（只增不删），并在 record_fact 的 artifact_paths 里记下这些绝对路径。共享文件只放这个目录。"
+}
+
+// sharedDirForRun returns <taskDir>/shared for either the task root
+// (.../tasks/<id>, planner and main agent) or an intent run dir
+// (.../tasks/<id>/i<intentID>, worker).
+func sharedDirForRun(dir string) string {
+	base := filepath.Base(dir)
+	if len(base) > 1 && base[0] == 'i' {
+		if _, err := strconv.ParseInt(base[1:], 10, 64); err == nil {
+			dir = filepath.Dir(dir)
+		}
+	}
+	return filepath.Join(dir, "shared")
+}
+
+// ensureTaskSharedDir creates the append-only cross-worker artifact directory
+// under a task root (.../tasks/<id>/shared).
+func ensureTaskSharedDir(taskDir string) string {
+	dir := filepath.Join(taskDir, "shared")
+	_ = os.MkdirAll(dir, 0o755)
+	return dir
 }
 
 // ensureRunDir builds and creates an agent's working directory under base:
@@ -478,6 +507,7 @@ func renderWorkerGraphOverview(data map[string]any, seedFactIDs map[int64]bool) 
 	for _, k := range []string{
 		"coverage", "open_intents", "recent_done_intents",
 		"crown_jewels", "goals", "cold_digests_more",
+		"task_assets", "task_assets_total",
 	} {
 		delete(data, k)
 	}
@@ -661,7 +691,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// 与 planner「态势块放 user turn」分叉是有意的：planner 本身是产意图的那个、没有单一 mandate，
 	// worker 有。仅【全局态势 overview】留在启动 user 消息里——它可降级、容忍 stale，压掉无碍。
 	// 本次意图的专属工作目录 <workDir>/tasks/<taskID>/i<intentID>，引擎侧先建好。
+	// 跨单兵制品在同级 shared/，与规划者约定的密钥/字典路径对齐。
 	runDir := ensureRunDir(w.workDir, taskID, intent.ID)
+	ensureTaskSharedDir(filepath.Dir(runDir))
 	// The run-wide intent is not the current tool action. Do not forward it or
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})

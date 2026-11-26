@@ -42,8 +42,20 @@ const goalsDefaultTmpl = `你是渗透测试目标分解器。你的职责是从
 - 存在多个**相互独立**的最终交付物 → 分别列出
 - 能对应明确漏洞类的标注 vulnclass；信息收集/业务逻辑类目标留空
 - 严禁臆造用户未提及的目标
+- **入口地址不是内部角色**：用户给出的 IP/域名/URL 只说明当前从哪里进。域控、数据库、跳板等角色在被证据证实之前，目标句只写最终可核验的结果，入口地址只留给范围登记。例如「目标 192.168.111.20，flag 在域控 C 盘」应拆成目标「取得域控机器 C 盘根目录下的 flag」，不要写成「获取位于域控机器（192.168.111.20）C 盘根目录下的 flag」。
 
 调用 set_goals 提交结果。`
+
+// goalsRoleBindTail is code-owned and always appended, including when the DB has
+// replaced goalsDefaultTmpl. It stops the decomposer from gluing an entry address
+// onto an internal role the text has not proven.
+const goalsRoleBindTail = `
+
+**入口与角色分开写（代码固定）**：
+用户给出的入口地址只说明当前从哪里进，不等于尚未证实的内部角色。
+- 目标句写最终可核验的结果（例如「取得域控机器 C 盘根目录下的 flag」）。
+- 入口 IP/域名/URL 交给范围登记，不写进域控、数据库、跳板等身份里。
+- 「目标 192.168.111.20，flag 在域控 C 盘」的正确目标是「取得域控机器 C 盘根目录下的 flag」。192.168.111.20 只作为入口。禁止输出「获取位于域控机器（192.168.111.20）C 盘根目录下的 flag」这类把入口提前绑成域控的句子。`
 
 // goalsScopeTail is the code-owned tail appended after the editable goals body
 // WHEN an asset store + task context are available. It teaches the decomposer to
@@ -65,6 +77,17 @@ const goalsScopeTail = `
 - reason 简述依据来自哪句话，便于审计。
 - 若目标/描述中没有任何明确资产范围，则**不要**调用 add_task_scope。
 先用 add_task_scope 登记范围（如有），再调用 set_goals 提交目标。`
+
+// goalsPrompt renders the decomposer system prompt. The role-binding tail is
+// always present; the scope tail is only present when add_task_scope is wired.
+func goalsPrompt(dataDir string, withScope bool) string {
+	sys := renderSystem("goals", goalsDefaultTmpl, GoalsVars{DataDir: dataDir, Now: nowStr()})
+	sys += goalsRoleBindTail
+	if withScope {
+		sys += goalsScopeTail
+	}
+	return sys
+}
 
 // GoalSpec is one decomposed objective.
 type GoalSpec struct {
@@ -127,7 +150,7 @@ func DecomposeGoalsWithProvider(ctx context.Context, prov llm.Provider, dataDir,
 	// Description rides in the user message (same channel as the goal), NOT via the
 	// {{.EngagementDescription}} template var — else a prompt that references the var
 	// would inject the description twice. System prompt stays pure static instructions.
-	sys := renderSystem("goals", goalsDefaultTmpl, GoalsVars{DataDir: dataDir, Now: nowStr()})
+	sys := goalsPrompt(dataDir, as != nil && taskID > 0)
 	// set_constraints 始终可用(不依赖 asset store):正文已含「先抽操作约束再拆目标」这步
 	// (可在 agent 编辑页改措辞),这里只需接上工具。
 	tools := []actool.CoreTool{tsx.setGoals(), tsx.setConstraints()}
@@ -136,7 +159,6 @@ func DecomposeGoalsWithProvider(ctx context.Context, prov llm.Provider, dataDir,
 	// a tool that isn't present.
 	if as != nil && taskID > 0 {
 		tools = append(tools, tsx.addTaskScope())
-		sys += goalsScopeTail
 	}
 	userMsg := "任务目标：\n" + goalText
 	if d := strings.TrimSpace(desc); d != "" {

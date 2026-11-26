@@ -439,7 +439,9 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		situational += "\n\n【任务终局收尾（本轮特殊指令，覆盖上面的常规规划流程）】：" + resolveTaskTimeoutWrapup("planner")
 	}
 	// 本任务的工作目录 <workDir>/tasks/<taskID>，先建好。
+	// shared/ 给跨单兵制品（密钥、路由表、字典）；worker 私有文件在 i<意图id>/。
 	taskDir := ensureRunDir(p.workDir, taskID, 0)
+	ensureTaskSharedDir(taskDir)
 	ctx = intercept.WithReviewContext(ctx, taskDir, intercept.ReviewBackground{})
 	sysBody := plannerSystem(goal, p.workDir, taskDir)
 	if p.wantConstraints() {

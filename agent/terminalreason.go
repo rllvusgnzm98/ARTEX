@@ -18,10 +18,12 @@ type runTrace struct {
 	input     string
 	at        time.Time
 	pending   bool
+	toolCalls int
 }
 
 func (t *runTrace) start(id, name, input string) {
 	t.id, t.name, t.input, t.at, t.pending = id, name, input, time.Now(), true
+	t.toolCalls++
 }
 
 func (t *runTrace) done(id string) {
@@ -44,9 +46,23 @@ var reasonHint = map[harness.TerminalReason]string{
 	harness.ReasonAbortedTools:      "运行在工具执行阶段被取消",
 }
 
+func normalizeTerminalForActivity(term *harness.Terminal) (harness.Terminal, bool) {
+	if term == nil {
+		return harness.Terminal{}, false
+	}
+	cp := *term
+	if isRunBudgetError(cp.Err) {
+		cp.Reason = harness.ReasonTimeout
+		return cp, false
+	}
+	return cp, cp.Err != nil
+}
+
 // terminalText renders a terminal event with no final text into a compact summary
 // and a Markdown detail block.
 func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (string, string) {
+	norm, _ := normalizeTerminalForActivity(term)
+	term = &norm
 	reason := term.Reason
 	aborted := reason == harness.ReasonAbortedStreaming || reason == harness.ReasonAbortedTools
 	// Prompt may return ctx.Err directly without a terminal event. Preserve the
@@ -61,6 +77,9 @@ func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (st
 	if term.Err != nil && IsGatewayWAFBlock(term.Err) {
 		reasonLabel = "gateway_waf_blocked"
 		reasonHintText = "上游 LLM 网关 Cloudflare WAF 拦截了请求体（HTTP 403）：对话历史中的工具输入/输出含触发网关防火墙的明文攻击载荷特征（非靶机拦截、非额度耗尽）。重派时须要求 worker 禁止明文读取/打印完整 CVE 模板或 PoC，改用编码构造；若同一目标连续触发 ≥3 次请降权绕行"
+	} else if term.Err != nil && IsCallTimeout(term.Err) {
+		reasonLabel = "call_timeout"
+		reasonHintText = "单次模型响应超时或流空闲超时（非传输层 0 探测死刑；请结合下方累计工具调用次数与 get_worker_trace 判断实际进展后再决定续派或换法）"
 	}
 	if aborted {
 		_, short, _, ok := AbortReason(ctx)
@@ -111,6 +130,9 @@ func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (st
 		fmt.Fprintf(&b, "- **累计 token**: 输入 %d / 输出 %d / 缓存读 %d / 缓存写 %d\n",
 			u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheWriteTokens)
 	}
+	if tr != nil && tr.toolCalls > 0 {
+		fmt.Fprintf(&b, "- **累计工具调用**: %d 次\n", tr.toolCalls)
+	}
 	if tr.name == "" {
 		b.WriteString("- **工具调用**: 本次运行还没有发出工具调用就结束了\n")
 	} else if tr.pending {
@@ -143,6 +165,9 @@ func progressSuffix(term *harness.Terminal, tr *runTrace) string {
 	var parts []string
 	if term.Turns > 0 {
 		parts = append(parts, fmt.Sprintf("%d 轮", term.Turns))
+	}
+	if tr != nil && tr.toolCalls > 0 {
+		parts = append(parts, fmt.Sprintf("%d 次工具调用", tr.toolCalls))
 	}
 	if !tr.startedAt.IsZero() {
 		parts = append(parts, roundDur(time.Since(tr.startedAt)))

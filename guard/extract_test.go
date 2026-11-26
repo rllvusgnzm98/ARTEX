@@ -151,3 +151,29 @@ func TestExtractHostsShellVarsAndNewReconCLIs(t *testing.T) {
 		}
 	}
 }
+
+func TestExtractHostsIgnoresNonNetworkSchemesAndSSHRemoteCommandArgs(t *testing.T) {
+	cases := []struct {
+		name string
+		cmd  string
+		want []string
+	}{
+		{"php://output stream", `php -d phar.readonly=0 phpggc Laravel/RCE2 system id --phar phar -o php://output`, nil},
+		{"nested php://filter in URL query", `curl -s "http://192.168.111.20:81/?page=php://filter/convert.base64-encode/resource=index.php"`, []string{"192.168.111.20"}},
+		{"standalone php://filter in grep/python", `grep -o 'php://filter/resource=a.php' out.txt`, nil},
+		{"phar://./ relative path", `php -r 'unlink("phar://./exploit.phar");'`, nil},
+		{"file:// and data:// wrappers", `cat <(echo 'file:///etc/passwd data://text/plain;base64,SGVsbG8=')`, nil},
+		{"ssh remote command tokens ignored", `ssh -i id_rsa -o StrictHostKeyChecking=no root@192.168.111.20 'python3 rce_run.py && sh build.sh && ping -c1 192.168.52.30'`, []string{"192.168.111.20", "192.168.52.30"}},
+		{"ssh remote iptables words are not hosts", `ssh -i id_rsa root@192.168.111.20 "iptables -t filter -L OUTPUT"`, []string{"192.168.111.20"}},
+		{"ssh -J proxy jump + remote URL", `ssh -J jump@10.0.0.1 root@10.0.0.2 'id; curl http://10.0.0.3/'`, []string{"10.0.0.3", "10.0.0.1", "10.0.0.2"}},
+	}
+	for _, c := range cases {
+		got := ExtractHosts(c.cmd)
+		if len(got) == 0 {
+			got = nil
+		}
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: ExtractHosts(%q) = %v, want %v", c.name, c.cmd, got, c.want)
+		}
+	}
+}

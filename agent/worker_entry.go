@@ -37,17 +37,18 @@ type WorkerEntrySeed struct {
 
 // EntryFact is a relevant confirmed fact or a task-wide key observation.
 type EntryFact struct {
-	ID           int64
-	Summary      string
-	Detail       string
-	Confidence   string
-	Category     string
-	EvidenceIDs  []string
-	AssetIDs     []int64
-	Assets       []string
-	FromIntent   int64
-	DirectParent bool // true when directly linked via derived_from to the claimed intent
-	Relevant     bool // true when linked via intent lineage or asset anchors (vs unrelated-host key fact)
+	ID            int64
+	Summary       string
+	Detail        string
+	Confidence    string
+	Category      string
+	EvidenceIDs   []string
+	ArtifactPaths []string
+	AssetIDs      []int64
+	Assets        []string
+	FromIntent    int64
+	DirectParent  bool // true when directly linked via derived_from to the claimed intent
+	Relevant      bool // true when linked via intent lineage or asset anchors (vs unrelated-host key fact)
 }
 
 // EntryTarget is a target confirmed reachable by a prior fact but not yet
@@ -245,14 +246,15 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 	}
 
 	type factView struct {
-		node        *db.Node
-		summary     string
-		detail      string
-		confidence  string
-		category    string
-		evidenceIDs []string
-		assets      []int64
-		from        int64
+		node          *db.Node
+		summary       string
+		detail        string
+		confidence    string
+		category      string
+		evidenceIDs   []string
+		artifactPaths []string
+		assets        []int64
+		from          int64
 	}
 	var confirmed []factView
 	byID := map[int64]factView{}
@@ -262,19 +264,21 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 		}
 		summary, detail, conf := factFields(n)
 		category, evidenceIDs := factPriorityFields(n)
+		artifactPaths := factArtifactPaths(n)
 		key := isKeyFact(category, evidenceIDs)
 		if key && n.State != "confirmed" || !key && !isConfirmedFact(n.State, conf) {
 			continue
 		}
 		fv := factView{
-			node:        n,
-			summary:     summary,
-			detail:      detail,
-			confidence:  conf,
-			category:    category,
-			evidenceIDs: evidenceIDs,
-			assets:      uniqueIDs(anchorOf(n.ID)),
-			from:        producedBy[n.ID],
+			node:          n,
+			summary:       summary,
+			detail:        detail,
+			confidence:    conf,
+			category:      category,
+			evidenceIDs:   evidenceIDs,
+			artifactPaths: artifactPaths,
+			assets:        uniqueIDs(anchorOf(n.ID)),
+			from:          producedBy[n.ID],
 		}
 		confirmed = append(confirmed, fv)
 		byID[n.ID] = fv
@@ -440,17 +444,18 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 			labels = append(labels, assetLabelOf(g.Assets, a))
 		}
 		facts = append(facts, EntryFact{
-			ID:           fv.node.ID,
-			Summary:      fv.summary,
-			Detail:       fv.detail,
-			Confidence:   fv.confidence,
-			Category:     fv.category,
-			EvidenceIDs:  fv.evidenceIDs,
-			AssetIDs:     fv.assets,
-			Assets:       labels,
-			FromIntent:   fv.from,
-			DirectParent: parentFacts[fv.node.ID],
-			Relevant:     intentRelevant[fv.node.ID],
+			ID:            fv.node.ID,
+			Summary:       fv.summary,
+			Detail:        fv.detail,
+			Confidence:    fv.confidence,
+			Category:      fv.category,
+			EvidenceIDs:   fv.evidenceIDs,
+			ArtifactPaths: fv.artifactPaths,
+			AssetIDs:      fv.assets,
+			Assets:        labels,
+			FromIntent:    fv.from,
+			DirectParent:  parentFacts[fv.node.ID],
+			Relevant:      intentRelevant[fv.node.ID],
 		})
 	}
 	sort.Slice(facts, func(i, j int) bool { return facts[i].ID < facts[j].ID })
@@ -585,6 +590,9 @@ func RenderWorkerEntrySeed(seed WorkerEntrySeed) string {
 		if len(f.EvidenceIDs) > 0 {
 			refs, _ := json.Marshal(f.EvidenceIDs)
 			fmt.Fprintf(&b, " [evidence_ids=%s]", refs)
+		}
+		if len(f.ArtifactPaths) > 0 {
+			fmt.Fprintf(&b, " [artifact_paths=%s]", strings.Join(f.ArtifactPaths, "；"))
 		}
 		if len(f.Assets) > 0 {
 			fmt.Fprintf(&b, "（资产：%s）", strings.Join(f.Assets, "、"))
@@ -768,6 +776,17 @@ func factPriorityFields(n *db.Node) (category string, evidenceIDs []string) {
 	}
 	_ = json.Unmarshal(n.Payload, &p)
 	return p.Category, p.EvidenceIDs
+}
+
+func factArtifactPaths(n *db.Node) []string {
+	if n == nil {
+		return nil
+	}
+	var p struct {
+		ArtifactPaths []string `json:"artifact_paths"`
+	}
+	_ = json.Unmarshal(n.Payload, &p)
+	return cleanArtifactPaths(p.ArtifactPaths)
 }
 
 func isKeyFact(category string, evidenceIDs []string) bool {
