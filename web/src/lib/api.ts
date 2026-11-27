@@ -86,6 +86,9 @@ import type {
   SkillItem,
   SSProject,
   SSTask,
+  Collection,
+  FofaRow,
+  ShodanRow,
   Stats,
   Task,
   TaskArchive,
@@ -272,6 +275,7 @@ export const api = {
     llmProfileIds?: number[];
     sourceTaskIds?: string[];
     companyIds?: number[];
+    collectionIds?: number[];
     timeoutSeconds?: number;
     seedFirstIntent?: boolean;
     planHeartbeatSeconds?: number;
@@ -291,6 +295,7 @@ export const api = {
       llm_profile_ids: input.llmProfileIds ?? [],
       source_task_ids: input.sourceTaskIds ?? [],
       company_ids: input.companyIds ?? [],
+      collection_ids: input.collectionIds ?? [],
       timeout_seconds: input.timeoutSeconds ?? 0,
       seed_first_intent: input.seedFirstIntent ?? false,
       plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = 后端归一到默认 600(10min)
@@ -1183,6 +1188,58 @@ export const api = {
       warnings: string[] | null;
       errors: string[] | null;
     }>("/sync/scopesentry/sync", body),
+
+  // ---- 资产同步 (FOFA 数据源) ----
+  fofaStatus: () =>
+    get<{ configured: boolean; reachable: boolean; email: string; error?: string }>("/sync/fofa/status"),
+  fofaDatasource: (body: { email?: string; key?: string }) =>
+    post<{ configured: boolean; email: string }>("/sync/fofa/datasource", body),
+  fofaQuery: (body: { query: string; size?: number }) =>
+    post<{ total: number; mode: string; rows: FofaRow[] }>("/sync/fofa/query", body).then((r) => ({
+      ...r,
+      rows: arr(r.rows),
+    })),
+  fofaSync: (body: { query: string; size?: number; collection_name?: string; page_size?: number }) =>
+    post<{
+      synced: Record<string, number>;
+      total: number;
+      imported: number;
+      truncated: boolean;
+      collection: { id: number; name: string; members: number } | null;
+      warnings: string[] | null;
+      errors: string[] | null;
+    }>("/sync/fofa/sync", body),
+
+  // ---- 资产同步 (Shodan 数据源) ----
+  shodanStatus: () =>
+    get<{
+      configured: boolean;
+      reachable: boolean;
+      plan?: string;
+      query_credits?: number;
+      scan_credits?: number;
+      error?: string;
+    }>("/sync/shodan/status"),
+  shodanDatasource: (body: { key?: string }) => post<{ configured: boolean }>("/sync/shodan/datasource", body),
+  shodanQuery: (body: { query: string; size?: number }) =>
+    post<{ total: number; mode: string; rows: ShodanRow[] }>("/sync/shodan/query", body).then((r) => ({
+      ...r,
+      rows: arr(r.rows),
+    })),
+  shodanSync: (body: { query: string; size?: number; collection_name?: string }) =>
+    post<{
+      synced: Record<string, number>;
+      total: number;
+      imported: number;
+      truncated: boolean;
+      collection: { id: number; name: string; members: number } | null;
+      warnings: string[] | null;
+      errors: string[] | null;
+    }>("/sync/shodan/sync", body),
+
+  // ---- 资产合集 (FOFA / Shodan 收集的显式资产集合，可作任务目标) ----
+  collections: () => get<{ collections: Collection[] }>("/collections").then((r) => arr(r.collections)),
+  deleteCollection: (id: number) => del<{ deleted: boolean }>(`/collections/${id}`),
 
   // ---- skills (文件系统) ----
   skills: () => get<{ skills: SkillItem[] }>("/skills").then((r) => arr(r.skills)),

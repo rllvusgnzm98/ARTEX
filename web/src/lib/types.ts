@@ -385,9 +385,11 @@ export interface WorkspaceFile {
 export interface TaskScopeRow {
   id: number;
   task_id: number;
-  kind: "company" | "root_domain" | "subdomain" | "ip" | "cidr" | "icp" | "keyword";
+  kind: "company" | "root_domain" | "subdomain" | "ip" | "cidr" | "icp" | "keyword" | "collection";
   company_id?: number;
   company_name?: string; // 后端 JOIN companies 解析，仅 kind=company 有值
+  collection_id?: number;
+  collection_name?: string; // 后端 JOIN asset_collections 解析，仅 kind=collection 有值
   domain?: string;
   net?: string;
   value?: string;
@@ -1783,4 +1785,38 @@ export interface TTPEntry {
   created_at: string;
   reviewed_at?: string;
   reviewer?: string;
+}
+
+// FofaRow — 一行 FOFA 搜索结果（预览用）。
+export interface FofaRow {
+  host: string;
+  ip: string;
+  port: string;
+  protocol: string;
+  domain: string;
+  title: string;
+  server: string;
+}
+
+// ShodanRow — 一行 Shodan 搜索或主机查询结果（预览用）。
+export interface ShodanRow {
+  ip: string;
+  port: string;
+  transport: string;
+  hostnames: string;
+  domains: string;
+  product: string;
+  org: string;
+  title: string;
+  module: string;
+}
+
+// Collection — 资产合集：FOFA / Shodan 收集的显式资产集合，可作任务目标。
+export interface Collection {
+  id: number;
+  name: string;
+  query: string;
+  source: string;
+  member_count: number;
+  created_at: string;
 }

@@ -13,8 +13,9 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { SSProject, SSTask } from "@/lib/types";
+import type { Collection, FofaRow, ShodanRow, SSProject, SSTask } from "@/lib/types";
 
 type SSStatus = {
   exists: boolean;
@@ -23,6 +24,22 @@ type SSStatus = {
   reachable: boolean;
   url?: string;
   tools: string[];
+};
+
+type FofaStatus = {
+  configured: boolean;
+  reachable: boolean;
+  email: string;
+  error?: string;
+};
+
+type ShodanStatus = {
+  configured: boolean;
+  reachable: boolean;
+  plan?: string;
+  query_credits?: number;
+  scan_credits?: number;
+  error?: string;
 };
 
 type Dimension = "project" | "task";
@@ -34,20 +51,34 @@ const ASSET_TYPES: { key: string; label: string }[] = [
 ];
 
 export default function AssetSyncPage() {
+  const [collectionsReload, setCollectionsReload] = React.useState(0);
+  const bumpCollections = React.useCallback(() => setCollectionsReload((n) => n + 1), []);
+
   return (
-    <div className="p-4 md:p-6">
-      <div className="mb-4">
+    <div className="space-y-6 p-4 md:p-6">
+      <div>
         <h1 className="font-semibold text-xl">资产同步</h1>
-        <p className="text-muted-foreground text-sm">从外部数据源同步资产入库</p>
+        <p className="text-muted-foreground text-sm">
+          从 ScopeSentry、FOFA、Shodan 同步外部测绘资产入库，辅助公司业务面理解、口令上下文构建与任务目标绑定
+        </p>
       </div>
       <Tabs defaultValue="scopesentry">
         <TabsList>
           <TabsTrigger value="scopesentry">ScopeSentry</TabsTrigger>
+          <TabsTrigger value="fofa">FOFA</TabsTrigger>
+          <TabsTrigger value="shodan">Shodan</TabsTrigger>
         </TabsList>
         <TabsContent value="scopesentry" className="mt-4">
           <ScopeSentryPanel />
         </TabsContent>
+        <TabsContent value="fofa" className="mt-4">
+          <FofaPanel onImported={bumpCollections} />
+        </TabsContent>
+        <TabsContent value="shodan" className="mt-4">
+          <ShodanPanel onImported={bumpCollections} />
+        </TabsContent>
       </Tabs>
+      <AssetCollectionsCard reloadKey={collectionsReload} />
     </div>
   );
 }
@@ -87,7 +118,7 @@ function ScopeSentryPanel() {
   );
 }
 
-// ── 数据源状态卡 ─────────────────────────────────────────────────────────────
+// ── ScopeSentry 数据源状态卡 ─────────────────────────────────────────────────
 
 function DataSourceCard({
   status,
@@ -213,7 +244,7 @@ function StatusBadge({ status, loading }: { status: SSStatus | null; loading: bo
   );
 }
 
-// ── 同步工作区（项目 / 任务维度）────────────────────────────────────────────────
+// ── ScopeSentry 同步工作区（项目 / 任务维度）───────────────────────────────────
 
 function SyncWorkbench() {
   const [dimension, setDimension] = React.useState<Dimension>("project");
@@ -340,7 +371,6 @@ function SyncWorkbench() {
         <CardTitle className="text-base">选择数据同步</CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
-        {/* 维度切换 */}
         <Tabs
           value={dimension}
           onValueChange={(v) => {
@@ -354,7 +384,6 @@ function SyncWorkbench() {
           </TabsList>
         </Tabs>
 
-        {/* 资产类型 + 选项 */}
         <div className="flex flex-wrap items-center gap-4">
           <span className="font-medium text-sm">同步资产：</span>
           {ASSET_TYPES.map((t) => (
@@ -375,7 +404,6 @@ function SyncWorkbench() {
           )}
         </div>
 
-        {/* 搜索 + 操作 */}
         <div className="flex items-center gap-2">
           <div className="relative max-w-xs flex-1">
             <SearchIcon className="absolute top-1/2 left-2 size-4 -translate-y-1/2 text-muted-foreground" />
@@ -402,7 +430,6 @@ function SyncWorkbench() {
           </Button>
         </div>
 
-        {/* 列表 */}
         <div className="rounded-md border">
           <Table>
             <TableHeader>
@@ -428,7 +455,6 @@ function SyncWorkbench() {
           </Table>
         </div>
 
-        {/* 分页 */}
         <div className="flex items-center justify-end gap-2">
           <Button variant="outline" size="sm" disabled={page <= 1 || loading} onClick={() => setPage((p) => p - 1)}>
             上一页
@@ -444,7 +470,6 @@ function SyncWorkbench() {
           </Button>
         </div>
 
-        {/* 结果 */}
         {result && <SyncResult result={result} />}
       </CardContent>
     </Card>
@@ -482,5 +507,666 @@ function SyncResult({ result }: { result: Awaited<ReturnType<typeof api.ssSync>>
         </ul>
       )}
     </div>
+  );
+}
+
+// ── 通用测绘连接状态徽章 & 导入结果卡片 ──────────────────────────────────────
+
+function SimpleStatusBadge({
+  configured,
+  reachable,
+  loading,
+}: {
+  configured: boolean;
+  reachable: boolean;
+  loading: boolean;
+}) {
+  if (loading) return <Badge variant="secondary">检测中…</Badge>;
+  if (!configured) return <Badge variant="outline">未配置</Badge>;
+  if (reachable)
+    return (
+      <Badge className="bg-emerald-600 hover:bg-emerald-600">
+        <CheckCircle2Icon className="mr-1 size-3" /> 已连接
+      </Badge>
+    );
+  return (
+    <Badge variant="destructive">
+      <AlertCircleIcon className="mr-1 size-3" /> 不可达
+    </Badge>
+  );
+}
+
+function MappingSyncResult({
+  result,
+}: {
+  result: {
+    synced: Record<string, number>;
+    imported: number;
+    truncated: boolean;
+    collection: { id: number; name: string; members: number } | null;
+    warnings: string[] | null;
+    errors: string[] | null;
+  };
+}) {
+  const synced = result.synced ?? {};
+  const labels: Record<string, string> = { service: "服务", ip: "IP", subdomain: "子域名", domain: "根域名" };
+  return (
+    <div className="space-y-2 rounded-md border bg-muted/40 p-3 text-sm">
+      <div className="flex flex-wrap items-center gap-3">
+        <Badge variant="secondary">导入 {result.imported ?? 0} 条</Badge>
+        {Object.entries(synced).map(([k, v]) => (
+          <Badge key={k} variant="outline">
+            {labels[k] ?? k}: {v}
+          </Badge>
+        ))}
+        {result.truncated && (
+          <Badge variant="outline" className="text-amber-600">
+            已达上限截断
+          </Badge>
+        )}
+      </div>
+      {result.collection && (
+        <p className="text-muted-foreground">
+          已归入合集「{result.collection.name}」（{result.collection.members} 个资产）· 新建任务时可在「关联资产合集」里选它为目标
+        </p>
+      )}
+      {result.warnings && result.warnings.length > 0 && (
+        <ul className="list-inside list-disc text-amber-600 dark:text-amber-500">
+          {result.warnings.map((wm) => (
+            <li key={wm}>{wm}</li>
+          ))}
+        </ul>
+      )}
+      {result.errors && result.errors.length > 0 && (
+        <ul className="list-inside list-disc text-destructive">
+          {result.errors.slice(0, 20).map((em) => (
+            <li key={em}>{em}</li>
+          ))}
+          {result.errors.length > 20 && <li>…共 {result.errors.length} 条错误</li>}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// ── FOFA 数据源 ──────────────────────────────────────────────────────────────
+
+function FofaPanel({ onImported }: { onImported: () => void }) {
+  const [status, setStatus] = React.useState<FofaStatus | null>(null);
+  const [loadingStatus, setLoadingStatus] = React.useState(true);
+
+  const loadStatus = React.useCallback(() => {
+    setLoadingStatus(true);
+    api
+      .fofaStatus()
+      .then(setStatus)
+      .catch((e) => toast.error(`读取 FOFA 状态失败：${e.message}`))
+      .finally(() => setLoadingStatus(false));
+  }, []);
+
+  React.useEffect(() => {
+    loadStatus();
+  }, [loadStatus]);
+
+  return (
+    <div className="space-y-4">
+      <FofaDataSourceCard status={status} loading={loadingStatus} onChanged={loadStatus} />
+      {status?.configured ? (
+        <FofaWorkbench onImported={onImported} />
+      ) : (
+        <Card>
+          <CardContent className="py-8 text-center text-muted-foreground text-sm">
+            填写并保存 FOFA 账号（Email 可选，API Key 必填）后即可查询并导入资产。
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+function FofaDataSourceCard({
+  status,
+  loading,
+  onChanged,
+}: {
+  status: FofaStatus | null;
+  loading: boolean;
+  onChanged: () => void;
+}) {
+  const [email, setEmail] = React.useState("");
+  const [apiKey, setApiKey] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+
+  React.useEffect(() => {
+    if (status?.email) setEmail(status.email);
+  }, [status?.email]);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      const r = await api.fofaDatasource({ email: email.trim(), key: apiKey.trim() });
+      toast.success(r.configured ? "已保存 FOFA 账号" : "已保存（尚未填写 API Key）");
+      setApiKey("");
+      onChanged();
+    } catch (e) {
+      toast.error(`保存失败：${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between">
+        <CardTitle className="flex items-center gap-2 text-base">
+          <PlugZapIcon className="size-4" /> FOFA 账号
+          <SimpleStatusBadge configured={!!status?.configured} reachable={!!status?.reachable} loading={loading} />
+        </CardTitle>
+        <Button variant="ghost" size="sm" onClick={onChanged} disabled={loading}>
+          <RefreshCwIcon className={loading ? "size-4 animate-spin" : "size-4"} /> 刷新
+        </Button>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="space-y-1.5">
+            <Label>Email（账号，可留空仅用 Key）</Label>
+            <Input placeholder="you@example.com" value={email} onChange={(e) => setEmail(e.target.value)} />
+          </div>
+          <div className="space-y-1.5">
+            <Label>API Key（留空保留原值）</Label>
+            <Input
+              type="password"
+              placeholder="FOFA API Key"
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+            />
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button onClick={save} disabled={busy}>
+            保存
+          </Button>
+          <span className="text-muted-foreground text-xs">
+            凭据存于本地数据库，密钥不会回显；调用走系统全局代理（若已配置）。
+          </span>
+        </div>
+        {status?.configured && !status.reachable && status.error && (
+          <p className="text-destructive text-xs">探测失败：{status.error}</p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function FofaWorkbench({ onImported }: { onImported: () => void }) {
+  const [query, setQuery] = React.useState("");
+  const [size, setSize] = React.useState("100");
+  const [collectionName, setCollectionName] = React.useState("");
+  const [previewing, setPreviewing] = React.useState(false);
+  const [syncing, setSyncing] = React.useState(false);
+  const [rows, setRows] = React.useState<FofaRow[]>([]);
+  const [total, setTotal] = React.useState<number | null>(null);
+  const [result, setResult] = React.useState<Awaited<ReturnType<typeof api.fofaSync>> | null>(null);
+
+  const sizeNum = Math.max(1, Math.min(5000, Math.floor(Number(size) || 100)));
+
+  const preview = async () => {
+    if (!query.trim()) return toast.error("请填写 FOFA 查询语句");
+    setPreviewing(true);
+    setResult(null);
+    try {
+      const r = await api.fofaQuery({ query: query.trim(), size: Math.min(sizeNum, 100) });
+      setRows(r.rows);
+      setTotal(r.total);
+      toast.success(`命中约 ${r.total} 条，预览 ${r.rows.length} 条`);
+    } catch (e) {
+      toast.error(`查询失败：${(e as Error).message}`);
+    } finally {
+      setPreviewing(false);
+    }
+  };
+
+  const runSync = async () => {
+    if (!query.trim()) return toast.error("请填写 FOFA 查询语句");
+    setSyncing(true);
+    setResult(null);
+    try {
+      const r = await api.fofaSync({
+        query: query.trim(),
+        size: sizeNum,
+        collection_name: collectionName.trim(),
+      });
+      setResult(r);
+      const cname = r.collection?.name || collectionName.trim() || query.trim();
+      toast.success(`已导入 ${r.imported ?? 0} 条资产，归入合集「${cname}」`);
+      onImported();
+    } catch (e) {
+      toast.error(`导入失败：${(e as Error).message}`);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">FOFA 查询与导入</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="space-y-1.5">
+          <Label htmlFor="fofa-query">查询语句（FOFA 语法）</Label>
+          <Textarea
+            id="fofa-query"
+            className="min-h-20 font-mono text-sm"
+            placeholder={'domain="example.com"\nip="1.2.3.4/24"\ncert="example.com"'}
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+          <p className="text-muted-foreground text-xs">
+            预览最多 100 条，导入最多 {sizeNum} 条（上限 5000）。导入的资产自动归并入库并按企业规则归属，同时冻结为一个「资产合集」。
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-4">
+          <div className="flex items-center gap-2">
+            <Label htmlFor="fofa-size" className="text-sm">
+              数量上限
+            </Label>
+            <Input id="fofa-size" className="w-24" value={size} onChange={(e) => setSize(e.target.value)} />
+          </div>
+          <div className="flex min-w-60 flex-1 items-center gap-2">
+            <Label htmlFor="fofa-collection" className="whitespace-nowrap text-sm">
+              合集名
+            </Label>
+            <Input
+              id="fofa-collection"
+              placeholder="默认用查询语法命名"
+              value={collectionName}
+              onChange={(e) => setCollectionName(e.target.value)}
+            />
+          </div>
+          <Button variant="outline" onClick={preview} disabled={previewing || syncing}>
+            <SearchIcon className={previewing ? "size-4 animate-pulse" : "size-4"} /> 预览
+          </Button>
+          <Button onClick={runSync} disabled={syncing || previewing}>
+            <DownloadIcon className={syncing ? "size-4 animate-pulse" : "size-4"} /> 导入资产
+          </Button>
+        </div>
+
+        {rows.length > 0 && (
+          <div className="rounded-md border">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Host</TableHead>
+                  <TableHead>IP</TableHead>
+                  <TableHead>端口</TableHead>
+                  <TableHead>协议</TableHead>
+                  <TableHead>标题</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {rows.map((row, i) => (
+                  <TableRow key={`${row.host}-${row.ip}-${i}`}>
+                    <TableCell className="font-medium">{row.host || "—"}</TableCell>
+                    <TableCell>{row.ip || "—"}</TableCell>
+                    <TableCell>{row.port || "—"}</TableCell>
+                    <TableCell>{row.protocol || "—"}</TableCell>
+                    <TableCell className="max-w-xs truncate" title={row.title}>
+                      {row.title || "—"}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+        {total != null && (
+          <p className="text-muted-foreground text-xs">
+            FOFA 命中约 {total} 条（预览展示前 {rows.length} 条）。
+          </p>
+        )}
+
+        {result && <MappingSyncResult result={result} />}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ── Shodan 数据源 ────────────────────────────────────────────────────────────
+
+function ShodanPanel({ onImported }: { onImported: () => void }) {
+  const [status, setStatus] = React.useState<ShodanStatus | null>(null);
+  const [loadingStatus, setLoadingStatus] = React.useState(true);
+
+  const loadStatus = React.useCallback(() => {
+    setLoadingStatus(true);
+    api
+      .shodanStatus()
+      .then(setStatus)
+      .catch((e) => toast.error(`读取 Shodan 状态失败：${e.message}`))
+      .finally(() => setLoadingStatus(false));
+  }, []);
+
+  React.useEffect(() => {
+    loadStatus();
+  }, [loadStatus]);
+
+  return (
+    <div className="space-y-4">
+      <ShodanDataSourceCard status={status} loading={loadingStatus} onChanged={loadStatus} />
+      {status?.configured ? (
+        <ShodanWorkbench onImported={onImported} />
+      ) : (
+        <Card>
+          <CardContent className="py-8 text-center text-muted-foreground text-sm">
+            填写并保存 Shodan API Key 后即可查询并导入资产。
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+function ShodanDataSourceCard({
+  status,
+  loading,
+  onChanged,
+}: {
+  status: ShodanStatus | null;
+  loading: boolean;
+  onChanged: () => void;
+}) {
+  const [apiKey, setApiKey] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      const r = await api.shodanDatasource({ key: apiKey.trim() });
+      toast.success(r.configured ? "已保存 Shodan API Key" : "已保存（尚未填写 API Key）");
+      setApiKey("");
+      onChanged();
+    } catch (e) {
+      toast.error(`保存失败：${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between">
+        <CardTitle className="flex items-center gap-2 text-base">
+          <PlugZapIcon className="size-4" /> Shodan 账号
+          <SimpleStatusBadge configured={!!status?.configured} reachable={!!status?.reachable} loading={loading} />
+          {status?.reachable && status.plan && (
+            <Badge variant="secondary" className="font-mono text-xs">
+              plan: {status.plan}
+            </Badge>
+          )}
+          {status?.reachable && status.query_credits != null && (
+            <Badge variant="outline" className="text-xs tabular-nums">
+              查询积分: {status.query_credits}
+            </Badge>
+          )}
+        </CardTitle>
+        <Button variant="ghost" size="sm" onClick={onChanged} disabled={loading}>
+          <RefreshCwIcon className={loading ? "size-4 animate-spin" : "size-4"} /> 刷新
+        </Button>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="max-w-lg space-y-1.5">
+          <Label>API Key（留空保留原值）</Label>
+          <Input
+            type="password"
+            placeholder="Shodan API Key"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+          />
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button onClick={save} disabled={busy}>
+            保存
+          </Button>
+          <span className="text-muted-foreground text-xs">
+            凭据存于本地数据库，密钥不会回显；调用走系统全局代理（若已配置）。支持直接输入单个 IP（免查询积分）或标准 Shodan 检索语法。
+          </span>
+        </div>
+        {status?.configured && !status.reachable && status.error && (
+          <p className="text-destructive text-xs">探测失败：{status.error}</p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function ShodanWorkbench({ onImported }: { onImported: () => void }) {
+  const [query, setQuery] = React.useState("");
+  const [size, setSize] = React.useState("100");
+  const [collectionName, setCollectionName] = React.useState("");
+  const [previewing, setPreviewing] = React.useState(false);
+  const [syncing, setSyncing] = React.useState(false);
+  const [rows, setRows] = React.useState<ShodanRow[]>([]);
+  const [total, setTotal] = React.useState<number | null>(null);
+  const [mode, setMode] = React.useState<string>("");
+  const [result, setResult] = React.useState<Awaited<ReturnType<typeof api.shodanSync>> | null>(null);
+
+  const sizeNum = Math.max(1, Math.min(5000, Math.floor(Number(size) || 100)));
+
+  const preview = async () => {
+    if (!query.trim()) return toast.error("请填写 Shodan 查询语句或目标 IP");
+    setPreviewing(true);
+    setResult(null);
+    try {
+      const r = await api.shodanQuery({ query: query.trim(), size: Math.min(sizeNum, 100) });
+      setRows(r.rows);
+      setTotal(r.total);
+      setMode(r.mode);
+      toast.success(`命中约 ${r.total} 条，预览 ${r.rows.length} 条`);
+    } catch (e) {
+      toast.error(`查询失败：${(e as Error).message}`);
+    } finally {
+      setPreviewing(false);
+    }
+  };
+
+  const runSync = async () => {
+    if (!query.trim()) return toast.error("请填写 Shodan 查询语句或目标 IP");
+    setSyncing(true);
+    setResult(null);
+    try {
+      const r = await api.shodanSync({
+        query: query.trim(),
+        size: sizeNum,
+        collection_name: collectionName.trim(),
+      });
+      setResult(r);
+      const cname = r.collection?.name || collectionName.trim() || query.trim();
+      toast.success(`已导入 ${r.imported ?? 0} 条资产，归入合集「${cname}」`);
+      onImported();
+    } catch (e) {
+      toast.error(`导入失败：${(e as Error).message}`);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">Shodan 查询与导入</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="space-y-1.5">
+          <Label htmlFor="shodan-query">查询语句（Shodan 语法或单个 IP）</Label>
+          <Textarea
+            id="shodan-query"
+            className="min-h-20 font-mono text-sm"
+            placeholder={'hostname:example.com\nssl:"example.com"\norg:"Acme Corp"\n1.2.3.4'}
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+          <p className="text-muted-foreground text-xs">
+            输入单个 IP 自动走主机详情接口（免积分）；输入检索语法走分页搜索（每页 100 条，自动限速防 429）。导入后自动提取域名/子域/IP/HTTP 标题/组件并归入「资产合集」。
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-4">
+          <div className="flex items-center gap-2">
+            <Label htmlFor="shodan-size" className="text-sm">
+              数量上限
+            </Label>
+            <Input id="shodan-size" className="w-24" value={size} onChange={(e) => setSize(e.target.value)} />
+          </div>
+          <div className="flex min-w-60 flex-1 items-center gap-2">
+            <Label htmlFor="shodan-collection" className="whitespace-nowrap text-sm">
+              合集名
+            </Label>
+            <Input
+              id="shodan-collection"
+              placeholder="默认用查询语法命名"
+              value={collectionName}
+              onChange={(e) => setCollectionName(e.target.value)}
+            />
+          </div>
+          <Button variant="outline" onClick={preview} disabled={previewing || syncing}>
+            <SearchIcon className={previewing ? "size-4 animate-pulse" : "size-4"} /> 预览
+          </Button>
+          <Button onClick={runSync} disabled={syncing || previewing}>
+            <DownloadIcon className={syncing ? "size-4 animate-pulse" : "size-4"} /> 导入资产
+          </Button>
+        </div>
+
+        {rows.length > 0 && (
+          <div className="rounded-md border">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>IP:端口</TableHead>
+                  <TableHead>主机名 / 域名</TableHead>
+                  <TableHead>产品 / 服务</TableHead>
+                  <TableHead>组织</TableHead>
+                  <TableHead>标题</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {rows.map((row, i) => (
+                  <TableRow key={`${row.ip}-${row.port}-${i}`}>
+                    <TableCell className="font-mono text-xs">
+                      {row.ip}
+                      {row.port ? `:${row.port}` : ""}
+                    </TableCell>
+                    <TableCell className="max-w-xs truncate font-medium" title={row.hostnames || row.domains}>
+                      {row.hostnames || row.domains || "—"}
+                    </TableCell>
+                    <TableCell className="max-w-44 truncate" title={row.product}>
+                      {row.product || row.module || "—"}
+                    </TableCell>
+                    <TableCell className="max-w-40 truncate text-muted-foreground text-xs" title={row.org}>
+                      {row.org || "—"}
+                    </TableCell>
+                    <TableCell className="max-w-xs truncate" title={row.title}>
+                      {row.title || "—"}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+        {total != null && (
+          <p className="text-muted-foreground text-xs">
+            Shodan {mode === "host" ? "单 IP 主机记录" : "命中约"} {total} 条（预览展示前 {rows.length} 条）。
+          </p>
+        )}
+
+        {result && <MappingSyncResult result={result} />}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ── 统一资产合集列表（FOFA + Shodan 共用）────────────────────────────────────
+
+function AssetCollectionsCard({ reloadKey }: { reloadKey: number }) {
+  const [cols, setCols] = React.useState<Collection[]>([]);
+  const [loading, setLoading] = React.useState(true);
+
+  const load = React.useCallback(() => {
+    setLoading(true);
+    api
+      .collections()
+      .then(setCols)
+      .catch((e) => toast.error(`读取合集失败：${e.message}`))
+      .finally(() => setLoading(false));
+  }, []);
+
+  React.useEffect(() => {
+    load();
+  }, [load, reloadKey]);
+
+  const remove = async (c: Collection) => {
+    if (!confirm(`删除合集「${c.name}」？仅删除该分组与引用它的任务目标，不删除资产本身。`)) return;
+    try {
+      await api.deleteCollection(c.id);
+      toast.success("已删除合集");
+      load();
+    } catch (e) {
+      toast.error(`删除失败：${(e as Error).message}`);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between">
+        <CardTitle className="text-base">资产合集</CardTitle>
+        <Button variant="ghost" size="sm" onClick={load} disabled={loading}>
+          <RefreshCwIcon className={loading ? "size-4 animate-spin" : "size-4"} /> 刷新
+        </Button>
+      </CardHeader>
+      <CardContent>
+        {cols.length === 0 ? (
+          <p className="py-4 text-center text-muted-foreground text-sm">
+            还没有合集。通过 FOFA 或 Shodan 查询并导入后，会生成对应合集，可在新建任务时选为测试目标。
+          </p>
+        ) : (
+          <div className="rounded-md border">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>名称</TableHead>
+                  <TableHead>来源</TableHead>
+                  <TableHead>查询</TableHead>
+                  <TableHead className="text-right">资产数</TableHead>
+                  <TableHead className="w-16" />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {cols.map((c) => (
+                  <TableRow key={c.id}>
+                    <TableCell className="font-medium">{c.name}</TableCell>
+                    <TableCell>
+                      <Badge variant="outline" className="text-xs uppercase">
+                        {c.source || "fofa"}
+                      </Badge>
+                    </TableCell>
+                    <TableCell className="max-w-xs truncate font-mono text-xs" title={c.query}>
+                      {c.query || "—"}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">{c.member_count}</TableCell>
+                    <TableCell className="text-right">
+                      <Button variant="ghost" size="sm" onClick={() => remove(c)}>
+                        删除
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
 }

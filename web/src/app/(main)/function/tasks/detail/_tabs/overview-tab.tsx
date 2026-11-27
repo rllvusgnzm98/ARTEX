@@ -54,17 +54,19 @@ function cacheHitRate(cacheRead: number, input: number): string {
   return Math.round((cacheRead / input) * 100) + "%";
 }
 
-// 测试范围一条的显示值：域名 / 网段 / 公司。
+// 测试范围一条的显示值：域名 / 网段 / 公司 / 资产合集。
 function scopeValue(row: TaskScopeRow): string {
   if (row.value) return row.value;
   if (row.domain) return row.domain;
   if (row.net) return row.net;
+  if (row.collection_id) return row.collection_name?.trim() ? row.collection_name : `合集 #${row.collection_id}`;
   if (row.company_id) return row.company_name?.trim() ? row.company_name : `企业 #${row.company_id}`;
   return "—";
 }
 
 const SCOPE_KIND_LABELS: Record<TaskScopeRow["kind"], string> = {
   company: "公司",
+  collection: "资产合集",
   root_domain: "根域名",
   subdomain: "子域名",
   ip: "IP",

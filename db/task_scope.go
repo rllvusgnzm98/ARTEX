@@ -18,16 +18,20 @@ import (
 type TaskScope struct {
 	ID        int64  `json:"id"`
 	TaskID    int64  `json:"task_id"`
-	Kind      string `json:"kind"` // company|root_domain|subdomain|ip|cidr|icp|keyword|exclude_root_domain|exclude_subdomain|exclude_ip|exclude_cidr
+	Kind      string `json:"kind"` // company|root_domain|subdomain|ip|cidr|icp|keyword|collection|exclude_root_domain|exclude_subdomain|exclude_ip|exclude_cidr
 	CompanyID *int64 `json:"company_id,omitempty"`
 	// CompanyName is resolved for kind=company so callers can label a scope row
 	// without a second lookup. Empty when the row is not a company reference.
-	CompanyName string `json:"company_name,omitempty"`
-	Domain      string `json:"domain,omitempty"`
-	Net         string `json:"net,omitempty"`
-	Value       string `json:"value,omitempty"`
-	Source      string `json:"source"`
-	Reason      string `json:"reason,omitempty"`
+	CompanyName  string `json:"company_name,omitempty"`
+	CollectionID *int64 `json:"collection_id,omitempty"`
+	// CollectionName is resolved for kind=collection so callers can label a scope
+	// row without a second lookup. Empty when the row is not a collection reference.
+	CollectionName string `json:"collection_name,omitempty"`
+	Domain         string `json:"domain,omitempty"`
+	Net            string `json:"net,omitempty"`
+	Value          string `json:"value,omitempty"`
+	Source         string `json:"source"`
+	Reason         string `json:"reason,omitempty"`
 }
 
 // stripHostPort drops a trailing :port from a host:port / ip:port / [ipv6]:port
@@ -62,7 +66,7 @@ func (s *AssetStore) upsertTaskScopeResult(ts TaskScope) (bool, error) {
 	if ts.TaskID <= 0 || ts.Kind == "" {
 		return false, nil
 	}
-	var domainVal, netVal, companyVal, valueVal any
+	var domainVal, netVal, companyVal, collectionVal, valueVal any
 	if ts.Domain != "" {
 		domainVal = ts.Domain
 	}
@@ -72,6 +76,9 @@ func (s *AssetStore) upsertTaskScopeResult(ts TaskScope) (bool, error) {
 	if ts.CompanyID != nil && *ts.CompanyID > 0 {
 		companyVal = *ts.CompanyID
 	}
+	if ts.CollectionID != nil && *ts.CollectionID > 0 {
+		collectionVal = *ts.CollectionID
+	}
 	if ts.Value != "" {
 		valueVal = ts.Value
 	}
@@ -80,9 +87,9 @@ func (s *AssetStore) upsertTaskScopeResult(ts TaskScope) (bool, error) {
 		src = "auto"
 	}
 	query := `
-INSERT INTO task_scope(task_id, kind, company_id, domain, net, value, source, reason)
-VALUES ($1,$2,$3,$4,$5::cidr,$6,$7,NULLIF($8,''))
-ON CONFLICT (task_id, kind, COALESCE(domain,''), COALESCE(net::text,''), COALESCE(company_id,0), COALESCE(value,''))
+INSERT INTO task_scope(task_id, kind, company_id, collection_id, domain, net, value, source, reason)
+VALUES ($1,$2,$3,$4,$5,$6::cidr,$7,$8,NULLIF($9,''))
+ON CONFLICT (task_id, kind, COALESCE(domain,''), COALESCE(net::text,''), COALESCE(company_id,0), COALESCE(collection_id,0), COALESCE(value,''))
 DO UPDATE SET
     source = EXCLUDED.source,
     reason = COALESCE(NULLIF(EXCLUDED.reason,''), task_scope.reason)
@@ -93,9 +100,9 @@ WHERE (EXCLUDED.source = 'manual' AND task_scope.source <> 'manual')
 		err    error
 	)
 	if s.tx != nil {
-		result, err = s.tx.ExecContext(s.ctx, query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason)
+		result, err = s.tx.ExecContext(s.ctx, query, ts.TaskID, ts.Kind, companyVal, collectionVal, domainVal, netVal, valueVal, src, ts.Reason)
 	} else {
-		result, err = s.db.ExecContext(s.ctx, query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason)
+		result, err = s.db.ExecContext(s.ctx, query, ts.TaskID, ts.Kind, companyVal, collectionVal, domainVal, netVal, valueVal, src, ts.Reason)
 	}
 	if err != nil {
 		return false, err
@@ -537,10 +544,12 @@ func (s *AssetStore) ListTaskScope(taskID int64) ([]TaskScope, error) {
 func (s *AssetStore) listTaskScopeCtx(ctx context.Context, taskID int64) ([]TaskScope, error) {
 	s = s.withContext(ctx)
 	query := `
-SELECT ts.id, ts.kind, COALESCE(ts.company_id,0), COALESCE(c.name,''), COALESCE(ts.domain,''),
-       COALESCE(ts.net::text,''), COALESCE(ts.value,''), ts.source, COALESCE(ts.reason,'')
+SELECT ts.id, ts.kind, COALESCE(ts.company_id,0), COALESCE(c.name,''),
+       COALESCE(ts.collection_id,0), COALESCE(ac.name,''),
+       COALESCE(ts.domain,''), COALESCE(ts.net::text,''), COALESCE(ts.value,''), ts.source, COALESCE(ts.reason,'')
 FROM task_scope ts
 LEFT JOIN companies c ON c.id=ts.company_id
+LEFT JOIN asset_collections ac ON ac.id=ts.collection_id
 WHERE ts.task_id=$1 ORDER BY ts.id`
 	var (
 		rows *sql.Rows
@@ -558,13 +567,16 @@ WHERE ts.task_id=$1 ORDER BY ts.id`
 	out := []TaskScope{}
 	for rows.Next() {
 		var t TaskScope
-		var cid int64
-		if err := rows.Scan(&t.ID, &t.Kind, &cid, &t.CompanyName, &t.Domain, &t.Net, &t.Value, &t.Source, &t.Reason); err != nil {
+		var cid, colID int64
+		if err := rows.Scan(&t.ID, &t.Kind, &cid, &t.CompanyName, &colID, &t.CollectionName, &t.Domain, &t.Net, &t.Value, &t.Source, &t.Reason); err != nil {
 			return nil, err
 		}
 		t.TaskID = taskID
 		if cid > 0 {
 			t.CompanyID = &cid
+		}
+		if colID > 0 {
+			t.CollectionID = &colID
 		}
 		out = append(out, t)
 	}
@@ -626,6 +638,7 @@ target AS (
          lower(regexp_replace(COALESCE(a.icp,''), '[[:space:]]+', '', 'g')) = ts.value
          OR lower(regexp_replace(COALESCE(a.app_icp,''), '[[:space:]]+', '', 'g')) = ts.value
        ))
+    OR (ts.kind='collection' AND a.id IN (SELECT asset_id FROM asset_collection_members WHERE collection_id = ts.collection_id))
   )
   WHERE NOT EXISTS (
     SELECT 1 FROM task_scope ex

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -44,13 +45,80 @@ func newRoEConfig(pg *db.DB) guard.RoEConfig {
 				return nil, err // 读失败交给 guard:strict 不得当成空范围放行
 			}
 			modeVal, _, _ := pg.GetSetting(settingRoEEnforcement)
-			return scopeRulesFromRowsForMode(rows, modeVal), nil
+			return resolveTaskScopeRules(pg, rows, modeVal)
 		},
 		TaskIDOf: func(ctx context.Context) int64 {
 			return agent.RunInfoFrom(ctx).TaskID
 		},
 		ExemptHosts: localRoEExemptHosts,
 	}
+}
+
+// resolveTaskScopeRules converts task_scope rows into guard ScopeRules and
+// expands any trusted kind='collection' rows into their member assets' exact
+// domains/IPs so RoE enforcement recognizes collection targets cleanly.
+func resolveTaskScopeRules(pg *db.DB, rows []db.TaskScope, mode string) ([]guard.ScopeRule, error) {
+	rules := scopeRulesFromRowsForMode(rows, mode)
+	strict := normalizeRoEMode(mode) == "strict"
+	var colIDs []int64
+	seenCol := map[int64]struct{}{}
+	for _, r := range rows {
+		if r.Kind != "collection" || r.CollectionID == nil || *r.CollectionID <= 0 {
+			continue
+		}
+		if strict && !isTrustedStrictScopeSource(r.Source) {
+			continue
+		}
+		if _, dup := seenCol[*r.CollectionID]; dup {
+			continue
+		}
+		seenCol[*r.CollectionID] = struct{}{}
+		colIDs = append(colIDs, *r.CollectionID)
+	}
+	if len(colIDs) == 0 || pg == nil {
+		return rules, nil
+	}
+	assets, err := pg.ListCollectionScopeAssets(colIDs)
+	if err != nil {
+		return nil, err
+	}
+	seenRule := map[string]struct{}{}
+	addRule := func(kind, val string) {
+		val = strings.ToLower(strings.TrimSpace(val))
+		if val == "" {
+			return
+		}
+		k := kind + "\x00" + val
+		if _, dup := seenRule[k]; dup {
+			return
+		}
+		seenRule[k] = struct{}{}
+		rules = append(rules, guard.ScopeRule{Kind: kind, Value: val})
+	}
+	for _, a := range assets {
+		if a.Type == "root_domain" && a.Domain != "" {
+			addRule("domain", a.Domain)
+		} else if a.Domain != "" {
+			if net.ParseIP(a.Domain) != nil {
+				addRule("ip", a.Domain)
+			} else {
+				addRule("exact_domain", a.Domain)
+			}
+		}
+		if a.IP != "" && net.ParseIP(a.IP) != nil {
+			addRule("ip", a.IP)
+		}
+		if a.URL != "" {
+			if h := hostFromURL(a.URL); h != "" {
+				if net.ParseIP(h) != nil {
+					addRule("ip", h)
+				} else {
+					addRule("exact_domain", h)
+				}
+			}
+		}
+	}
+	return rules, nil
 }
 
 // scopeRulesFromRows 定义见 pendingscope.go:官方 task_scope 归一,RoE 与
@@ -103,7 +171,11 @@ func (s *Server) roeVerdictFor(taskID int64, host string) (guard.ScopeVerdict, s
 	if err != nil {
 		return guard.ScopeUnknown, mode, err
 	}
-	matcher := guard.NewScopeMatcher(scopeRulesFromRowsForMode(rows, mode))
+	rules, err := resolveTaskScopeRules(s.m.pg, rows, mode)
+	if err != nil {
+		return guard.ScopeUnknown, mode, err
+	}
+	matcher := guard.NewScopeMatcher(rules)
 	matcher.AddExemptHosts(localRoEExemptHosts())
 	return matcher.Check(host), mode, nil
 }

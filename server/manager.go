@@ -981,7 +981,7 @@ func (m *Manager) proxyRoEDeps() roeGateDeps {
 				return nil, err
 			}
 			modeVal, _, _ := m.pg.GetSetting(settingRoEEnforcement)
-			return scopeRulesFromRowsForMode(rows, modeVal), nil
+			return resolveTaskScopeRules(m.pg, rows, modeVal)
 		},
 		warn: m.recordProxyRoEWarn,
 	}

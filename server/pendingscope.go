@@ -113,7 +113,11 @@ func (s *Server) reconRegisterPendingScope(taskID int64, ips map[string]bool) {
 	if err != nil {
 		return
 	}
-	matcher := guard.NewScopeMatcher(scopeRulesFromRows(rows))
+	rules, err := resolveTaskScopeRules(s.m.pg, rows, "warn")
+	if err != nil {
+		return
+	}
+	matcher := guard.NewScopeMatcher(rules)
 	segExample := map[string]string{}
 	for ip := range ips {
 		if matcher.Check(ip) != guard.ScopeOut {
