@@ -5,12 +5,84 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/hook"
 )
+
+// interfaceAddrsFn enumerates host network interface addresses for local/VPN
+// NIC auto-exemption. Swappable in tests for deterministic verification.
+var interfaceAddrsFn = net.InterfaceAddrs
+
+// LocalExemptHosts returns deduplicated, normalized local/VPN interface IPs
+// (non-loopback unicast addresses from net.InterfaceAddrs) plus the host part
+// of ARTEX_CALLBACK_ADDR and any caller-supplied extra hosts/host:port strings.
+func LocalExemptHosts(extra ...string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(raw string) {
+		h := extractExemptHost(raw)
+		if h == "" || seen[h] {
+			return
+		}
+		seen[h] = true
+		out = append(out, h)
+	}
+	if addrs, err := interfaceAddrsFn(); err == nil {
+		for _, a := range addrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+				continue
+			}
+			if v4 := ip.To4(); v4 != nil {
+				add(v4.String())
+			} else {
+				add(ip.String())
+			}
+		}
+	}
+	add(os.Getenv("ARTEX_CALLBACK_ADDR"))
+	for _, raw := range extra {
+		add(raw)
+	}
+	return out
+}
+
+func extractExemptHost(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if strings.Contains(raw, "://") {
+		if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
+			raw = u.Hostname()
+		}
+	}
+	h := normalizeHost(raw)
+	if h == "" || h == "*" {
+		return ""
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		if ip.IsUnspecified() || ip.IsMulticast() {
+			return ""
+		}
+		if v4 := ip.To4(); v4 != nil {
+			return v4.String()
+		}
+		return ip.String()
+	}
+	return h
+}
 
 // RoEConfig wires the RoE authorization-scope check (F5 / AUDIT-REPORT H2) into
 // the PreToolUse chain. All fields are optional; a nil Scope disables the check
@@ -27,6 +99,10 @@ type RoEConfig struct {
 	// TaskIDOf extracts the task id from the hook ctx (server 注入
 	// agent.RunInfoFrom;guard 不反向依赖 agent 包)。nil → 0 → Unknown。
 	TaskIDOf func(ctx context.Context) int64
+	// ExemptHosts optionally returns additional operator/local hosts (e.g.
+	// config callback_addr / own_infra_hosts) exempted alongside local NIC IPs
+	// and ARTEX_CALLBACK_ADDR unless explicitly excluded by a scope rule.
+	ExemptHosts func() []string
 }
 
 // SetRoE installs the RoE scope check. Zero RoEConfig disables it.
@@ -82,6 +158,11 @@ func (g *Guard) checkRoE(ctx context.Context, ev hook.Event, cmd string) (hook.R
 		return g.roeScopeLoadFailure(ev, cmd, mode, taskID, err)
 	}
 	matcher := NewScopeMatcher(rules)
+	var extraExempt []string
+	if cfg.ExemptHosts != nil {
+		extraExempt = cfg.ExemptHosts()
+	}
+	matcher.AddExemptHosts(LocalExemptHosts(extraExempt...))
 	var out []string
 	unknown := false
 	for _, h := range hosts {

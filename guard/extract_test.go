@@ -177,3 +177,71 @@ func TestExtractHostsIgnoresNonNetworkSchemesAndSSHRemoteCommandArgs(t *testing.
 		}
 	}
 }
+
+func TestExtractHostsRoEFalsePositiveCleanup(t *testing.T) {
+	cases := []struct {
+		name string
+		cmd  string
+		want []string
+	}{
+		{
+			"SOAP/XML xmlns namespaces and schema hosts ignored",
+			`curl -s -X POST http://192.168.111.20:7001/wls-wsat/CoordinatorPortType -d '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:wsa="http://www.w3.org/2005/08/addressing" xmlns:work="http://www.bea.com/2004/06/soap/workarea/" xmlns:custom="http://ns.vendor.internal/v1"><soapenv:Body/></soapenv:Envelope>'`,
+			[]string{"192.168.111.20"},
+		},
+		{
+			"Spring and Microsoft XML schema hosts ignored",
+			`curl -s http://10.0.0.5:8080/api -d '<beans xmlns="http://www.springframework.org/schema/beans" xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages" xsi:schemaLocation="http://www.w3.org/2001/XMLSchema http://www.springframework.org/schema/beans/spring-beans.xsd"/>'`,
+			[]string{"10.0.0.5"},
+		},
+		{
+			"post-ex and script file extensions ignored",
+			`curl http://10.0.0.5/ sam.save system.hiv urllib.parse lsass.dmp hklm.reg admin.kirbi krb5.ccache exploit.py invoke.ps1 agent.exe helper.dll Exploit.class run.log`,
+			[]string{"10.0.0.5"},
+		},
+		{
+			"netmask broadcast and unspecified IPs ignored",
+			`ifconfig eth0 192.168.52.30 netmask 255.255.255.0 broadcast 255.255.255.255 && python3 -m http.server --bind 0.0.0.0 8000 && echo 0.0.0.0:8080 255.0.0.0`,
+			[]string{"192.168.52.30"},
+		},
+		{
+			"smbclient single-target reset with UNC share",
+			`smbclient //192.168.52.30/C$ -U admin%pass -c "get flag.out secret.dat"`,
+			[]string{"192.168.52.30"},
+		},
+		{
+			"rpcclient single-target reset",
+			`rpcclient -U admin%pass 192.168.52.30 -c "enumdomusers; queryuser foo.bar"`,
+			[]string{"192.168.52.30"},
+		},
+		{
+			"evil-winrm -i single-target reset",
+			`evil-winrm -i 192.168.52.30 -u admin -p pass -s payload.out`,
+			[]string{"192.168.52.30"},
+		},
+		{
+			"nxc single-target reset after protocol subcommand and host",
+			`nxc smb 192.168.52.30 -u admin -p pass -x "cmd /c type loot.out"`,
+			[]string{"192.168.52.30"},
+		},
+		{
+			"impacket prefixed tools single-target reset",
+			`impacket-smbexec corp/admin:pass@dc.corp.local "cmd /c dir share.out"`,
+			[]string{"dc.corp.local"},
+		},
+		{
+			"impacket-wmiexec single-target reset",
+			`impacket-wmiexec admin@10.0.0.8 "powershell -c Get-Item foo.bar"`,
+			[]string{"10.0.0.8"},
+		},
+	}
+	for _, c := range cases {
+		got := ExtractHosts(c.cmd)
+		if len(got) == 0 {
+			got = nil
+		}
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: ExtractHosts(%q) = %v, want %v", c.name, c.cmd, got, c.want)
+		}
+	}
+}

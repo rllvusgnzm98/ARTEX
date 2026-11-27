@@ -91,23 +91,23 @@ WHERE exploration_id=$1 AND origin='entry-priority-general' AND (payload->>'sequ
 
 func TestRenderEntrySeedKeyCapAndOmissions(t *testing.T) {
 	seed := WorkerEntrySeed{Prefetched: true}
-	for i := 44; i >= 0; i-- {
+	for i := 16; i >= 0; i-- {
 		seed.ConfirmedFacts = append(seed.ConfirmedFacts, EntryFact{ID: int64(i + 1), Summary: fmt.Sprintf("key-%d", i), Category: "scope_limit"})
 	}
-	for i := 99; i >= 0; i-- {
+	for i := 49; i >= 0; i-- {
 		seed.ConfirmedFacts = append(seed.ConfirmedFacts, EntryFact{ID: int64(i + 100), Summary: fmt.Sprintf("ordinary-%d", i)})
 	}
 	prompt := RenderWorkerEntrySeed(seed)
-	if strings.Count(prompt, "- fact #") != 60 || strings.Count(prompt, "[category=scope_limit]") != 40 {
+	if strings.Count(prompt, "- fact #") != entrySeedFactCap || strings.Count(prompt, "[category=scope_limit]") != entrySeedKeyFactCap {
 		t.Fatalf("wrong class caps:\n%s", prompt)
 	}
-	if !strings.Contains(prompt, "fact #1 ") || !strings.Contains(prompt, "fact #40 ") || strings.Contains(prompt, "fact #41 ") || strings.Contains(prompt, "fact #179 ") || !strings.Contains(prompt, "fact #180 ") || !strings.Contains(prompt, "fact #199 ") {
-		t.Errorf("must retain oldest 40 keys, newest 20 ordinary facts:\n%s", prompt)
+	if !strings.Contains(prompt, "fact #1 ") || !strings.Contains(prompt, "fact #12 ") || strings.Contains(prompt, "fact #13 ") || strings.Contains(prompt, "fact #136 ") || !strings.Contains(prompt, "fact #137 ") || !strings.Contains(prompt, "fact #149 ") {
+		t.Errorf("must retain oldest 12 keys, newest 13 ordinary facts:\n%s", prompt)
 	}
-	if strings.Index(prompt, "fact #40 ") > strings.Index(prompt, "fact #180 ") {
+	if strings.Index(prompt, "fact #12 ") > strings.Index(prompt, "fact #137 ") {
 		t.Error("keys must render before ordinary facts")
 	}
-	if !strings.Contains(prompt, "另有 85 条事实未列出：关键事实 5 条，相关普通事实 80 条") || !strings.Contains(prompt, "list_facts / node_detail") {
+	if !strings.Contains(prompt, "另有 42 条事实未列出：关键事实 5 条，相关普通事实 37 条") || !strings.Contains(prompt, "list_facts / node_detail") {
 		t.Errorf("incorrect class omission counts:\n%s", prompt)
 	}
 }

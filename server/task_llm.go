@@ -307,7 +307,7 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 			msg, sr, usage, callErr = selection.provider.Complete(ctx, req)
 			if callErr != nil && ctx.Err() == nil && !agent.ModelRetriesStopped(ctx) &&
 				attempt < retries && isRetryableStreamError(callErr) {
-				backoff := backoffOf(attempt)
+				backoff := sameProviderAttemptBackoff(selection.retry, backoffOf, attempt, callErr)
 				log.Printf("[task-llm] task %s 非流式调用失败,%v 后同 provider 重试 (%d/%d): %v",
 					taskID, backoff, attempt+1, retries, callErr)
 				if sleepCtx(ctx, backoff) || agent.ModelRetriesStopped(ctx) {
@@ -384,7 +384,7 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 				}
 				if streamErr != nil && !committed && ctx.Err() == nil && !agent.ModelRetriesStopped(ctx) &&
 					attempt < retries && isRetryableStreamError(streamErr) {
-					backoff := backoffOf(attempt)
+					backoff := sameProviderAttemptBackoff(selection.retry, backoffOf, attempt, streamErr)
 					log.Printf("[task-llm] task %s 提交前流失败,%v 后同 provider 重试 (%d/%d): %v",
 						taskID, backoff, attempt+1, retries, streamErr)
 					if sleepCtx(ctx, backoff) || agent.ModelRetriesStopped(ctx) {
@@ -476,13 +476,71 @@ func streamEventCommitsOutput(event llm.StreamEvent) bool {
 // 冒泡成 model_error,零重试。只要一个 token 都还没交给调用方(!committed),重放
 // 完全相同的请求就不会重复模型输出或工具副作用,因此这里补一层同 provider 退避重试,
 // 把这类抖动挡在意图整体重跑之前。可被 LLM 配置的重试覆盖/全局重试策略改写。
-const sameProviderStreamRetries = 2
+const sameProviderStreamRetries = 5
 
 // sameProviderRetryBackoff 是第 attempt 次重试前的【默认】退避(0.5s、1s…,上限 4s),
 // 与 SDK 的指数梯度同风格但封顶更小,避免拖住 worker 的收尾/取消响应。
 // 以变量形式暴露,便于测试将退避置零。
 var sameProviderRetryBackoff = func(attempt int) time.Duration {
 	return min(500*time.Millisecond*(1<<attempt), 4*time.Second)
+}
+
+// sameProviderTransportBackoff 是连接拒绝/断流 EOF/502/503 等传输级故障的指数退避
+// 阶梯（1s, 2s, 4s, 8s, 15s），用于在短时网关或代理抖动期间抗过故障窗口。
+// 以变量形式暴露，便于测试置零。
+var sameProviderTransportBackoff = func(attempt int) time.Duration {
+	ladder := [...]time.Duration{
+		1 * time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		15 * time.Second,
+	}
+	if attempt <= 0 {
+		return ladder[0]
+	}
+	if attempt >= len(ladder) {
+		return ladder[len(ladder)-1]
+	}
+	return ladder[attempt]
+}
+
+// isRetryableTransportError reports whether err is a transient transport or
+// upstream gateway failure (connection refused, EOF, 502/503, connection reset)
+// that warrants the wider 1s->2s->4s->8s->15s exponential backoff ladder.
+func isRetryableTransportError(err error) bool {
+	if !isRetryableStreamError(err) {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	for _, needle := range []string{
+		"connection refused",
+		"unexpected eof",
+		"eof",
+		"status 502",
+		"502 bad gateway",
+		"bad gateway",
+		"status 503",
+		"503 service unavailable",
+		"service unavailable",
+		"connection reset",
+		"broken pipe",
+		"i/o timeout",
+		"tls handshake timeout",
+		"network is unreachable",
+	} {
+		if strings.Contains(s, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameProviderAttemptBackoff(r agent.RetryConfig, backoffOf func(int) time.Duration, attempt int, err error) time.Duration {
+	if r.StreamInterval <= 0 && isRetryableTransportError(err) {
+		return sameProviderTransportBackoff(attempt)
+	}
+	return backoffOf(attempt)
 }
 
 // sameProviderRetryPolicy 解析这次调用用哪套同 provider 重试参数:配置里设了次数就

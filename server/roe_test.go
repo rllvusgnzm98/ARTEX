@@ -273,3 +273,37 @@ func TestRoEStrictIgnoresAutoAndAgentScopeExpansionAndHonorsExclusions(t *testin
 		t.Fatalf("manual subdomain must match exact host, not child deep.evil.other.test")
 	}
 }
+
+func TestRoEStrictSeedScopeEnforcesAndCallbackExempts(t *testing.T) {
+	pg := openTestPG(t)
+	withRoEMode(t, pg, "strict")
+	t.Setenv("ARTEX_CALLBACK_ADDR", "198.51.100.77:4444")
+
+	task, err := pg.CreateTask("roe strict seed", "round-0 seed target", nil, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	t.Cleanup(func() { _ = pg.DeleteTask(task.ID) })
+
+	as := pg.Assets()
+	if _, err := as.AddAgentScope(task.ID, "ip", "192.168.111.20", "goal seed", "seed"); err != nil {
+		t.Fatalf("seed scope: %v", err)
+	}
+	// Runtime agent scope addition must NOT widen strict boundary.
+	if _, err := as.AddAgentScope(task.ID, "ip", "10.255.0.9", "runtime guess", "agent"); err != nil {
+		t.Fatalf("agent scope: %v", err)
+	}
+
+	s := &Server{m: &Manager{pg: pg, assets: as}}
+	ctx := agent.WithRunInfo(context.Background(), agent.RunInfo{TaskID: task.ID})
+
+	if msg, err := s.roeCheckHost(ctx, "192.168.111.20", "target"); err != nil || msg != "" {
+		t.Fatalf("seed target should pass in strict mode: msg=%q err=%v", msg, err)
+	}
+	if _, err := s.roeCheckHost(ctx, "10.255.0.9", "target"); err == nil {
+		t.Fatal("strict mode with seed scope must block out-of-scope / runtime-agent target (no ScopeUnknown fail-open)")
+	}
+	if msg, err := s.roeCheckHost(ctx, "198.51.100.77", "target"); err != nil || msg != "" {
+		t.Fatalf("ARTEX_CALLBACK_ADDR host should be auto-exempted: msg=%q err=%v", msg, err)
+	}
+}

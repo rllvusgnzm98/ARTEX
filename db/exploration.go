@@ -319,7 +319,11 @@ func (s *ExplorationStore) SetNodeState(id int64, state string) error {
 }
 
 func (s *ExplorationStore) SetNodeStateCtx(ctx context.Context, id int64, state string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE exploration_nodes SET state=$1, blocked_reason=NULL, content_version=content_version+1 WHERE id=$2 AND exploration_id=$3`, state, id, s.expID)
+	terminal := state == "met" || state == "abandoned" || state == "dismissed"
+	_, err := s.db.ExecContext(ctx, `UPDATE exploration_nodes
+SET state=$1, blocked_reason=NULL, content_version=content_version+1,
+    completed_at = CASE WHEN $4 THEN COALESCE(completed_at, now()) ELSE NULL END
+WHERE id=$2 AND exploration_id=$3`, state, id, s.expID, terminal)
 	return err
 }
 
@@ -394,6 +398,23 @@ WHERE id=$1 AND exploration_id=$2 AND kind='intent'
 func (s *ExplorationStore) ReopenBlockedIntents() (int64, error) {
 	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='open', completed_at=NULL, blocked_reason=NULL
 WHERE exploration_id=$1 AND kind='intent' AND state='blocked'`, s.expID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// StopOpenIntents transitions all stranded 'open' intents in this exploration to
+// 'stopped' (stamping completed_at and bumping content_version). Called when a
+// task reaches 'done' so queued intents no longer lock ancestor chains hot.
+func (s *ExplorationStore) StopOpenIntents(ctx context.Context) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE exploration_nodes
+SET state='stopped', owner='', blocked_reason=NULL, content_version=content_version+1, completed_at=COALESCE(completed_at, now())
+WHERE exploration_id=$1 AND kind='intent' AND state='open'`, s.expID)
 	if err != nil {
 		return 0, err
 	}
@@ -803,13 +824,25 @@ WHERE exploration_id=$1 AND kind=$2 ORDER BY id DESC LIMIT $3`, s.expID, kind, l
 
 // EntrySeedFacts reads one fact class without a recency cap. Key facts are read
 // independently so old restrictions and evidence cannot fall out of the seed.
+// Facts already covered by an active digest (digest --covers--> fact) are
+// excluded so worker entry seeds do not re-inject cold folded history.
 func (s *ExplorationStore) EntrySeedFacts(key bool) ([]*Node, error) {
 	rows, err := s.db.Query(`SELECT `+nodeCols+` FROM exploration_nodes
 WHERE exploration_id=$1 AND kind='fact' AND (
   COALESCE(payload->>'category','') NOT IN ('','general')
   OR CASE WHEN jsonb_typeof(payload->'evidence_ids')='array'
      THEN jsonb_array_length(payload->'evidence_ids')>0 ELSE false END
-)=$2 ORDER BY id ASC`, s.expID, key)
+)=$2
+AND NOT EXISTS (
+  SELECT 1 FROM exploration_edges e
+  JOIN exploration_nodes d ON d.id = e.src_id AND d.exploration_id = e.exploration_id
+  WHERE e.exploration_id = exploration_nodes.exploration_id
+    AND e.rel = 'covers'
+    AND e.dst_id = exploration_nodes.id
+    AND d.kind = 'digest'
+    AND d.state = 'active'
+)
+ORDER BY id ASC`, s.expID, key)
 	if err != nil {
 		return nil, err
 	}
@@ -931,6 +964,82 @@ func (s *ExplorationStore) CountRunningIntents() (int, error) {
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM exploration_nodes
 WHERE exploration_id=$1 AND kind='intent' AND state='running'`, s.expID).Scan(&n)
 	return n, err
+}
+
+// GraphSignalWatermarks tracks the highest node id per signal kind so the
+// planner loop can detect newly created intents, facts, findings, or hints
+// in one lightweight query without fetching node bodies.
+type GraphSignalWatermarks struct {
+	MaxIntentID  int64
+	MaxFactID    int64
+	MaxFindingID int64
+	MaxHintID    int64
+}
+
+// GraphSignalWatermarks returns the current max node id for intent/fact/finding/hint.
+func (s *ExplorationStore) GraphSignalWatermarks() (GraphSignalWatermarks, error) {
+	var wm GraphSignalWatermarks
+	rows, err := s.db.Query(`SELECT kind, COALESCE(MAX(id), 0)
+FROM exploration_nodes
+WHERE exploration_id=$1 AND kind IN ('intent','fact','finding','hint')
+GROUP BY kind`, s.expID)
+	if err != nil {
+		return wm, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var kind string
+		var maxID int64
+		if err := rows.Scan(&kind, &maxID); err != nil {
+			return wm, err
+		}
+		switch kind {
+		case KindIntent:
+			wm.MaxIntentID = maxID
+		case KindFact:
+			wm.MaxFactID = maxID
+		case KindFinding:
+			wm.MaxFindingID = maxID
+		case KindHint:
+			wm.MaxHintID = maxID
+		}
+	}
+	return wm, rows.Err()
+}
+
+// StalledIntentStamp summarizes exhausted/blocked intents so the planner's
+// deterministic heartbeat check can detect newly stalled intents without an LLM call.
+type StalledIntentStamp struct {
+	Count         int
+	LatestUpdated time.Time
+}
+
+// StalledIntentStamp returns the count and most recent updated_at across all
+// exhausted/blocked intents in this exploration.
+func (s *ExplorationStore) StalledIntentStamp() (StalledIntentStamp, error) {
+	var st StalledIntentStamp
+	var latest sql.NullTime
+	err := s.db.QueryRow(`SELECT COUNT(*), MAX(updated_at)
+FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='intent' AND state IN ('exhausted','blocked')`, s.expID).Scan(&st.Count, &latest)
+	if err != nil {
+		return st, err
+	}
+	if latest.Valid {
+		st.LatestUpdated = latest.Time
+	}
+	return st, nil
+}
+
+// LastActivityTime returns the most recent persisted activity timestamp for this
+// exploration (zero time if no activity rows exist).
+func (s *ExplorationStore) LastActivityTime() (time.Time, error) {
+	var latest sql.NullTime
+	err := s.db.QueryRow(`SELECT MAX(created_at) FROM activity WHERE exploration_id=$1`, s.expID).Scan(&latest)
+	if err != nil || !latest.Valid {
+		return time.Time{}, err
+	}
+	return latest.Time, nil
 }
 
 // GetNode returns one node of this exploration by id (nil, nil if not found).
@@ -1968,31 +2077,96 @@ func (s *ExplorationStore) ActivityTraceForTerminalIntent(nodeID int64, limit in
 	return scanTrace(rows)
 }
 
-// ActivityTraceSearch finds steps whose summary OR detail matches q
-// (case-insensitive), returning summaries only. nodeID != nil scopes to one work;
-// nil searches across ALL works (node_id IS NOT NULL — planner/main steps have no
-// node_id, so this cleanly means "worker traces"). thinking/usage rows dropped.
-func (s *ExplorationStore) ActivityTraceSearch(nodeID *int64, q string, limit int) ([]Activity, error) {
+const maxTraceSearchTerms = 8
+
+// tokenizeTraceQuery splits a whitespace-separated trace query into unique
+// non-empty search terms (case-insensitive dedup, capped at maxTraceSearchTerms).
+func tokenizeTraceQuery(q string) []string {
+	raw := strings.Fields(strings.TrimSpace(q))
+	if len(raw) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(raw))
+	out := make([]string, 0, min(len(raw), maxTraceSearchTerms))
+	for _, tok := range raw {
+		key := strings.ToLower(tok)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, tok)
+		if len(out) >= maxTraceSearchTerms {
+			break
+		}
+	}
+	return out
+}
+
+// buildTraceSearchClause builds a parameterized ILIKE predicate matching each
+// term against summary or detail, joined by joinOp ("AND" or "OR").
+func buildTraceSearchClause(colPrefix string, terms []string, joinOp string, startArgIdx int) (string, []any) {
+	if len(terms) == 0 {
+		like := "%"
+		return fmt.Sprintf("(%ssummary ILIKE $%d OR %sdetail ILIKE $%d)", colPrefix, startArgIdx, colPrefix, startArgIdx), []any{like}
+	}
+	parts := make([]string, 0, len(terms))
+	args := make([]any, 0, len(terms))
+	for i, tok := range terms {
+		idx := startArgIdx + i
+		parts = append(parts, fmt.Sprintf("(%ssummary ILIKE $%d OR %sdetail ILIKE $%d)", colPrefix, idx, colPrefix, idx))
+		args = append(args, "%"+tok+"%")
+	}
+	if len(parts) == 1 {
+		return parts[0], args
+	}
+	return "(" + strings.Join(parts, " "+joinOp+" ") + ")", args
+}
+
+func (s *ExplorationStore) runTraceSearch(baseWhere string, baseArgs []any, colPrefix, q string, limit int) ([]Activity, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	like := "%" + q + "%"
-	var rows *sql.Rows
-	var err error
+	terms := tokenizeTraceQuery(q)
+	execSearch := func(joinOp string) ([]Activity, error) {
+		clause, clauseArgs := buildTraceSearchClause(colPrefix, terms, joinOp, len(baseArgs)+1)
+		args := make([]any, 0, len(baseArgs)+len(clauseArgs)+1)
+		args = append(args, baseArgs...)
+		args = append(args, clauseArgs...)
+		limitIdx := len(args) + 1
+		args = append(args, limit)
+		query := fmt.Sprintf(`SELECT %s FROM activity WHERE %s AND %s ORDER BY id LIMIT $%d`,
+			traceCols, baseWhere, clause, limitIdx)
+		rows, err := s.db.Query(query, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		return scanTrace(rows)
+	}
+	hits, err := execSearch("AND")
+	if err != nil || len(hits) > 0 || len(terms) <= 1 {
+		return hits, err
+	}
+	return execSearch("OR")
+}
+
+// ActivityTraceSearch finds steps whose summary OR detail matches q
+// (case-insensitive), returning summaries only. Multi-word queries match all
+// terms with AND and automatically fall back to OR if AND yields 0 hits.
+// nodeID != nil scopes to one work; nil searches across ALL works (node_id IS NOT NULL —
+// planner/main steps have no node_id, so this cleanly means "worker traces").
+// thinking/usage rows dropped.
+func (s *ExplorationStore) ActivityTraceSearch(nodeID *int64, q string, limit int) ([]Activity, error) {
 	if nodeID != nil {
-		rows, err = s.db.Query(`SELECT `+traceCols+`
-FROM activity WHERE exploration_id=$1 AND node_id=$2 AND kind NOT IN ('thinking','usage')
-AND (summary ILIKE $3 OR detail ILIKE $3) ORDER BY id LIMIT $4`, s.expID, *nodeID, like, limit)
-	} else {
-		rows, err = s.db.Query(`SELECT `+traceCols+`
-FROM activity WHERE exploration_id=$1 AND node_id IS NOT NULL AND kind NOT IN ('thinking','usage')
-AND (summary ILIKE $2 OR detail ILIKE $2) ORDER BY id LIMIT $3`, s.expID, like, limit)
+		return s.runTraceSearch(
+			`exploration_id=$1 AND node_id=$2 AND kind NOT IN ('thinking','usage')`,
+			[]any{s.expID, *nodeID}, "", q, limit,
+		)
 	}
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	return scanTrace(rows)
+	return s.runTraceSearch(
+		`exploration_id=$1 AND node_id IS NOT NULL AND kind NOT IN ('thinking','usage')`,
+		[]any{s.expID}, "", q, limit,
+	)
 }
 
 // ActivityTraceSearchForTerminalIntent is the scoped inherited search variant;
@@ -2089,24 +2263,17 @@ ORDER BY en.id DESC`, assetID, s.expID)
 // ActivityTraceSearchExcluding keyword-searches every node's steps in this
 // exploration EXCEPT one node's own (excludeNodeID) — so a worker's
 // search_all_worker_traces doesn't return its own in-progress trace (which is
-// already in its context). excludeNodeID<=0 → no exclusion (searches all nodes).
+// already in its context). Multi-word whitespace queries tokenize into AND
+// ILIKE terms with an OR fallback when AND returns 0 hits. excludeNodeID<=0 →
+// no exclusion (searches all nodes).
 func (s *ExplorationStore) ActivityTraceSearchExcluding(excludeNodeID int64, q string, limit int) ([]Activity, error) {
 	if excludeNodeID <= 0 {
 		return s.ActivityTraceSearch(nil, q, limit)
 	}
-	if limit <= 0 {
-		limit = 100
-	}
-	like := "%" + q + "%"
-	rows, err := s.db.Query(`SELECT `+traceCols+`
-FROM activity WHERE exploration_id=$1 AND node_id IS NOT NULL AND node_id <> $2
-AND kind NOT IN ('thinking','usage')
-AND (summary ILIKE $3 OR detail ILIKE $3) ORDER BY id LIMIT $4`, s.expID, excludeNodeID, like, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	return scanTrace(rows)
+	return s.runTraceSearch(
+		`exploration_id=$1 AND node_id IS NOT NULL AND node_id <> $2 AND kind NOT IN ('thinking','usage')`,
+		[]any{s.expID, excludeNodeID}, "", q, limit,
+	)
 }
 
 // ActivityByIDs loads full detail for specific step ids (the trace drill-down),

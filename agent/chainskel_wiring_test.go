@@ -174,3 +174,19 @@ func TestSystemPromptsCarryMetaRules(t *testing.T) {
 		t.Fatal("worker system 不应含 planner 专属派活纪律")
 	}
 }
+
+func TestRenderIntentTaskDualTagAndPivotSessionReminder(t *testing.T) {
+	n := &db.Node{ID: 99, Payload: []byte(`{"summary":"WebLogic RCE 后搭代理横向","chain_tags":["web","pivot"]}`)}
+	msg := renderIntentTask(n)
+	if !strings.Contains(msg, `category="web"`) || !strings.Contains(msg, `category="pivot"`) {
+		t.Fatalf("dual chain_tags should inject both web and pivot skeletons:\n%s", msg)
+	}
+	if strings.Count(msg, "<chains-skeleton ") != 2 {
+		t.Fatalf("expected 2 injected skeletons, got %d", strings.Count(msg, "<chains-skeleton "))
+	}
+	for _, want := range []string{"register_session", "tunnel_register", "shared/"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("pivot skeleton missing %q reminder:\n%s", want, msg)
+		}
+	}
+}

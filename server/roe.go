@@ -10,9 +10,17 @@ import (
 	"strings"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/config"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/guard"
 )
+
+// localRoEExemptHosts collects local/VPN interface IPs (net.InterfaceAddrs)
+// plus platform callback / own-infra hosts (ARTEX_CALLBACK_ADDR, callback_addr,
+// own_infra_hosts) so operator/attacker local interfaces never spam RoE alerts.
+func localRoEExemptHosts() []string {
+	return guard.LocalExemptHosts(config.OwnInfraHosts()...)
+}
 
 // settingRoEEnforcement 是 RoE 三态设置键:"off" | "warn"(默认) | "strict"。
 // 空值与未知值由 guard.RoEConfig.mode 回落为 warn。
@@ -41,6 +49,7 @@ func newRoEConfig(pg *db.DB) guard.RoEConfig {
 		TaskIDOf: func(ctx context.Context) int64 {
 			return agent.RunInfoFrom(ctx).TaskID
 		},
+		ExemptHosts: localRoEExemptHosts,
 	}
 }
 
@@ -94,7 +103,9 @@ func (s *Server) roeVerdictFor(taskID int64, host string) (guard.ScopeVerdict, s
 	if err != nil {
 		return guard.ScopeUnknown, mode, err
 	}
-	return guard.NewScopeMatcher(scopeRulesFromRowsForMode(rows, mode)).Check(host), mode, nil
+	matcher := guard.NewScopeMatcher(scopeRulesFromRowsForMode(rows, mode))
+	matcher.AddExemptHosts(localRoEExemptHosts())
+	return matcher.Check(host), mode, nil
 }
 
 // sessionRoECheck 在登记会话前校验目标 URL 的 host 是否在本任务官方范围内:

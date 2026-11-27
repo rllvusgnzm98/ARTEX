@@ -93,10 +93,10 @@ func (e *Engine) resetTimeoutRevival(taskID string) {
 	e.coordStarted.Delete(taskID)
 }
 
-// stampFirstRun records first_run_at + deadline_at on the FIRST real run (LLM ready)
-// of a timeout task, once per process. No-op when the task has no timeout.
+// stampFirstRun records first_run_at (+ deadline_at when TimeoutSeconds > 0) on
+// the FIRST real run (LLM ready) of any task, once per process.
 func (e *Engine) stampFirstRun(t *Task) {
-	if t.TimeoutSeconds <= 0 {
+	if t == nil || e.m == nil || e.m.pg == nil {
 		return
 	}
 	if _, loaded := e.stamped.LoadOrStore(t.ID, true); loaded {
@@ -269,6 +269,9 @@ func (e *Engine) settleTask(ctx context.Context, t *Task) {
 		log.Printf("[deadline] task %s 收尾时已是终态,保留原状态", t.ID)
 	}
 	if met {
+		if won {
+			e.stopOpenIntents(t)
+		}
 		e.fireRetro(t.ID) // 超时收尾也判定目标达成 → 同样触发一次复盘
 	}
 }

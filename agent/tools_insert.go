@@ -414,7 +414,9 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 					}
 				}
 				// 自动入测试范围(source='auto')：只对 worker 顶层显式插入的这一项，按其
-				// 类型加保守范围；side-effect 派生的资产不经此处，故范围不盲目扩大。taskID=0 时无操作。
+				// 类型加保守范围；若任务已登记受信任范围(manual/seed)且该资产落于范围外，
+				// AddAutoScopeCtx 不会静默扩权，而是保持资产入库并转入 pending_scope。
+				// side-effect 派生的资产不经此处，故范围不盲目扩大。taskID=0 时无操作。
 				// 与覆盖度开关无关：task_scope 是任务的范围边界(list/查询的过滤基准)，
 				// 覆盖度开关只决定要不要把它当分母去算指标，不决定要不要累积范围本身。
 				{
@@ -531,10 +533,18 @@ func (t *ToolSet) addTaskScope() actool.CoreTool {
 			if len(items) == 0 {
 				items = []scopeEntry{a.scopeEntry}
 			}
+			src := "agent"
+			if strings.TrimSpace(t.scopeSource) == "seed" {
+				src = "seed"
+			}
+			reason := strings.TrimSpace(a.Reason)
+			if src == "agent" && reason == "" {
+				return actool.Errorf("add_task_scope 必须填写 reason 说明范围依据（便于审计）"), nil
+			}
 			var added []map[string]any
 			errs := map[string]string{}
 			for i, e := range items {
-				ts, err := t.as.AddAgentScopeCtx(ctx, t.taskID, strings.TrimSpace(e.Kind), e.Value, a.Reason, "agent")
+				ts, err := t.as.AddAgentScopeCtx(ctx, t.taskID, strings.TrimSpace(e.Kind), e.Value, reason, src)
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
 					continue
@@ -726,6 +736,8 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		t.searchAllWorkerTraces(), t.getWorkerTrace(),
 		// node_detail：worker 拿到 intent_id/节点 id 后可查该节点完整详情（配合上面的回看）。
 		t.nodeDetail(),
+		// expand_digest：worker 可按需展开冷摘要 digest 节点（P0-C1）。
+		t.expandDigest(),
 		// 读侧闭环：worker 必须能读回已确认事实与企业范围，避免后续工人靠盲扫补上下文。
 		// list_worker_traces 仍不给 worker（v2 已补回 search/get_worker_trace/node_detail，不再改它）。
 		t.listFacts(), t.listCompanies(),

@@ -74,6 +74,7 @@ const goalsScopeTail = `
 - **不要**登记公司范围（company）——任务刚建立、资产系统里通常还没有这家公司，登记不上，公司级范围交由后续 plan 阶段处理。
 其它规则：
 - 只登记**目标/描述里明确写出**的范围；严禁臆造或推断未提及的域名/IP。
+- 严禁把操作员本机/攻击机回连地址（如「本机地址 x.x.x.x」「攻击机/监听 IP」）通过 add_task_scope 登记为测试范围。
 - reason 简述依据来自哪句话，便于审计。
 - 若目标/描述中没有任何明确资产范围，则**不要**调用 add_task_scope。
 先用 add_task_scope 登记范围（如有），再调用 set_goals 提交目标。`
@@ -147,6 +148,7 @@ func DecomposeGoalsWithProvider(ctx context.Context, prov llm.Provider, dataDir,
 	// each goal under the task root. This is the catalog's real set_goals tool, so a
 	// web-edited description/schema on it applies here too.
 	tsx := &ToolSet{as: as, ts: ts, taskID: taskID, worker: "goals"}
+	tsx.SetScopeSource("seed")
 	// Description rides in the user message (same channel as the goal), NOT via the
 	// {{.EngagementDescription}} template var — else a prompt that references the var
 	// would inject the description twice. System prompt stays pure static instructions.

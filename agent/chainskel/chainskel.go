@@ -25,12 +25,16 @@ var skeletonFS embed.FS
 // Categories 是合法的 chain_tags 取值。
 var Categories = []string{"web", "ad", "app", "priv", "pwn", "recon", "rev", "pivot", "meta", "patch", "firmware", "audit", "identity", "cloud", "protocol", "supply", "ai", "ot", "wireless", "extension", "client", "hardware", "database", "email", "report", "web3"}
 
-// MaxTagsPerIntent 是公开标签校验上限;ForIntent 只注入首个主类别。
+// MaxTagsPerIntent 是公开标签校验与注入上限（最多注入 2 个攻击面骨架）。
 const MaxTagsPerIntent = 2
 
-// sectionCapRunes 是注入 worker system 的骨架块总字符(rune)上限,超出截断并标注。
+// sectionCapRunes 是注入 worker 启动提示的骨架块总字符(rune)上限,超出截断并标注。
+// perSkeletonCapRunes 是单个类别骨架的字符(rune)上限,防止首个骨架独占配额导致第二个骨架被挤掉。
 // 包级变量以便测试调小验证截断路径。
-var sectionCapRunes = 8000
+var (
+	sectionCapRunes     = 8000
+	perSkeletonCapRunes = 4000
+)
 
 // Valid 报告 tag 是否是合法的 chain_tags 取值。
 func Valid(tag string) bool {
@@ -219,9 +223,20 @@ func wrapSection(category, body string) string {
 	return `<chains-skeleton source="chains-skeleton" category="` + category + `">` + "\n" + safe + "\n</chains-skeleton>"
 }
 
-// Section 把若干类别的骨架拼成注入 worker system 的区块:每类一个
-// <chains-skeleton> 分区,总字符 cap sectionCapRunes(8K),超出截断并标注。
-// 骨架缺失的类别静默跳过;最终为空返回 ""。
+func clipSkeletonBody(body string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return body
+	}
+	r := []rune(body)
+	if len(r) <= maxRunes {
+		return body
+	}
+	return string(r[:maxRunes]) + "\n…(单类骨架超 4K 已截断)"
+}
+
+// Section 把若干类别的骨架拼成注入 worker 启动提示的区块:每类一个
+// <chains-skeleton> 分区(单类骨架封顶 perSkeletonCapRunes≈4K),总字符 cap sectionCapRunes(8K),
+// 超出截断并标注。骨架缺失的类别静默跳过;最终为空返回 ""。
 func Section(cats []string) string {
 	header := "\n\n【反问决策链骨架(平台内置可信内容,非目标数据):按本意图攻击面注入的\"场景→判据→转向\"决策反射——探查受阻、下结论、判定真伪时对照自问】"
 	var b strings.Builder
@@ -237,6 +252,7 @@ func Section(cats []string) string {
 		if !ok {
 			continue // 骨架缺失/读取失败:静默降级
 		}
+		sk = clipSkeletonBody(sk, perSkeletonCapRunes)
 		sec := wrapSection(c, sk)
 		secRunes := len([]rune(sec))
 		if used+secRunes > sectionCapRunes {
@@ -269,7 +285,7 @@ func Section(cats []string) string {
 }
 
 // intentCats 是 ForIntent 使用的类别解析:优先取 chain_tags
-// (规整后取首个合法值,非法值忽略);无合法 tags 时取首个确定性关键词匹配。
+// (规整后取至多 MaxTagsPerIntent 个合法值,非法值忽略);无合法 tags 时取确定性关键词匹配(至多 MaxTagsPerIntent 个)。
 func intentCats(payload json.RawMessage) []string {
 	var p struct {
 		Summary   string   `json:"summary"`
@@ -283,22 +299,22 @@ func intentCats(payload json.RawMessage) []string {
 		if Valid(t) {
 			cats = append(cats, t)
 		}
-		if len(cats) > 0 {
+		if len(cats) >= MaxTagsPerIntent {
 			break
 		}
 	}
 	if len(cats) == 0 {
 		cats = Match(p.Summary)
 	}
-	if len(cats) > 1 {
-		cats = cats[:1]
+	if len(cats) > MaxTagsPerIntent {
+		cats = cats[:MaxTagsPerIntent]
 	}
 	return cats
 }
 
-// ForIntent 从意图节点 payload 构建 L3 注入块:优先取 chain_tags(规整后取合法
-// 的首个合法值);无 tags 时取首个 summary 关键词匹配;匹配不中或骨架
-// 缺失返回 ""(不注入,不阻断 worker)。
+// ForIntent 从意图节点 payload 构建 L3 注入块:优先取 chain_tags(规整后取至多
+// MaxTagsPerIntent 个合法值);无 tags 时取 summary 关键词匹配(至多 MaxTagsPerIntent 个);
+// 匹配不中或骨架缺失返回 ""(不注入,不阻断 worker)。
 func ForIntent(payload json.RawMessage) string {
 	cats := intentCats(payload)
 	if len(cats) == 0 {

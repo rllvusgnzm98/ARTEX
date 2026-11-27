@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/config"
@@ -26,6 +27,7 @@ type tunnelRuntime struct {
 	store   *db.TunnelStore
 	dataDir string
 	mgr     *tunnel.Manager
+	regMu   sync.Mutex
 }
 
 func (rt *tunnelRuntime) ListByTask(ctx context.Context, taskID int64) ([]*db.TunnelRecord, error) {
@@ -141,6 +143,7 @@ func (s *Server) tunnelTools() []actool.CoreTool {
 	return []actool.CoreTool{
 		s.tunnelProbeTool(),
 		s.tunnelDeployTool(),
+		s.tunnelRegisterTool(),
 		s.tunnelListTool(),
 		s.tunnelTeardownTool(),
 	}
@@ -449,6 +452,336 @@ func (s *Server) tunnelTeardownTool() actool.CoreTool {
 	})
 }
 
+type externalTunnelParams struct {
+	Kind         string `json:"kind"`
+	Adapter      string `json:"adapter"`
+	TaskID       int64  `json:"task_id"`
+	ViaSessionID int64  `json:"via_session_id,omitempty"`
+	ListenHost   string `json:"listen_host"`
+	ListenPort   int    `json:"listen_port"`
+	SocksPort    int    `json:"socks_port,omitempty"`
+	LocalPort    int    `json:"local_port,omitempty"`
+	TargetHost   string `json:"target_host,omitempty"`
+	TargetPort   int    `json:"target_port,omitempty"`
+	StatusNote   string `json:"status_note,omitempty"`
+	Protocol     string `json:"protocol,omitempty"`
+	Notes        string `json:"notes,omitempty"`
+	ListenAddr   string `json:"listen_addr"`
+	TargetAddr   string `json:"target_addr,omitempty"`
+	External     bool   `json:"external"`
+}
+
+func normalizeRegisteredTunnelKind(rawKind, rawProto, targetAddr string) (string, error) {
+	k := strings.ToLower(strings.TrimSpace(rawKind))
+	if k == "" {
+		p := strings.ToLower(strings.TrimSpace(rawProto))
+		switch {
+		case strings.HasPrefix(p, "socks"):
+			k = tunnel.KindSocks
+		case strings.TrimSpace(targetAddr) != "":
+			k = tunnel.KindPortfwd
+		default:
+			k = tunnel.KindSocks
+		}
+	}
+	switch k {
+	case tunnel.KindSocks, "socks4", "socks5", "proxy":
+		return tunnel.KindSocks, nil
+	case tunnel.KindPortfwd, "port_forward", "forward", "tcp", "lportfwd", "rportfwd":
+		return tunnel.KindPortfwd, nil
+	default:
+		return "", fmt.Errorf("kind 非法：%q（支持 socks | portfwd）", rawKind)
+	}
+}
+
+func parseTunnelAddr(raw, defaultHost string) (host string, port int, norm string, protoHint string, err error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", 0, "", "", fmt.Errorf("地址不能为空")
+	}
+	if idx := strings.Index(s, "://"); idx > 0 {
+		protoHint = strings.ToLower(strings.TrimSpace(s[:idx]))
+		if u, uerr := url.Parse(s); uerr == nil && u.Host != "" {
+			s = u.Host
+		} else {
+			s = s[idx+3:]
+		}
+	}
+	if p, perr := strconv.Atoi(s); perr == nil {
+		if p <= 0 || p > 65535 {
+			return "", 0, "", protoHint, fmt.Errorf("端口越界: %d", p)
+		}
+		if defaultHost == "" {
+			defaultHost = "127.0.0.1"
+		}
+		return defaultHost, p, net.JoinHostPort(defaultHost, strconv.Itoa(p)), protoHint, nil
+	}
+	h, pStr, serr := net.SplitHostPort(s)
+	if serr != nil {
+		return "", 0, "", protoHint, fmt.Errorf("地址格式应为 host:port，实际 %q", raw)
+	}
+	p, perr := strconv.Atoi(strings.TrimSpace(pStr))
+	if perr != nil || p <= 0 || p > 65535 {
+		return "", 0, "", protoHint, fmt.Errorf("端口非法: %q", pStr)
+	}
+	h = strings.TrimSpace(h)
+	if h == "" {
+		h = defaultHost
+	}
+	if h == "" {
+		h = "127.0.0.1"
+	}
+	return h, p, net.JoinHostPort(h, strconv.Itoa(p)), protoHint, nil
+}
+
+func isLoopbackTunnelHost(host string) bool {
+	switch strings.ToLower(strings.TrimSpace(host)) {
+	case "", "127.0.0.1", "::1", "localhost", "0.0.0.0":
+		return true
+	default:
+		return false
+	}
+}
+
+func tunnelRecordMatchKey(r *db.TunnelRecord) (listenAddr, targetAddr string) {
+	if r == nil {
+		return "", ""
+	}
+	if r.ListenPort > 0 {
+		lh := strings.TrimSpace(r.ListenHost)
+		if lh == "" {
+			lh = "127.0.0.1"
+		}
+		listenAddr = net.JoinHostPort(lh, strconv.Itoa(r.ListenPort))
+	}
+	if r.TargetHost != "" && r.TargetPort > 0 {
+		targetAddr = net.JoinHostPort(strings.TrimSpace(r.TargetHost), strconv.Itoa(r.TargetPort))
+	} else {
+		targetAddr = strings.TrimSpace(r.TargetHost)
+	}
+	if listenAddr == "" || targetAddr == "" {
+		var meta struct {
+			ListenAddr string `json:"listen_addr"`
+			TargetAddr string `json:"target_addr"`
+		}
+		if json.Unmarshal(r.DeployParams, &meta) == nil {
+			if listenAddr == "" && meta.ListenAddr != "" {
+				listenAddr = meta.ListenAddr
+			}
+			if targetAddr == "" && meta.TargetAddr != "" {
+				targetAddr = meta.TargetAddr
+			}
+		}
+	}
+	return listenAddr, targetAddr
+}
+
+func (s *Server) tunnelRegisterTool() actool.CoreTool {
+	return actool.Build(actool.Spec{
+		Name: "tunnel_register",
+		Description: "【隧道·register】登记外部已建好的端口转发或 SOCKS 代理端点（如 ssh -D/-L、chisel、frp、socat）进平台隧道台账，供后续单兵发现和复用。" +
+			"按 (task_id, listen_addr, target_addr) 自动去重：已存在时更新状态与备注元数据，不重复建行。",
+		Schema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"listen_addr":    strParam("监听地址，格式 host:port（如 127.0.0.1:10808）或纯端口（默认 127.0.0.1），必填"),
+				"target_addr":    strParam("转发目标地址，格式 host:port（portfwd 必填；socks 可省略或填目标网段/说明）"),
+				"kind":           strParam("隧道类型：socks | portfwd（省略时：有 target_addr 默认 portfwd，否则 socks）"),
+				"protocol":       strParam("可选，代理/转发协议说明（如 socks5 / tcp / ssh_local / chisel / frp）"),
+				"adapter":        strParam("可选，工具/适配器名称（默认 external 或沿用 protocol）"),
+				"via_session_id": map[string]any{"type": "integer", "description": "可选，经由哪条立足点会话建立（0 表示外部）"},
+				"state":          strParam("可选，状态：alive（默认）| deploying | stopped | error"),
+				"notes":          strParam("可选，备注/认证或复用说明"),
+			},
+			"required": []any{"listen_addr"},
+		},
+		ReadOnly:    func(json.RawMessage) bool { return false },
+		Permissions: sessionPerm,
+		Run: func(ctx context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
+			if s.tunnels == nil || s.tunnels.store == nil {
+				return actool.Errorf("隧道台账未就绪"), nil
+			}
+			var a struct {
+				ListenAddr   string `json:"listen_addr"`
+				TargetAddr   string `json:"target_addr"`
+				Kind         string `json:"kind"`
+				Protocol     string `json:"protocol"`
+				Adapter      string `json:"adapter"`
+				ViaSessionID int64  `json:"via_session_id"`
+				State        string `json:"state"`
+				Notes        string `json:"notes"`
+			}
+			_ = json.Unmarshal(in, &a)
+
+			listenHost, listenPort, normListen, protoHint, err := parseTunnelAddr(a.ListenAddr, "127.0.0.1")
+			if err != nil {
+				return actool.Errorf("listen_addr 非法：" + err.Error()), nil
+			}
+			protocol := strings.TrimSpace(a.Protocol)
+			if protocol == "" {
+				protocol = protoHint
+			}
+			kind, err := normalizeRegisteredTunnelKind(a.Kind, protocol, a.TargetAddr)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			var targetHost string
+			var targetPort int
+			var normTarget string
+			rawTarget := strings.TrimSpace(a.TargetAddr)
+			if rawTarget != "" {
+				th, tp, nt, _, perr := parseTunnelAddr(rawTarget, "")
+				if perr == nil {
+					targetHost, targetPort, normTarget = th, tp, nt
+				} else if kind == tunnel.KindPortfwd {
+					return actool.Errorf("portfwd 的 target_addr 非法：" + perr.Error()), nil
+				} else {
+					targetHost = rawTarget
+					normTarget = rawTarget
+				}
+			} else if kind == tunnel.KindPortfwd {
+				return actool.Errorf("portfwd 需要 target_addr=host:port"), nil
+			}
+
+			state := strings.ToLower(strings.TrimSpace(a.State))
+			if state == "" {
+				state = db.TunnelAlive
+			}
+			switch state {
+			case db.TunnelAlive, db.TunnelDeploying, db.TunnelError, db.TunnelStopped:
+			default:
+				return actool.Errorf(fmt.Sprintf("state 非法：%q（alive|deploying|error|stopped）", a.State)), nil
+			}
+
+			var roeWarn string
+			if kind == tunnel.KindPortfwd && targetHost != "" {
+				warn, roeErr := s.roeCheckHost(ctx, targetHost, "隧道目标")
+				if roeErr != nil {
+					return actool.Errorf(roeErr.Error()), nil
+				}
+				roeWarn = warn
+			}
+
+			adapter := strings.TrimSpace(a.Adapter)
+			if adapter == "" {
+				if protocol != "" {
+					adapter = protocol
+				} else {
+					adapter = "external"
+				}
+			}
+			notes := strings.TrimSpace(a.Notes)
+			ri := agent.RunInfoFrom(ctx)
+			params := externalTunnelParams{
+				Kind:         kind,
+				Adapter:      adapter,
+				TaskID:       ri.TaskID,
+				ViaSessionID: a.ViaSessionID,
+				ListenHost:   listenHost,
+				ListenPort:   listenPort,
+				TargetHost:   targetHost,
+				TargetPort:   targetPort,
+				StatusNote:   notes,
+				Protocol:     protocol,
+				Notes:        notes,
+				ListenAddr:   normListen,
+				TargetAddr:   normTarget,
+				External:     true,
+			}
+			if kind == tunnel.KindSocks && isLoopbackTunnelHost(listenHost) {
+				params.SocksPort = listenPort
+			} else if kind == tunnel.KindPortfwd {
+				params.LocalPort = listenPort
+			}
+			paramsRaw, err := json.Marshal(params)
+			if err != nil {
+				return actool.Errorf("参数序列化失败：" + err.Error()), nil
+			}
+
+			s.tunnels.regMu.Lock()
+			defer s.tunnels.regMu.Unlock()
+
+			var existingList []*db.TunnelRecord
+			if ri.TaskID > 0 {
+				existingList, err = s.tunnels.store.ListByTask(ctx, ri.TaskID)
+			} else {
+				existingList, err = s.tunnels.store.List(ctx)
+			}
+			if err != nil {
+				return actool.Errorf(withRoEWarn(roeWarn, "隧道台账读取失败："+err.Error())), nil
+			}
+			var existing *db.TunnelRecord
+			for _, r := range existingList {
+				if r == nil || r.TaskID != ri.TaskID {
+					continue
+				}
+				el, et := tunnelRecordMatchKey(r)
+				if strings.EqualFold(el, normListen) && strings.EqualFold(et, normTarget) {
+					existing = r
+					break
+				}
+			}
+
+			var tunnelID int64
+			dedup := false
+			if existing != nil {
+				dedup = true
+				tunnelID = existing.ID
+				if uerr := s.tunnels.store.UpdateDeployParams(ctx, existing.ID, existing.RemotePID, paramsRaw); uerr != nil {
+					return actool.Errorf(withRoEWarn(roeWarn, "隧道元数据更新失败："+uerr.Error())), nil
+				}
+				if serr := s.tunnels.store.UpdateState(ctx, existing.ID, state, ""); serr != nil {
+					return actool.Errorf(withRoEWarn(roeWarn, "隧道状态更新失败："+serr.Error())), nil
+				}
+				kind = existing.Kind
+			} else {
+				rec := &db.TunnelRecord{
+					TaskID:       ri.TaskID,
+					Kind:         kind,
+					Adapter:      adapter,
+					ListenHost:   listenHost,
+					ListenPort:   listenPort,
+					TargetHost:   targetHost,
+					TargetPort:   targetPort,
+					ViaSessionID: a.ViaSessionID,
+					DeployParams: paramsRaw,
+					State:        state,
+				}
+				id, cerr := s.tunnels.store.Create(ctx, rec)
+				if cerr != nil {
+					return actool.Errorf(withRoEWarn(roeWarn, "隧道落库失败："+cerr.Error())), nil
+				}
+				tunnelID = id
+			}
+			if s.m != nil {
+				s.m.RefreshTaskProxy(ri.TaskID)
+			}
+			out := map[string]any{
+				"tunnel_id":    tunnelID,
+				"kind":         kind,
+				"adapter":      adapter,
+				"listen_addr":  normListen,
+				"state":        state,
+				"deduplicated": dedup,
+				"updated":      dedup,
+			}
+			if normTarget != "" {
+				out["target_addr"] = normTarget
+			}
+			if protocol != "" {
+				out["protocol"] = protocol
+			}
+			if notes != "" {
+				out["notes"] = notes
+			}
+			if roeWarn != "" {
+				out["roe_warning"] = roeWarn
+			}
+			return jsonResult(out)
+		},
+	})
+}
+
 func (s *Server) seedTunnelTools() {
 	if s.tunnels == nil || s.m == nil || s.m.PG() == nil {
 		return
@@ -459,6 +792,7 @@ func (s *Server) seedTunnelTools() {
 		if err := s.m.PG().SeedTool(t.Name(), t.Description(), schema, workerAgents); err != nil {
 			log.Printf("[tools] seed %s 失败： %v", t.Name(), err)
 		}
+		s.syncBuiltinToolSchema(t.Name(), t.Description(), schema)
 	}
 }
 

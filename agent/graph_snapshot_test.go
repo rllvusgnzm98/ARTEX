@@ -150,8 +150,10 @@ func TestRenderWorkerEntrySeedCapsFactsAndDetail(t *testing.T) {
 		seed.ConfirmedFacts = append(seed.ConfirmedFacts, f)
 	}
 	out := RenderWorkerEntrySeed(seed)
-	if strings.Contains(out, "fact #5 ") || !strings.Contains(out, "fact #6 ") || !strings.Contains(out, fmt.Sprintf("fact #%d ", entrySeedFactCap+5)) {
-		t.Fatal("must keep the newest facts and drop the oldest")
+	// With entrySeedFactCap=25, entrySeedKeyFactCap=12 and 30 alternating facts (15 keys even 2..30, 15 general odd 1..29):
+	// oldest 12 keys (2..24) are kept (key #26/#28/#30 omitted) and newest 13 general facts (5..29) are kept (general #1/#3 omitted).
+	if strings.Contains(out, "fact #1 ") || strings.Contains(out, "fact #3 ") || !strings.Contains(out, "fact #5 ") || !strings.Contains(out, fmt.Sprintf("fact #%d ", entrySeedFactCap+4)) {
+		t.Fatal("must keep the newest general facts and drop the oldest")
 	}
 	if !strings.Contains(out, "另有 5 条") {
 		t.Fatal("must state how many facts were omitted")

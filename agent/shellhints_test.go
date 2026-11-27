@@ -14,6 +14,7 @@ func TestShellHintCatalogKeys(t *testing.T) {
 		"nxc",
 		"impacket-secretsdump", "impacket-psexec", "impacket-wmiexec",
 		"impacket-smbclient", "impacket-GetUserSPNs",
+		"evil-winrm", "impacket-ntlmrelayx", "certipy", "bloodhound-python", "msfconsole",
 	}
 	seeds := ShellHintSeeds()
 	if len(seeds) != len(want) {
@@ -46,8 +47,8 @@ func TestShellHintCatalogKeys(t *testing.T) {
 		t.Fatal("alias secretsdump.py must not be a catalog key")
 	}
 
-	// nxc / impacket: capability + when, not harvest or movement steps.
-	for _, key := range []string{"nxc", "impacket-secretsdump", "impacket-psexec", "impacket-wmiexec", "impacket-smbclient", "impacket-GetUserSPNs"} {
+	// nxc / impacket / AD & pivot CLIs: capability + when, not harvest or movement steps.
+	for _, key := range []string{"nxc", "impacket-secretsdump", "impacket-psexec", "impacket-wmiexec", "impacket-smbclient", "impacket-GetUserSPNs", "evil-winrm", "impacket-ntlmrelayx", "certipy", "bloodhound-python", "msfconsole"} {
 		s, ok := ShellHintByKey(key)
 		if !ok {
 			t.Fatalf("missing %s", key)

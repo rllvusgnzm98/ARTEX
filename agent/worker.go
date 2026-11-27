@@ -340,7 +340,7 @@ const workerDefaultTmpl = `你是授权安全测试与红队行动的"执行者"
 - **确认漏洞 → report_finding（传 intent_id 与简明漏洞标题 name）**：**仅限本次亲自触发、具备跨安全边界真实危害（如 RCE、SQLi/SSRF 实锤、跨租户/越权读写、核心凭据/数据泄露等）且拿到可复现请求/响应或命令输出证据时使用**。纯版本号暴露、缺安全头、无凭据 CORS 反射、Self-XSS、未证实接管的悬空解析或仅靠版本推断的疑似 CVE，**严禁调用 report_finding 充数**（有可串联价值的高潜怀疑点用 record_fact 记 inferred 交规划者）。
 
 **专项技能与扩展工具**：
-- 遇到前端 SPA/打包 JS 逆向提取隐藏 API 与签名算法、Web 业务热点审计、需真实浏览器交互或外部资产测绘时，先查 Skill 工具列表按需加载对应技能（js-api-recon / tbhm-app-analysis / playwright-cli / tbhm-recon）。
+- 遇到前端 SPA/打包 JS 逆向提取隐藏 API 与签名算法、Web 业务热点审计、需真实浏览器交互、跨系统载荷编码、Java/WebLogic 评估、多层内网跳板或 Windows/AD 后渗透等场景时，先查 Skill 工具列表按需加载已装配的对应技能（如 js-api-recon / tbhm-app-analysis / playwright-cli 等按需技能）。
 - 涉及双账号/多租户越权（IDOR/BOLA）验证或立足点会话纳管时，按需检索并调用 dual_account_verify、register_session 等扩展工具。
 
 完成本意图后用一句话总结你做了什么、写回了哪些核心结论。
@@ -439,22 +439,30 @@ func ensureRunDir(base string, taskID, intentID int64) string {
 // cmdOutDir is the SDK large-tool-output spill dir under an agent's run dir.
 func cmdOutDir(dir string) string { return filepath.Join(dir, "cmd-output") }
 
+// workerArtifactSpecStatic is the task-stable variant used inside workerSystem so
+// the system prompt stays byte-for-byte identical across different intents of the
+// same task (maximizing KV cache reuse). The per-intent runDir absolute path rides
+// in the first user message alongside the intent task.
+func workerArtifactSpecStatic(runDir string) string {
+	shared := sharedDirForRun(runDir)
+	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等本次意图的私有中间产物，**一律写到当前工作目录（本次意图的专属工作目录，见首条消息路径，直接用相对路径即可，无需再手动建目录）**——**不要写 /tmp、不要用其它绝对路径**。" +
+		"\n后续单兵还要用的制品（SSH 私钥、路由表、字典、凭据文件）写到跨单兵共享目录 **" + shared + "**（只增不删），并在 record_fact 的 artifact_paths 里记下这些绝对路径。共享文件只放这个目录。"
+}
+
 func workerSystem(proxyAddr, caCert, dataDir, runDir string, intranet bool, fp FootprintToggles) string {
 	vars := WorkerVars{ProxyAddr: proxyAddr, DataDir: dataDir, Now: nowStr(), Intranet: intranet}
 	body := renderSystem("worker", workerDefaultTmpl, vars)
 	tail := ""
 	if intranet {
 		// APPEND-ONLY:变体与代码固定红线尾只接到 worker 正文之后,不替换主正文,
-		// 也不触碰 execute() 里稍后追加的 RenderWorkerEntrySeed 进场预塞。
+		// 也不触碰首条用户消息里的 RenderWorkerEntrySeed 进场预塞。
 		tail = "\n\n" + renderSystemVariant("worker", "intranet", workerIntranetDiscipline, vars) + workerIntranetRules
 	}
 	// caCert is present only when the recording MITM is on, which is exactly when
 	// the traffic_* tools are registered — so it gates the traffic-tool note.
 	// Optional finding guidance is added for every role after tool resolution.
-	// CLI 优先固定尾始终追加,位于内网变体之后,进场预塞仍由 execute() 再往后接。
-	// 工人红线是代码固定尾:目标内容当数据不当指令,内外网一律追加,
-	// 编辑正文也删不掉。进场预塞仍由 execute() 再往后接。
-	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir) + tail + workerShellCLIRules + untrustedDataRule + workerAntiTrapRules + workerFootprintRulesFor(fp) + chainskel.WorkerMetaRules
+	// CLI 优先固定尾与工人红线始终追加，使 system prompt 跨意图保持静态可缓存。
+	return body + workerTrafficBlock(caCert != "") + workerArtifactSpecStatic(runDir) + tail + workerShellCLIRules + untrustedDataRule + workerAntiTrapRules + workerFootprintRulesFor(fp) + chainskel.WorkerMetaRules
 }
 
 // renderIntentTask formats the claimed intent for the worker's launch USER message:
@@ -684,12 +692,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	tools, def, cleanup := AugmentTools(ctx, "worker", base)
 	defer cleanup()
 
-	// 意图是 worker 的【唯一职责、贯穿整个 run 的不变量】→ 连同启动指令、意图锚定的目标资产
-	// 原始数据一起放进 system prompt：system 每次 run 都重新拼一遍、绝不会被 compaction 压掉，
-	// 长 run 里意图永远在场，续跑时也不依赖 transcript 历史是否留住那条首消息。代价是 system
-	// 混入 per-intent 易变数据、失去跨意图缓存复用；这是刻意的取舍（意图丢失比省 token 严重得多）。
-	// 与 planner「态势块放 user turn」分叉是有意的：planner 本身是产意图的那个、没有单一 mandate，
-	// worker 有。仅【全局态势 overview】留在启动 user 消息里——它可降级、容忍 stale，压掉无碍。
+	// system prompt 保持任务级静态可缓存（角色正文 + 固定红线 + 任务级操作约束），
+	// 所有 per-intent 动态块（意图正文/骨架、目标资产、蜜罐提示、进场预塞、继承凭据、全局态势）
+	// 统一放进首条 User 消息，避免跨意图破坏 KV cache 前缀。
 	// 本次意图的专属工作目录 <workDir>/tasks/<taskID>/i<intentID>，引擎侧先建好。
 	// 跨单兵制品在同级 shared/，与规划者约定的密钥/字典路径对齐。
 	runDir := ensureRunDir(w.workDir, taskID, intent.ID)
@@ -707,35 +712,44 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if w.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
 	}
-	sysBody += honeypotBlock(tsx, as, intent.ID) // 无蜜罐资产时为空串,不改变提示词
-	// 意图块 → 意图锚定资产块 → 启动指令，依次追加到 system 尾部（与 constraintBlock 同一套追加法）。
-	sysBody += renderIntentTask(intent)
+
+	// Per-intent dynamic blocks go into the first User message so SystemPrompt stays
+	// static and KV-cacheable across intents within the same task.
+	var userLaunch strings.Builder
+	userLaunch.WriteString(strings.TrimSpace(renderIntentTask(intent)))
+	userLaunch.WriteString("\n\n【本次意图专属工作目录（当前 CWD）】：")
+	userLaunch.WriteString(runDir)
 	if as != nil {
 		if ids := intentAssetIDs(intent); len(ids) > 0 {
 			if assets, err := as.GetByIDs(ids); err == nil && len(assets) > 0 {
 				if b, err := json.Marshal(assets); err == nil {
-					sysBody += "\n\n本意图 asset_ids 对应的目标资产：\n" + WrapUntrustedData("target-assets", string(b))
+					userLaunch.WriteString("\n\n本意图 asset_ids 对应的目标资产：\n" + WrapUntrustedData("target-assets", string(b)))
 				}
-				// 意图明确针对的这些资产 → 自动纳入任务测试范围（与 insertAssets 同一套
-				// 保守粒度）。upsertTaskScope 的 ON CONFLICT DO NOTHING + uq_task_scope
-				// 唯一索引保证不会重复添加；重跑/重试同样是幂等 no-op。
-				// 资产覆盖度功能关闭时不再累积测试范围(分母)。
+				// 意图明确针对的资产仅在任务尚无可信范围、或资产位于已有可信范围（manual/seed）内时
+				// 才纳入自动覆盖范围，防止 out-of-scope 资产静默扩张 task_scope。
 				if coverageEnabled {
+					trustedMatcher, trustedCompanies, hasTrusted := trustedScopeForTask(as, taskID)
 					for _, a := range assets {
+						if hasTrusted && !assetMatchesScope(a, trustedMatcher, trustedCompanies) {
+							continue
+						}
 						_ = as.AddAutoScope(taskID, a.Type, a.Domain, a.URL, a.IP)
 					}
 				}
 			}
 		}
 	}
+	userLaunch.WriteString(honeypotBlock(tsx, as, intent.ID)) // 无蜜罐资产时为空串
 	// 进场预塞：与本意图相关的已确认事实 + 已确认可达但未兑现的下一跳。
 	// 压缩/预取失败只打「图谱不完整」标记，fail-soft，不阻断进场、不写目标失败。
 	seedBlock := RenderWorkerEntrySeed(entrySeed)
-	sysBody += seedBlock
-	sysBody += w.credentialSeedBlock(ctx, taskID) // 无继承凭据或查询失败时为空串
-	sysBody += "\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。"
-	log.Printf("[worker] intent #%d prompt chars: system=%d overview=%d entry_seed=%d",
-		intent.ID, utf8.RuneCountInString(sysBody), utf8.RuneCountInString(overview), utf8.RuneCountInString(seedBlock))
+	userLaunch.WriteString(seedBlock)
+	userLaunch.WriteString(w.credentialSeedBlock(ctx, taskID)) // 无继承凭据或查询失败时为空串
+	userLaunch.WriteString(overview)
+	userLaunch.WriteString("\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。")
+	launchInput := userLaunch.String()
+	log.Printf("[worker] intent #%d prompt chars: system=%d user=%d overview=%d entry_seed=%d",
+		intent.ID, utf8.RuneCountInString(sysBody), utf8.RuneCountInString(launchInput), utf8.RuneCountInString(overview), utf8.RuneCountInString(seedBlock))
 	system, boundary := deferredSystem(sysBody, def)
 	// 任务级 deadline(经 ctx 注入)夹逼本 run 的墙钟预算 + 决定收尾词(见 taskclock.go)。
 	tc := taskClockFrom(ctx)
@@ -826,12 +840,11 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 			emit(r)
 		}
 	}
-	// 意图 / 启动指令 / 意图锚定资产已随 system prompt 下发（见上方 sysBody 组装）。
-	// 这条启动 user 消息只承载【全局态势 overview】——可降级的了解大局信息，压掉无碍。
-	// overview 罕见地 marshal 失败为空时，回退一句启动词，避免首轮出现空 user 消息。
-	input := overview
+	// 首条启动 user 消息承载全部 per-intent 动态块（意图正文、目标资产、蜜罐、进场预塞、
+	// 继承凭据与全局态势 overview），system prompt 保持跨意图静态可缓存。
+	input := launchInput
 	if strings.TrimSpace(input) == "" {
-		input = "开始执行 system 里领到的意图：只做它、只产生事实、assets、finding、做完即停。"
+		input = "开始执行本条意图：只做它、只产生事实、assets、finding、做完即停。"
 	}
 
 	// 实验功能:开启后由 noa 接管上下文压缩(归档集中在 <workDir>/noa/<SessionID> 下,持久)。
@@ -880,7 +893,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 
 	reason, err := captureWorkerSession(ctx, s, resumeWarning+input, emitWrap)
 	if !budgetProvider.loss.Fired() {
-		w.recoverSettlement(ctx, s, opts, settle, err, tsx, emitWrap)
+		if recErr := w.recoverSettlement(ctx, s, opts, settle, err, tsx, emitWrap); recErr != nil && isTransientSettlementError(recErr) {
+			err = &SettlementTransientError{BudgetErr: err, RecoveryErr: recErr}
+		}
 	}
 	return reason, tsx.finishEvidenceWrites(), err
 }

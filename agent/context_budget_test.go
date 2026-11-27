@@ -154,11 +154,12 @@ func TestStage3ContextBudgetReduction(t *testing.T) {
 	if seedNew >= seedOld || ovNew >= ovOld {
 		t.Fatalf("both blocks must shrink: seed %d->%d overview %d->%d", seedOld, seedNew, ovOld, ovNew)
 	}
-	// No fact is lost: every seed fact id is still named in the seed render.
+	// Selected facts (10 keys + newest 15 general = 25) are all named in the seed render.
 	render := RenderWorkerEntrySeed(seed)
-	for _, f := range seed.ConfirmedFacts[5:] {
+	selKeys, selGen, _, _ := selectedEntrySeedFacts(seed)
+	for _, f := range append(selKeys, selGen...) {
 		if !strings.Contains(render, fmt.Sprintf("fact #%d ", f.ID)) {
-			t.Fatalf("fact #%d dropped from seed render", f.ID)
+			t.Fatalf("selected fact #%d dropped from seed render", f.ID)
 		}
 	}
 }
@@ -275,8 +276,8 @@ func TestRenderWorkerGraphOverviewCapsFindingList(t *testing.T) {
 }
 
 func TestEntrySeedDirectParentDetailRelevantKeysAndEmptyGraph(t *testing.T) {
-	// 1. Direct parent general fact retains up to 600-rune detail; non-parent general fact omits detail.
-	parentDetail := strings.Repeat("上游凭据与参数细节", 50) // 450 runes (<600)
+	// 1. Direct parent general fact retains up to entrySeedParentDetailCap (350-rune) detail; non-parent general fact omits detail.
+	parentDetail := strings.Repeat("上游凭据与参数细节", 30) // 270 runes (<350)
 	siblingDetail := strings.Repeat("无关旁枝细节", 50)
 	seed := WorkerEntrySeed{
 		Prefetched: true,
@@ -293,14 +294,14 @@ func TestEntrySeedDirectParentDetailRelevantKeysAndEmptyGraph(t *testing.T) {
 		t.Fatalf("non-parent general fact must not inline its detail:\n%s", out)
 	}
 
-	// 2. Intent-relevant key facts beat 45 older unrelated-host negative_result key facts.
+	// 2. Intent-relevant key facts beat older unrelated-host negative_result key facts.
 	var many []EntryFact
-	for i := 1; i <= 45; i++ {
+	for i := 1; i <= 20; i++ {
 		many = append(many, EntryFact{ID: int64(i), Summary: fmt.Sprintf("other-host-neg-%d", i), Category: "negative_result", Relevant: false})
 	}
 	many = append(many, EntryFact{ID: 999, Summary: "target-host-key", Category: "negative_result", Relevant: true})
 	keys, _, omittedKeys, _ := selectedEntrySeedFacts(WorkerEntrySeed{Prefetched: true, ConfirmedFacts: many})
-	if len(keys) != entrySeedKeyFactCap || omittedKeys != 6 {
+	if len(keys) != entrySeedKeyFactCap || omittedKeys != len(many)-entrySeedKeyFactCap {
 		t.Fatalf("len(keys)=%d omittedKeys=%d", len(keys), omittedKeys)
 	}
 	foundTarget := false

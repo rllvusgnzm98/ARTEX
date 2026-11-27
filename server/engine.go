@@ -105,8 +105,10 @@ var errWorkControlConflict = errors.New("work control conflict")
 // retryableWorkerModelError excludes errors already handled by the task router.
 // In particular, a quota error after partial streaming advances the task cursor
 // for the next LLM call but must not replay this whole intent on the backup.
+// Settlement transient errors are returned cleanly to 'open' instead of
+// re-running an entire new worker loop inside the same runIntent call.
 func retryableWorkerModelError(reason harness.TerminalReason, err error) bool {
-	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err) && !agent.IsSupplyFailure(err) && !agent.IsGatewayWAFBlock(err)
+	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err) && !agent.IsSupplyFailure(err) && !agent.IsGatewayWAFBlock(err) && !agent.IsSettlementTransientError(err)
 }
 
 // Engine drives the event-driven exploration loop with real LLM agents
@@ -471,7 +473,96 @@ func (e *Engine) endProviderCall() {
 
 func (e *Engine) touch(taskID string) { e.lastAct.Store(taskID, time.Now().Unix()) }
 
-const defaultPlanCooldown = 20 * time.Second
+const (
+	defaultPlanCooldown       = 20 * time.Second
+	maxPlannerBackoffCooldown = 180 * time.Second
+)
+
+// plannerEffectiveCooldown returns the active cooldown between routine planner
+// wakes, applying exponential backoff (capped at 180s) once zeroIntentStreak >= 2.
+func plannerEffectiveCooldown(base time.Duration, zeroIntentStreak int) time.Duration {
+	if base <= 0 || zeroIntentStreak < 2 {
+		return base
+	}
+	capDur := maxPlannerBackoffCooldown
+	if base > capDur {
+		capDur = base
+	}
+	shift := zeroIntentStreak - 1
+	if shift > 10 {
+		return capDur
+	}
+	d := base << shift
+	if d <= 0 || d > capDur {
+		return capDur
+	}
+	return d
+}
+
+// stopLossEnabled reports whether the worker StopLossMonitor is enabled.
+// Default ON (using calibrated tiered defaults from agent.DefaultStopLossPolicy);
+// disable explicitly with ARTEX_ENABLE_STOPLOSS=0/false/no/off.
+func stopLossEnabled() bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("ARTEX_ENABLE_STOPLOSS")))
+	switch raw {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+// stopOpenIntents transitions any stranded open intents on a completed ('done')
+// task to 'stopped' so they no longer keep ancestor chains hot.
+func (e *Engine) stopOpenIntents(t *Task) {
+	if t == nil || t.Store == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	n, err := t.Store.StopOpenIntents(ctx)
+	if err != nil {
+		log.Printf("[planner] task %s 清理遗留 open 意图失败: %v", t.ID, err)
+		return
+	}
+	if n > 0 {
+		log.Printf("[planner] task %s 已完成，将 %d 条遗留 open 意图置为 stopped", t.ID, n)
+	}
+}
+
+// shouldSkipHeartbeatPlan performs a zero-cost deterministic check before a
+// planner heartbeat invokes the LLM: if at least one worker is actively running,
+// recent activity occurred within the heartbeat window, no urgent wake is
+// pending, and no newly exhausted/blocked intents appeared, skip the Planner LLM.
+func (e *Engine) shouldSkipHeartbeatPlan(t *Task, interval time.Duration, lastStalled db.StalledIntentStamp, now time.Time) (bool, db.StalledIntentStamp) {
+	if t == nil || t.Store == nil || interval <= 0 {
+		return false, lastStalled
+	}
+	if t.hasUrgentWake() {
+		return false, lastStalled
+	}
+	running, err := t.Store.CountRunningIntents()
+	if err != nil || running <= 0 {
+		return false, lastStalled
+	}
+	stalled, err := t.Store.StalledIntentStamp()
+	if err != nil {
+		return false, lastStalled
+	}
+	if stalled.Count > lastStalled.Count || stalled.LatestUpdated.After(lastStalled.LatestUpdated) {
+		return false, stalled
+	}
+	var lastAct time.Time
+	if unix := e.LastActivity(t.ID); unix > 0 {
+		lastAct = time.Unix(unix, 0)
+	} else if ts, terr := t.Store.LastActivityTime(); terr == nil {
+		lastAct = ts
+	}
+	if lastAct.IsZero() || now.Sub(lastAct) >= interval {
+		return false, stalled
+	}
+	return true, stalled
+}
 
 func resolvePlanCooldown() time.Duration {
 	raw := strings.TrimSpace(os.Getenv("ARTEX_PLANNER_COOLDOWN_SECONDS"))
@@ -1146,12 +1237,39 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	defer heartbeat.Stop()
 	e.restorePlanRoundCounter(ctx, t)
 	var lastPlanAt time.Time
+	zeroIntentStreak := 0
+	var lastWM db.GraphSignalWatermarks
+	var lastStalled db.StalledIntentStamp
+	if t.Store != nil {
+		if wm, err := t.Store.GraphSignalWatermarks(); err == nil {
+			lastWM = wm
+		}
+		if st, err := t.Store.StalledIntentStamp(); err == nil {
+			lastStalled = st
+		}
+	}
+	syncSignals := func() {
+		if t.Store == nil {
+			return
+		}
+		wm, err := t.Store.GraphSignalWatermarks()
+		if err != nil {
+			return
+		}
+		if wm.MaxFactID > lastWM.MaxFactID || wm.MaxFindingID > lastWM.MaxFindingID ||
+			wm.MaxHintID > lastWM.MaxHintID || wm.MaxIntentID > lastWM.MaxIntentID {
+			zeroIntentStreak = 0
+			lastWM = wm
+		}
+	}
 
 	// waitCooldown 对常规 worker done 边沿唤醒做冷却合并：若距上次真实规划不足
-	// planCooldown、没有紧急唤醒（finding/目标或提示变更/人工取消/显式 Notify）、且
-	// frontier 仍有 open 意图可供 worker 消费，则把短时间内的多个 done 聚成一轮规划；
-	// 只要出现紧急唤醒或 frontier 抽干（open==0），立即跳出冷却避免空转或延迟响应。
+	// effectiveCooldown、没有紧急唤醒（finding/目标或提示变更/人工取消/显式 Notify）、且
+	// 仍有 open 或 running 意图（仅当 open==0 && running==0 时才视为彻底空闲绕过冷却），
+	// 则把短时间内的多个 done 聚成一轮规划；连续 >=2 轮 0 新意图时自动指数退避（上限 180s），
+	// 新 fact/finding/hint/intent 到达时立即清零退避。
 	waitCooldown := func() bool {
+		syncSignals()
 		if e.PlanCooldown() <= 0 || lastPlanAt.IsZero() {
 			return true
 		}
@@ -1159,23 +1277,28 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			if ctx.Err() != nil {
 				return false
 			}
+			syncSignals()
 			open, oerr := -1, error(nil)
+			running, rerr := -1, error(nil)
 			if t.Store != nil {
 				open, oerr = t.Store.CountOpenIntents()
+				running, rerr = t.Store.CountRunningIntents()
 			}
 			saturated := false
-			if oerr == nil && open > 0 && t.Store != nil && e.m != nil && e.m.Workers() > 0 {
-				if running, rerr := t.Store.CountRunningIntents(); rerr == nil && running >= e.m.Workers() {
-					saturated = true
-				}
+			if oerr == nil && rerr == nil && open > 0 && e.m != nil && e.m.Workers() > 0 && running >= e.m.Workers() {
+				saturated = true
 			}
-			if e.IsPaused(t.ID) || e.IsDeleting(t.ID) || e.isSettling(t.ID) || taskSupplyFrozen(t) || t.hasImmediateWake(saturated) {
+			immediateWake := t.hasImmediateWake(saturated)
+			if immediateWake {
+				zeroIntentStreak = 0
+			}
+			if e.IsPaused(t.ID) || e.IsDeleting(t.ID) || e.isSettling(t.ID) || taskSupplyFrozen(t) || immediateWake {
 				return true
 			}
-			if t.Store != nil && (oerr != nil || open == 0) {
+			if t.Store != nil && (oerr != nil || rerr != nil || (open == 0 && running == 0)) {
 				return true
 			}
-			rem := e.PlanCooldown() - time.Since(lastPlanAt)
+			rem := plannerEffectiveCooldown(e.PlanCooldown(), zeroIntentStreak) - time.Since(lastPlanAt)
 			if rem <= 0 {
 				return true
 			}
@@ -1248,6 +1371,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 				if won, err := e.m.SetTaskStatusGuarded(t.ID, "done"); err != nil {
 					log.Printf("[goalless] task %s 收尾落 done 失败: %v", t.ID, err)
 				} else if won {
+					e.stopOpenIntents(t)
 					e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
 						Summary: "目标已全部达成，直投意图已执行完毕，任务结束"})
 				}
@@ -1278,6 +1402,12 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// coalesces a burst; empty for time/heartbeat wakes).
 		triggers := t.drainTriggers()
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
+		var beforeWM db.GraphSignalWatermarks
+		if t.Store != nil {
+			if wm, werr := t.Store.GraphSignalWatermarks(); werr == nil {
+				beforeWM = wm
+			}
+		}
 		ectx = llmrec.WithAttribution(ectx, 0, "planner", int64(round))
 		e.BeginLLMCall(t.ID)
 		started := time.Now()
@@ -1300,13 +1430,29 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			if err := e.m.SetTaskStatus(t.ID, "done"); err != nil {
 				log.Printf("[planner] task %s 标记完成落库失败: %v", t.ID, err)
 			}
-			// 任务已判完成 → 立刻取消在跑的 worker：它们手头的意图跑出来也没意义了。
-			// 下一轮 worker 循环撞终态门就不再领新意图;被取消的这批走下方"任务已完成"分支
-			// 归为 stopped(而非 blocked)。
+			// 任务已判完成 → 立刻取消在跑的 worker 并停掉所有遗留 open 意图，
+			// 避免它们继续锁热祖先链或污染已完成任务的意图状态。
+			e.stopOpenIntents(t)
 			e.cancelExec(t.ID, agent.AbortGoalMet)
 			e.fireRetro(t.ID) // 结构化复盘:任务收官触发一次(best-effort,异步)
 		default:
 			log.Printf("[planner] task %s 规划完成", t.ID)
+			if t.Store != nil {
+				if afterWM, werr := t.Store.GraphSignalWatermarks(); werr == nil {
+					if afterWM.MaxIntentID > beforeWM.MaxIntentID ||
+						afterWM.MaxFactID > beforeWM.MaxFactID ||
+						afterWM.MaxFindingID > beforeWM.MaxFindingID ||
+						afterWM.MaxHintID > beforeWM.MaxHintID {
+						zeroIntentStreak = 0
+					} else {
+						zeroIntentStreak++
+					}
+					lastWM = afterWM
+				}
+				if st, serr := t.Store.StalledIntentStamp(); serr == nil {
+					lastStalled = st
+				}
+			}
 		}
 		e.touch(t.ID)
 		e.recordPlanRound(ectx, t, db.PlanRound{TaskID: t.ID, Round: int64(round), StartedAt: started,
@@ -1327,6 +1473,12 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 				lastPlanAt = time.Now()
 			}
 		case <-heartbeat.C:
+			// 零成本确定性预检：仍有 worker 活跃运行、心跳窗内有新活动、无新 exhausted/blocked 意图 → 跳过本次 Planner LLM 调用，重置定时器。
+			if skip, st := e.shouldSkipHeartbeatPlan(t, interval, lastStalled, time.Now()); skip {
+				lastStalled = st
+				log.Printf("[planner] task %s heartbeat 跳过：worker 活跃且无新阻断/耗尽意图", t.ID)
+				break
+			}
 			// 周期兜底:死锁兜底 + 唤醒去监督飞行中的 worker(steer/kill) + 周期复查。
 			if runRound("heartbeat") {
 				lastPlanAt = time.Now()
@@ -1440,8 +1592,8 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	workCtx = intercept.WithTaskContext(workCtx, t.ID, label, taskEmit)
 	// nudges 有意建在 model_error 重跑循环之外:空转续跑的上限是「这条意图」的总量，
 	// 重跑一轮不该把额度清零重来。
-	// 默认摘除 Stop-Loss 早期止损钩子（保留墙钟上限 + 里程碑续期 + 正常收尾），避免多步利用链
-	// 在突破前被空转计数误杀；如需恢复旧止损策略可显式设 ARTEX_ENABLE_STOPLOSS=1。
+	// 默认开启校准后的分级 Stop-Loss 止损钩子（IdleProbeLimit/RepeatCommandLimit 由
+	// agent.DefaultStopLossPolicy 提供）；仅当显式设 ARTEX_ENABLE_STOPLOSS=0/false 时关闭。
 	baseHooks := steerHooks{
 		inner:   t.Guard.Hooks(),
 		drain:   func() (string, bool) { return e.drainSteer(iid) },
@@ -1452,7 +1604,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	var loss *agent.StopLossMonitor
 	var hooks harness.HookRunner = baseHooks
-	if envEnabledFlag("ARTEX_ENABLE_STOPLOSS") {
+	if stopLossEnabled() {
 		loss = agent.NewStopLossMonitor(agent.DefaultStopLossPolicy())
 		hooks = agent.WrapStopLoss(baseHooks, loss)
 	}
@@ -1651,6 +1803,17 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		e.touch(t.ID)
 		return true
 	}
+	// 收尾阶段遇到上游 LLM 瞬时故障（非真正耗尽）：将意图回场为 open，保留已写回的
+	// partial_progress 与 transcript，供上游恢复后续跑，避免以 0 写入永久标 exhausted。
+	if agent.IsSettlementTransientError(err) && !loss.Fired() {
+		if controlErr = transitionIntentState(t.Store, intent.ID, "running", "open"); controlErr != nil {
+			log.Printf("[worker %s] task %s 意图 #%d 收尾瞬时故障回场 open 失败: %v", name, t.ID, intent.ID, controlErr)
+		} else {
+			log.Printf("[worker %s] task %s 意图 #%d 收尾阶段遇瞬时 LLM 故障，回场 open 等待续跑（已写回 %s）", name, t.ID, intent.ID, wrote)
+		}
+		e.touch(t.ID)
+		return true
+	}
 	// terminal分流：撞步数上限 / 墙钟安全上限 / 止损让出槽位 ≠ 完成，也 ≠ 目标失败。
 	// max_turns 或 MaxDuration 到点、以及无新事实/无新资产/重复命令的止损 → exhausted
 	//（规划者据此知道这个方向试过但没有边际进展、需换角度，而非当成已覆盖永久跳过或目标失败）；
@@ -1690,6 +1853,8 @@ func workerTerminationOutcome(reason harness.TerminalReason, runErr error, verdi
 		return "persistence_failed", "evidence_write"
 	case verdict.Fired():
 		return "stop_loss", string(verdict.Kind)
+	case agent.IsSettlementTransientError(runErr):
+		return "settlement_transient", "settlement_llm_outage"
 	case reason == harness.ReasonMaxTurns || reason == harness.ReasonTimeout:
 		return "budget_exhausted", string(reason)
 	case reason == harness.ReasonStopHookPrevented || reason == harness.ReasonHookStopped:

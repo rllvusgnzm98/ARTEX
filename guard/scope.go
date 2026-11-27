@@ -126,9 +126,11 @@ func normalizeScopeRuleKind(kind string, exclude bool) (canon string, isExclude 
 type ScopeMatcher struct {
 	include       scopeBucket
 	exclude       scopeBucket
+	localExempt   scopeBucket
 	hasInclusions bool
 	hasRules      bool
-	// AllowLocal treats worker-local targets (loopback / link-local / localhost)
+	// AllowLocal treats worker-local targets (loopback / link-local / localhost,
+	// plus any localExempt NIC/callback hosts added via AddExemptHosts)
 	// as in-scope: 本机操作不算出界。默认开;关掉后本机地址也走范围匹配。
 	// 注意:RFC1918 内网地址不在放行之列——内网任务必须把目标网段登记进
 	// task_scope,否则 RoE 对内网形同虚设。
@@ -163,6 +165,27 @@ func NewScopeMatcher(rules []ScopeRule) *ScopeMatcher {
 	return m
 }
 
+// AddExemptHosts registers local/operator hosts (IP literals or exact hostnames,
+// such as local NIC / VPN interface IPs or ARTEX_CALLBACK_ADDR) treated as
+// in-scope when AllowLocal is true, unless matched by an explicit exclusion rule.
+// Does not mark hasRules/hasInclusions, so empty scope still yields ScopeUnknown.
+func (m *ScopeMatcher) AddExemptHosts(hosts []string) {
+	for _, raw := range hosts {
+		h := normalizeHost(raw)
+		if h == "" {
+			continue
+		}
+		if ip := net.ParseIP(h); ip != nil {
+			if ip.IsUnspecified() || ip.IsMulticast() {
+				continue
+			}
+			m.localExempt.add("ip", h)
+			continue
+		}
+		m.localExempt.add("exact_domain", h)
+	}
+}
+
 // Check reports whether host is in scope. host may carry a :port (stripped)
 // and is matched case-insensitively with trailing dots removed. Exclusions take
 // precedence over both wildcard inclusions and AllowLocal.
@@ -177,7 +200,7 @@ func (m *ScopeMatcher) Check(host string) ScopeVerdict {
 	if m.exclude.match(h) {
 		return ScopeOut
 	}
-	if m.AllowLocal && isLocalHost(h) {
+	if m.AllowLocal && (isLocalHost(h) || m.localExempt.match(h)) {
 		return ScopeIn
 	}
 	if !m.hasInclusions {

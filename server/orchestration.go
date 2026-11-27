@@ -1,7 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -564,42 +567,94 @@ WHERE kind = 'shell' AND enabled = true AND NOT (COALESCE(agents, '[]'::jsonb) @
 	log.Printf("[tools] 已完成低频工具 deferred 折叠、军火库 shell 提示补录与 mainagent 绑定(一次性)")
 }
 
-// refreshBuiltinToolSchemas propagates code schema/description changes on the
-// orchestration + platform tools into already-seeded rows ONCE per version flag —
-// SeedTool is first-insert-only, so a new param (e.g. spawn_task 的 llm_profile) never
-// reaches an old DB otherwise. Preserves each tool's agent binding + enabled flag.
-// Bump the flag whenever these tools' schemas/descriptions change in code.
-func (s *Server) refreshBuiltinToolSchemas() {
-	const flag = "tool_schema_refresh_v8_finding_name_fact_cat"
-	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
-		return
+const toolSchemaHashSettingPrefix = "tool_schema_hash:"
+
+// canonicalSchemaHash returns a deterministic SHA-256 hex digest of a JSON
+// schema regardless of whitespace or key ordering (matching PostgreSQL jsonb
+// normalization).
+func canonicalSchemaHash(raw json.RawMessage) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		trimmed = []byte("{}")
 	}
+	var v any
+	if err := json.Unmarshal(trimmed, &v); err == nil {
+		if norm, merr := json.Marshal(v); merr == nil {
+			sum := sha256.Sum256(norm)
+			return hex.EncodeToString(sum[:])
+		}
+	}
+	sum := sha256.Sum256(trimmed)
+	return hex.EncodeToString(sum[:])
+}
+
+// syncBuiltinToolSchema compares a built-in tool's code schema hash against the
+// last synced hash stored in settings (`tool_schema_hash:<key>`).
+//   - If code schema changed since the last sync AND the DB schema still matches
+//     the last synced hash (or no hash was previously recorded on an existing DB),
+//     it updates DB `tools.schema` + description while preserving agent bindings
+//     and enabled flags.
+//   - If the DB schema differs from the last synced hash, an admin manually
+//     edited it in the UI; the manual edit is respected and left untouched.
+func (s *Server) syncBuiltinToolSchema(key, desc string, codeSchema json.RawMessage) bool {
+	if s == nil || s.m == nil || s.m.pg == nil || key == "" {
+		return false
+	}
+	row, err := s.m.pg.GetTool(key)
+	if err != nil || row == nil || !row.System || row.Kind != "builtin" {
+		return false
+	}
+	codeHash := canonicalSchemaHash(codeSchema)
+	dbHash := canonicalSchemaHash(row.Schema)
+	settingKey := toolSchemaHashSettingPrefix + key
+	lastHash, hasSetting, err := s.m.pg.GetSetting(settingKey)
+	if err != nil {
+		log.Printf("[tools] read %s failed: %v", settingKey, err)
+		return false
+	}
+	if hasSetting && lastHash == codeHash {
+		return false
+	}
+	if dbHash == codeHash {
+		_ = s.m.pg.SetSetting(settingKey, codeHash)
+		return false
+	}
+	if hasSetting && lastHash != "" && dbHash != lastHash {
+		// Admin manually edited tools.schema since our last sync; preserve it.
+		return false
+	}
+	if err := s.m.pg.RefreshToolDefaults(key, desc, codeSchema); err != nil {
+		log.Printf("[tools] auto-sync %s schema failed: %v", key, err)
+		return false
+	}
+	if err := s.m.pg.SetSetting(settingKey, codeHash); err != nil {
+		log.Printf("[tools] save %s failed: %v", settingKey, err)
+	}
+	return true
+}
+
+// refreshBuiltinToolSchemas automatically synchronizes code schema changes for
+// orchestration, platform, and built-in agent tools into existing DB rows via
+// deterministic SHA-256 schema hash comparison stored in settings
+// (`tool_schema_hash:<key>`), preserving manual admin edits and agent bindings.
+func (s *Server) refreshBuiltinToolSchemas() {
+	updated := 0
 	tools := append(s.orchestrationTools(), s.platformTools()...)
 	for _, t := range tools {
 		schema, _ := json.Marshal(t.InputSchema())
-		if err := s.m.pg.RefreshToolDefaults(t.Name(), t.Description(), schema); err != nil {
-			log.Printf("[tools] refresh %s schema failed: %v", t.Name(), err)
+		if s.syncBuiltinToolSchema(t.Name(), t.Description(), schema) {
+			updated++
 		}
-	}
-	refreshBuiltin := map[string]bool{
-		"goal_met":       true,
-		"insert_assets":  true,
-		"list_facts":     true,
-		"report_finding": true,
-		"record_fact":    true,
-		"add_intent":     true,
 	}
 	for _, sd := range agent.BuiltinToolSeeds() {
-		if !refreshBuiltin[sd.Key] {
-			continue
-		}
 		schema, _ := json.Marshal(sd.Schema)
-		if err := s.m.pg.RefreshToolDefaults(sd.Key, sd.Desc, schema); err != nil {
-			log.Printf("[tools] refresh %s desc failed: %v", sd.Key, err)
+		if s.syncBuiltinToolSchema(sd.Key, sd.Desc, schema) {
+			updated++
 		}
 	}
-	_ = s.m.pg.SetSetting(flag, "true")
-	log.Printf("[tools] 已刷新 orchestration/platform 与核心内置工具 schema 到代码默认(一次性)")
+	if updated > 0 {
+		log.Printf("[tools] 已按 schema hash 自动同步 %d 个内置工具 schema 到代码默认", updated)
+	}
 }
 
 // unbindGoalMetDefault removes goal_met's default "planner" binding ONCE (guarded by

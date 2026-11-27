@@ -26,8 +26,8 @@ import (
 const DefaultSafetyCeiling = 20 * time.Minute
 
 const (
-	defaultIdleProbeLimit     = 14
-	defaultRepeatCommandLimit = 4
+	defaultIdleProbeLimit     = 24
+	defaultRepeatCommandLimit = 3
 	defaultMaxNovelRelief     = 16
 	maxMilestoneIdleBonus     = 18
 )
@@ -56,11 +56,11 @@ type StopLossPolicy struct {
 	SafetyCeiling time.Duration
 	// IdleProbeLimit is how many non-novel target-facing probe tool calls may
 	// run after the last graph write before a no_progress stop fires.
-	// Zero uses the default (14, overridable via ARTEX_STOPLOSS_IDLE_PROBES).
+	// Zero uses the default (24, overridable via ARTEX_STOPLOSS_IDLE_PROBES).
 	IdleProbeLimit int
 	// RepeatCommandLimit is how many times the same command fingerprint may
 	// appear within the current idle window before a repeated-command stop fires.
-	// Zero uses the default (4, overridable via ARTEX_STOPLOSS_REPEAT_LIMIT).
+	// Zero uses the default (3, overridable via ARTEX_STOPLOSS_REPEAT_LIMIT).
 	RepeatCommandLimit int
 	// MaxNovelRelief bounds how many probes with genuinely distinct output
 	// signatures in the current idle window are exempted from advancing IdleProbes.

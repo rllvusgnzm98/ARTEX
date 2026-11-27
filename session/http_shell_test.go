@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -920,5 +921,227 @@ func TestTmpPrefixSanitize(t *testing.T) {
 	}
 	if got := sanitizeTmpPrefix("/tmp/.artex_1_2_"); got != "/tmp/.artex_1_2_" {
 		t.Fatalf("合法前缀被误杀: %q", got)
+	}
+}
+
+// ---------------- HTTP GET / URL 模板传输测试 ----------------
+
+type transportInspect struct {
+	method      string
+	rawQuery    string
+	contentType string
+	body        string
+}
+
+func TestHTTPTransportDefaultPOSTFormEncoding(t *testing.T) {
+	inner := &phpcmdMock{fs: newFakeFS()}
+	var mu sync.Mutex
+	var reqs []transportInspect
+	u := probeURL(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawBody, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		r.Body = io.NopCloser(strings.NewReader(string(rawBody)))
+		mu.Lock()
+		reqs = append(reqs, transportInspect{
+			method:      r.Method,
+			rawQuery:    r.URL.RawQuery,
+			contentType: r.Header.Get("Content-Type"),
+			body:        string(rawBody),
+		})
+		mu.Unlock()
+		inner.ServeHTTP(w, r)
+	}))
+
+	sh, _, err := Probe(context.Background(), u, "cmd", "phpcmd")
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	if sh.Method() != http.MethodPost {
+		t.Fatalf("Method() = %q, want POST", sh.Method())
+	}
+	stdout, _, err := sh.Exec(context.Background(), "whoami", 0)
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if strings.TrimSpace(stdout) != "www-data" {
+		t.Fatalf("stdout = %q", stdout)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reqs) == 0 {
+		t.Fatal("expected HTTP requests")
+	}
+	last := reqs[len(reqs)-1]
+	if last.method != http.MethodPost {
+		t.Fatalf("last.method = %q, want POST", last.method)
+	}
+	if last.contentType != "application/x-www-form-urlencoded" {
+		t.Fatalf("last.contentType = %q", last.contentType)
+	}
+	if last.rawQuery != "" {
+		t.Fatalf("unexpected query on POST: %q", last.rawQuery)
+	}
+	vals, err := url.ParseQuery(last.body)
+	if err != nil || !strings.Contains(vals.Get("cmd"), "whoami") {
+		t.Fatalf("form body = %q (err=%v)", last.body, err)
+	}
+}
+
+func TestHTTPTransportExplicitGETQueryEncoding(t *testing.T) {
+	inner := &phpcmdMock{fs: newFakeFS()}
+	var mu sync.Mutex
+	var reqs []transportInspect
+	base := probeURL(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawBody, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		mu.Lock()
+		reqs = append(reqs, transportInspect{
+			method:      r.Method,
+			rawQuery:    r.URL.RawQuery,
+			contentType: r.Header.Get("Content-Type"),
+			body:        string(rawBody),
+		})
+		mu.Unlock()
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		out, _ := inner.fs.run(r.URL.Query().Get("cmd"))
+		_, _ = w.Write([]byte(out))
+	}))
+
+	sh, info, err := ProbeWithMethod(context.Background(), base+"?token=keep&cmd=stale", "cmd", "auto", "get")
+	if err != nil {
+		t.Fatalf("ProbeWithMethod: %v", err)
+	}
+	if info.Kind != "http_phpcmd" || sh.Method() != http.MethodGet {
+		t.Fatalf("info=%+v method=%q", info, sh.Method())
+	}
+	stdout, _, err := sh.Exec(context.Background(), "id", 0)
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if !strings.Contains(stdout, "uid=33(www-data)") {
+		t.Fatalf("stdout = %q", stdout)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	last := reqs[len(reqs)-1]
+	if last.method != http.MethodGet || last.body != "" || last.contentType != "" {
+		t.Fatalf("GET request mismatch: %+v", last)
+	}
+	q, err := url.ParseQuery(last.rawQuery)
+	if err != nil {
+		t.Fatalf("ParseQuery(%q): %v", last.rawQuery, err)
+	}
+	if q.Get("token") != "keep" || len(q["cmd"]) != 1 || !strings.Contains(q.Get("cmd"), "id") {
+		t.Fatalf("unexpected merged query: %v", q)
+	}
+}
+
+func TestHTTPTransportAutoGETURLTemplateEscaping(t *testing.T) {
+	inner := &phpcmdMock{fs: newFakeFS()}
+	var mu sync.Mutex
+	var reqs []transportInspect
+	base := probeURL(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawBody, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		mu.Lock()
+		reqs = append(reqs, transportInspect{
+			method:      r.Method,
+			rawQuery:    r.URL.RawQuery,
+			contentType: r.Header.Get("Content-Type"),
+			body:        string(rawBody),
+		})
+		mu.Unlock()
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		out, _ := inner.fs.run(r.URL.Query().Get("c"))
+		_, _ = w.Write([]byte(out))
+	}))
+
+	tmplURL := base + "/shell.php?token=1&c={{cmd}}"
+	sh, info, err := Probe(context.Background(), tmplURL, "pass", "auto")
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	if info.Kind != "http_phpcmd" || sh.Method() != http.MethodGet {
+		t.Fatalf("info=%+v method=%q", info, sh.Method())
+	}
+	// 简单命令直接进 URL 模板；包含空格与 + 字符，验证 url.QueryEscape 转义正确。
+	stdout, _, err := sh.Exec(context.Background(), "echo a+b", 0)
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if strings.TrimSpace(stdout) != "a+b" {
+		t.Fatalf("stdout = %q, want a+b", stdout)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	last := reqs[len(reqs)-1]
+	if last.method != http.MethodGet || last.body != "" || last.contentType != "" {
+		t.Fatalf("template GET mismatch: %+v", last)
+	}
+	if strings.Contains(last.rawQuery, "{{cmd}}") {
+		t.Fatalf("placeholder not replaced: %q", last.rawQuery)
+	}
+	if !strings.Contains(last.rawQuery, "token=1&c=") || !strings.Contains(last.rawQuery, "%2B") {
+		t.Fatalf("expected QueryEscape of '+' in rawQuery, got %q", last.rawQuery)
+	}
+}
+
+func TestHTTPTransportSecretRestorePreservesMethod(t *testing.T) {
+	inner := newPHPMock("eval")
+	var mu sync.Mutex
+	var lastMethod string
+	base := probeURL(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		lastMethod = r.Method
+		mu.Unlock()
+		inner.ServeHTTP(w, r)
+	}))
+
+	sh, _, err := ProbeWithMethod(context.Background(), base, "cmd", "php", "GET")
+	if err != nil {
+		t.Fatalf("ProbeWithMethod: %v", err)
+	}
+	sec := sh.Secret()
+	if sec.Method != http.MethodGet {
+		t.Fatalf("sec.Method = %q, want GET", sec.Method)
+	}
+	restored, err := RestoreHTTPShell(99, sec)
+	if err != nil {
+		t.Fatalf("RestoreHTTPShell: %v", err)
+	}
+	if restored.Method() != http.MethodGet {
+		t.Fatalf("restored.Method() = %q, want GET", restored.Method())
+	}
+	stdout, _, err := restored.Exec(context.Background(), "whoami", 0)
+	if err != nil {
+		t.Fatalf("restored Exec: %v", err)
+	}
+	if strings.TrimSpace(stdout) != "www-data" {
+		t.Fatalf("stdout = %q", stdout)
+	}
+	mu.Lock()
+	gotMethod := lastMethod
+	mu.Unlock()
+	if gotMethod != http.MethodGet {
+		t.Fatalf("restored request method = %q, want GET", gotMethod)
+	}
+
+	// {{cmd}} 模板在空 sec.Method（兼容旧库记录）时也应恢复为 GET。
+	tmplShell, err := RestoreHTTPShell(100, Secret{
+		URL:      base + "/?c={{cmd}}",
+		Password: "cmd",
+		Lang:     "phpcmd",
+	})
+	if err != nil {
+		t.Fatalf("RestoreHTTPShell template: %v", err)
+	}
+	if tmplShell.Method() != http.MethodGet {
+		t.Fatalf("tmplShell.Method() = %q, want GET", tmplShell.Method())
 	}
 }

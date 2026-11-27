@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -404,5 +406,159 @@ func TestWorkerRunBudgetExpiryPG(t *testing.T) {
 	}
 	if result := SettleWorkerRun(reason, err); result.IntentState != "exhausted" || result.TerminalKind != TerminalBudgetExhausted {
 		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestSettlementTransientRetrySucceeds(t *testing.T) {
+	origBackoffs, origMinRemain := settlementRetryBackoffs, settlementMinRetryRemain
+	settlementRetryBackoffs = []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 30 * time.Millisecond}
+	settlementMinRetryRemain = 500 * time.Millisecond
+	t.Cleanup(func() {
+		settlementRetryBackoffs, settlementMinRetryRemain = origBackoffs, origMinRemain
+	})
+
+	_, store := retentionStore(t)
+	tsx := NewToolSet(store, "retry-worker")
+	ctx, work := withRunBudget(t.Context(), time.Now().Add(-18*time.Second+100*time.Millisecond), 28*time.Second, 10*time.Second)
+
+	calls := 0
+	fake := budgetFakeProvider{complete: func(call context.Context, _ llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+		calls++
+		switch calls {
+		case 1:
+			<-call.Done()
+			return llm.Message{}, "", llm.Usage{}, call.Err()
+		case 2:
+			return llm.Message{}, "", llm.Usage{}, fmt.Errorf("stream failed: %w", io.ErrUnexpectedEOF)
+		case 3:
+			return llm.Message{}, "", llm.Usage{}, errors.New("status 503: service unavailable")
+		case 4:
+			return budgetToolMessage("record_fact"), "tool_use", llm.Usage{}, nil
+		default:
+			return assistantText("saved after retries"), "end_turn", llm.Usage{}, nil
+		}
+	}}
+	settle := &harness.Settlement{Prompt: "checkpoint existing evidence", MaxTurns: 2, DisabledTools: []string{"Bash"}}
+	opts := agentcore.Options{
+		Provider: &runBudgetProvider{inner: fake}, Tools: []actool.CoreTool{tsx.recordFact(), actool.NewBash()},
+		NonStreaming: true, PermissionMode: permission.ModeBypass, MaxDuration: work, Settlement: settle,
+		Transcript: transcript.NewStore(t.TempDir()), SessionID: "retry-test", DisableBackgroundTasks: true,
+	}
+	s := agentcore.NewSession(opts)
+	defer s.Close()
+	_, _, runErr := captureRunSession(ctx, s, "initial evidence", nil)
+	w := NewWorker(fake, "fake", t.TempDir(), nil, 0, 0)
+	recErr := w.recoverSettlement(ctx, s, opts, settle, runErr, tsx, nil)
+	if recErr != nil {
+		t.Fatalf("expected transient settlement retries to succeed, got recErr=%v (calls=%d)", recErr, calls)
+	}
+	if tsx.Writes().Facts != 1 || calls < 4 {
+		t.Fatalf("writes=%+v calls=%d, want 1 fact written after transient retries", tsx.Writes(), calls)
+	}
+}
+
+func TestSettlementTransientExhaustedWritesPartialProgressAndReturnsTransientError(t *testing.T) {
+	origBackoffs, origMinRemain := settlementRetryBackoffs, settlementMinRetryRemain
+	settlementRetryBackoffs = []time.Duration{10 * time.Millisecond, 10 * time.Millisecond}
+	settlementMinRetryRemain = 500 * time.Millisecond
+	t.Cleanup(func() {
+		settlementRetryBackoffs, settlementMinRetryRemain = origBackoffs, origMinRemain
+	})
+
+	d, store := retentionStore(t)
+	var taskID int64
+	if err := d.QueryRow(`SELECT id FROM tasks WHERE exploration_id=$1`, store.ID()).Scan(&taskID); err != nil {
+		t.Fatal(err)
+	}
+	iid, err := store.AddIntent(map[string]any{"summary": "transient settlement fallback fixture"}, 0, nil, "planner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := store.GetNode(iid)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	calls := 0
+	fake := budgetFakeProvider{complete: func(call context.Context, _ llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+		calls++
+		b, _ := call.Value(runBudgetKey{}).(runBudget)
+		if !b.recovery {
+			if calls == 1 {
+				return llm.Message{
+					Role: llm.RoleAssistant,
+					Content: []llm.ContentBlock{{
+						Type:  llm.BlockToolUse,
+						ID:    "probe-1",
+						Name:  "Bash",
+						Input: json.RawMessage(`{"command":"echo observed-port-8080-open"}`),
+					}},
+				}, "tool_use", llm.Usage{}, nil
+			}
+			// Wait for main run budget expiry so recovery settlement triggers.
+			<-call.Done()
+			return llm.Message{}, "", llm.Usage{}, call.Err()
+		}
+		// All settlement attempts fail with a transient connection error.
+		return llm.Message{}, "", llm.Usage{}, errors.New("dial tcp 127.0.0.1:443: connection refused")
+	}}
+	dir := t.TempDir()
+	w := NewWorker(fake, "fake", dir, transcript.NewStore(dir), 128000, 10)
+	// work = 1s, reserve = 6s (total = 7s; reserve capped at total/4 -> use 24s total, 6s reserve?
+	// No: use CallTimeoutError on turn 2 so main run ends immediately and recovery has full 6s reserve!)
+	calls = 0
+	fakeCallTO := budgetFakeProvider{complete: func(call context.Context, _ llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+		calls++
+		b, _ := call.Value(runBudgetKey{}).(runBudget)
+		if !b.recovery {
+			if calls == 1 {
+				return llm.Message{
+					Role: llm.RoleAssistant,
+					Content: []llm.ContentBlock{{
+						Type:  llm.BlockToolUse,
+						ID:    "probe-1",
+						Name:  "Bash",
+						Input: json.RawMessage(`{"command":"echo observed-port-8080-open"}`),
+					}},
+				}, "tool_use", llm.Usage{}, nil
+			}
+			return llm.Message{}, "", llm.Usage{}, &CallTimeoutError{Provider: "fake", Model: "fake", Timeout: time.Second}
+		}
+		return llm.Message{}, "", llm.Usage{}, errors.New("dial tcp 127.0.0.1:443: connection refused")
+	}}
+	_ = fake
+	w = NewWorker(fakeCallTO, "fake", dir, transcript.NewStore(dir), 128000, 10)
+	w.SetRunTimeout(28 * time.Second)
+	w.SetSettleTimeout(7 * time.Second)
+	w.SetNonStreaming(func() bool { return true })
+
+	_, writes, runErr := w.Execute(t.Context(), "fallback-worker", taskID, nil, store, intent, nil, nil, nil, nil)
+	if !IsSettlementTransientError(runErr) {
+		t.Fatalf("expected SettlementTransientError, got err=%v", runErr)
+	}
+	var ste *SettlementTransientError
+	if !errors.As(runErr, &ste) || ste.BudgetErr == nil || ste.RecoveryErr == nil {
+		t.Fatalf("SettlementTransientError fields missing: %#v", ste)
+	}
+	if !IsCallTimeout(runErr) {
+		t.Fatalf("Unwrap should preserve underlying BudgetErr (CallTimeoutError), got %v", runErr)
+	}
+	// 2 main calls + 1 initial settlement attempt + 2 retries = 5 total calls.
+	if calls != 5 {
+		t.Fatalf("expected 5 calls (2 main + 3 settlement attempts), got %d", calls)
+	}
+	if writes.Facts != 1 {
+		t.Fatalf("expected deterministic partial_progress fact write, got writes=%+v", writes)
+	}
+	factIDs, err := store.FactsYielded(iid)
+	if err != nil || len(factIDs) != 1 {
+		t.Fatalf("expected 1 yielded partial_progress fact, got ids=%v err=%v", factIDs, err)
+	}
+	fn, err := store.GetNode(factIDs[0])
+	if err != nil || fn == nil {
+		t.Fatalf("GetNode fallback fact: %v", err)
+	}
+	if !strings.Contains(string(fn.Payload), "partial_progress") || !strings.Contains(string(fn.Payload), "observed-port-8080-open") {
+		t.Fatalf("fallback fact missing partial_progress or observed tool output: %s", fn.Payload)
 	}
 }

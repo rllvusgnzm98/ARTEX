@@ -10,9 +10,10 @@ import (
 )
 
 // TaskScope is one row of a task's test scope — the coverage denominator and the
-// per-task authorization edge. Rows come either from insertAssets (source='auto',
-// conservative, one per explicitly-inserted asset) or from the add_task_scope tool
-// (source='agent', for company / domain / network / ICP / keyword scope).
+// per-task authorization edge. Rows come from operator input (source='manual'),
+// round-0 goal decomposition (source='seed'), runtime add_task_scope calls
+// (source='agent'), or insertAssets (source='auto', conservative and contained
+// within explicit manual/seed scope when present).
 type TaskScope struct {
 	ID        int64  `json:"id"`
 	TaskID    int64  `json:"task_id"`
@@ -82,9 +83,10 @@ INSERT INTO task_scope(task_id, kind, company_id, domain, net, value, source, re
 VALUES ($1,$2,$3,$4,$5::cidr,$6,$7,NULLIF($8,''))
 ON CONFLICT (task_id, kind, COALESCE(domain,''), COALESCE(net::text,''), COALESCE(company_id,0), COALESCE(value,''))
 DO UPDATE SET
-    source = 'manual',
+    source = EXCLUDED.source,
     reason = COALESCE(NULLIF(EXCLUDED.reason,''), task_scope.reason)
-WHERE EXCLUDED.source = 'manual' AND task_scope.source <> 'manual'`
+WHERE (EXCLUDED.source = 'manual' AND task_scope.source <> 'manual')
+   OR (EXCLUDED.source = 'seed' AND task_scope.source NOT IN ('manual', 'seed'))`
 	var (
 		result sql.Result
 		err    error
@@ -106,10 +108,208 @@ func (s *AssetStore) upsertTaskScope(ts TaskScope) error {
 	return err
 }
 
+type autoScopeDecision int
+
+const (
+	autoScopeSkip autoScopeDecision = iota
+	autoScopeAllow
+	autoScopePending
+)
+
+func autoScopeCandidate(taskID int64, assetType, domain, rawURL, ip string) TaskScope {
+	switch assetType {
+	case "root_domain":
+		if d := DomainKey(domain); d != "" {
+			return TaskScope{TaskID: taskID, Kind: "root_domain", Domain: d, Source: "auto"}
+		}
+	case "subdomain":
+		if d := DomainKey(domain); d != "" {
+			return TaskScope{TaskID: taskID, Kind: "subdomain", Domain: d, Source: "auto"}
+		}
+	case "service", "endpoint":
+		host := domain
+		if host == "" && rawURL != "" {
+			host, _, _ = parseURL(normalizeURL(rawURL))
+		}
+		host = DomainKey(host)
+		if host != "" && net.ParseIP(host) == nil {
+			return TaskScope{TaskID: taskID, Kind: "subdomain", Domain: host, Source: "auto"}
+		}
+		if ip == "" && host != "" && net.ParseIP(host) != nil {
+			ip = host
+		}
+		// IP-literal host or no host → fall back to ip scope if we have one.
+		if c := ipToHostCIDR(ip); c != "" {
+			return TaskScope{TaskID: taskID, Kind: "ip", Net: c, Source: "auto"}
+		}
+	case "ip":
+		if c := ipToHostCIDR(ip); c != "" {
+			return TaskScope{TaskID: taskID, Kind: "ip", Net: c, Source: "auto"}
+		}
+	}
+	return TaskScope{}
+}
+
+func isTrustedTaskScopeSource(src string) bool {
+	switch strings.ToLower(strings.TrimSpace(src)) {
+	case "manual", "seed":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeScopeDomain(d string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d), "."))
+}
+
+func parseScopeCIDR(raw string) *net.IPNet {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	if _, n, err := net.ParseCIDR(raw); err == nil {
+		return n
+	}
+	if c := ipToHostCIDR(raw); c != "" {
+		if _, n, err := net.ParseCIDR(c); err == nil {
+			return n
+		}
+	}
+	return nil
+}
+
+func parseCandidateIP(raw string) net.IP {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	if ip, _, err := net.ParseCIDR(raw); err == nil {
+		return ip
+	}
+	return net.ParseIP(raw)
+}
+
+func isLocalScopeIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()
+}
+
+// evaluateAutoScope checks whether an auto-scope candidate should be written to
+// task_scope (autoScopeAllow), routed to pending_scope (autoScopePending), or
+// skipped (autoScopeSkip).
+//
+// Containment rule (P0-D2):
+//  1. Explicit exclude_* rows always suppress auto-scope (autoScopeSkip).
+//  2. When a task already has explicit trusted host/net scope rules (source in
+//     manual/seed), an out-of-scope candidate MUST NOT expand task_scope as
+//     source='auto'; it is routed to pending_scope instead.
+//  3. When a task has zero trusted scope rules (legacy / unscoped tasks),
+//     backwards-compatible auto-scope insertion is preserved.
+func evaluateAutoScope(existing []TaskScope, cand TaskScope) (autoScopeDecision, string, string) {
+	if cand.Kind == "" {
+		return autoScopeSkip, "", ""
+	}
+	var candDomain string
+	var candIP net.IP
+	switch cand.Kind {
+	case "root_domain", "subdomain":
+		candDomain = normalizeScopeDomain(cand.Domain)
+		if candDomain == "" {
+			return autoScopeSkip, "", ""
+		}
+	case "ip":
+		candIP = parseCandidateIP(cand.Net)
+		if candIP == nil {
+			return autoScopeSkip, "", ""
+		}
+	default:
+		return autoScopeSkip, "", ""
+	}
+
+	hasTrustedInclusions := false
+	matchedTrusted := false
+	for _, r := range existing {
+		switch r.Kind {
+		case "exclude_root_domain":
+			rd := normalizeScopeDomain(r.Domain)
+			if rd != "" && candDomain != "" && (candDomain == rd || strings.HasSuffix(candDomain, "."+rd)) {
+				return autoScopeSkip, "", ""
+			}
+		case "exclude_subdomain":
+			rd := normalizeScopeDomain(r.Domain)
+			if rd != "" && candDomain != "" && candDomain == rd {
+				return autoScopeSkip, "", ""
+			}
+		case "exclude_ip", "exclude_cidr":
+			if candIP != nil {
+				if n := parseScopeCIDR(r.Net); n != nil && n.Contains(candIP) {
+					return autoScopeSkip, "", ""
+				}
+			}
+		case "root_domain":
+			if !isTrustedTaskScopeSource(r.Source) {
+				continue
+			}
+			rd := normalizeScopeDomain(r.Domain)
+			if rd == "" {
+				continue
+			}
+			hasTrustedInclusions = true
+			if candDomain != "" && (candDomain == rd || strings.HasSuffix(candDomain, "."+rd)) {
+				matchedTrusted = true
+			}
+		case "subdomain":
+			if !isTrustedTaskScopeSource(r.Source) {
+				continue
+			}
+			rd := normalizeScopeDomain(r.Domain)
+			if rd == "" {
+				continue
+			}
+			hasTrustedInclusions = true
+			// A trusted exact subdomain covers only that exact subdomain (never a broader root_domain).
+			if cand.Kind == "subdomain" && candDomain == rd {
+				matchedTrusted = true
+			}
+		case "ip", "cidr":
+			if !isTrustedTaskScopeSource(r.Source) {
+				continue
+			}
+			n := parseScopeCIDR(r.Net)
+			if n == nil {
+				continue
+			}
+			hasTrustedInclusions = true
+			if candIP != nil && n.Contains(candIP) {
+				matchedTrusted = true
+			}
+		}
+	}
+
+	if !hasTrustedInclusions {
+		return autoScopeAllow, "", ""
+	}
+	if matchedTrusted {
+		return autoScopeAllow, "", ""
+	}
+	if candIP != nil {
+		if isLocalScopeIP(candIP) {
+			return autoScopeSkip, "", ""
+		}
+		return autoScopePending, "ip", candIP.String()
+	}
+	if candDomain == "localhost" || strings.HasSuffix(candDomain, ".localhost") {
+		return autoScopeSkip, "", ""
+	}
+	return autoScopePending, cand.Kind, candDomain
+}
+
 // AddAutoScope records the conservative task scope implied by ONE explicitly-inserted
 // asset item (source='auto'). MUST be called only from insertAssets' top-level loop —
 // never from a db-layer side effect (linkHostAssets), so派生资产不会盲目扩大范围。
-// Rule: scope granularity follows the asset's own type. taskID<=0 → no-op.
+// When the task already has explicit trusted scope rules (manual/seed) and the new
+// asset falls outside them, task_scope is NOT expanded; the candidate is routed to
+// pending_scope instead. taskID<=0 → no-op.
 func (s *AssetStore) AddAutoScope(taskID int64, assetType, domain, rawURL, ip string) error {
 	return s.AddAutoScopeCtx(context.Background(), taskID, assetType, domain, rawURL, ip)
 }
@@ -119,38 +319,32 @@ func (s *AssetStore) AddAutoScopeCtx(ctx context.Context, taskID int64, assetTyp
 	if taskID <= 0 {
 		return nil
 	}
-	switch assetType {
-	case "root_domain":
-		if d := DomainKey(domain); d != "" {
-			return s.upsertTaskScope(TaskScope{TaskID: taskID, Kind: "root_domain", Domain: d})
-		}
-	case "subdomain":
-		if d := DomainKey(domain); d != "" {
-			return s.upsertTaskScope(TaskScope{TaskID: taskID, Kind: "subdomain", Domain: d})
-		}
-	case "service", "endpoint":
-		host := domain
-		if host == "" && rawURL != "" {
-			host, _, _ = parseURL(normalizeURL(rawURL))
-		}
-		host = DomainKey(host)
-		if host != "" && net.ParseIP(host) == nil {
-			return s.upsertTaskScope(TaskScope{TaskID: taskID, Kind: "subdomain", Domain: host})
-		}
-		// IP-literal host or no host → fall back to ip scope if we have one.
-		if c := ipToHostCIDR(ip); c != "" {
-			return s.upsertTaskScope(TaskScope{TaskID: taskID, Kind: "ip", Net: c})
-		}
-	case "ip":
-		if c := ipToHostCIDR(ip); c != "" {
-			return s.upsertTaskScope(TaskScope{TaskID: taskID, Kind: "ip", Net: c})
-		}
+	cand := autoScopeCandidate(taskID, assetType, domain, rawURL, ip)
+	if cand.Kind == "" {
+		return nil
 	}
-	return nil
+	existing, err := s.listTaskScopeCtx(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	decision, pendingKind, pendingVal := evaluateAutoScope(existing, cand)
+	switch decision {
+	case autoScopeAllow:
+		return s.upsertTaskScope(cand)
+	case autoScopePending:
+		if s.db != nil && pendingKind != "" && pendingVal != "" {
+			_, err := s.UpsertPendingScope(taskID, pendingKind, pendingVal)
+			return err
+		}
+		return nil
+	default:
+		return nil
+	}
 }
 
 // AddAgentScope parses a (kind,value) pair and records it as task scope.
-// source is "agent" when called from an LLM tool, "manual" from the UI.
+// source is "agent" when called from a runtime LLM tool, "seed" from round-0
+// goal decomposition, "manual" from the UI / operator approval.
 // company: value = company name or id (must already exist). root_domain/subdomain:
 // value = a domain. ip/cidr: value = an IP or CIDR (bare IP → /32,/128).
 func (s *AssetStore) AddAgentScope(taskID int64, kind, value, reason, source string) (TaskScope, error) {
@@ -263,12 +457,26 @@ func (s *AssetStore) DeleteTaskScope(taskID, scopeID int64) (bool, error) {
 
 // ListTaskScope returns all scope rows for a task.
 func (s *AssetStore) ListTaskScope(taskID int64) ([]TaskScope, error) {
-	rows, err := s.db.Query(`
+	return s.listTaskScopeCtx(context.Background(), taskID)
+}
+
+func (s *AssetStore) listTaskScopeCtx(ctx context.Context, taskID int64) ([]TaskScope, error) {
+	s = s.withContext(ctx)
+	query := `
 SELECT ts.id, ts.kind, COALESCE(ts.company_id,0), COALESCE(c.name,''), COALESCE(ts.domain,''),
        COALESCE(ts.net::text,''), COALESCE(ts.value,''), ts.source, COALESCE(ts.reason,'')
 FROM task_scope ts
 LEFT JOIN companies c ON c.id=ts.company_id
-WHERE ts.task_id=$1 ORDER BY ts.id`, taskID)
+WHERE ts.task_id=$1 ORDER BY ts.id`
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if s.tx != nil {
+		rows, err = s.tx.QueryContext(s.ctx, query, taskID)
+	} else {
+		rows, err = s.db.QueryContext(s.ctx, query, taskID)
+	}
 	if err != nil {
 		return nil, err
 	}

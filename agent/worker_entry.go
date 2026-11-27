@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/db"
 )
@@ -357,6 +358,33 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 		intentAssets = filtered
 	}
 
+	assetFactCount := map[int64]int{}
+	for _, fv := range confirmed {
+		for _, a := range fv.assets {
+			assetFactCount[a]++
+		}
+	}
+	isHubAnchor := func(assetID int64) bool {
+		return assetFactCount[assetID] >= entrySeedHubAnchorThreshold
+	}
+	hasSpecificNonHubIntentAsset := false
+	for _, id := range intentAssets {
+		if !isHubAnchor(id) {
+			hasSpecificNonHubIntentAsset = true
+			break
+		}
+	}
+	lateralIntentAssets := intentAssets
+	if hasSpecificNonHubIntentAsset {
+		filtered := make([]int64, 0, len(intentAssets))
+		for _, id := range intentAssets {
+			if !isHubAnchor(id) {
+				filtered = append(filtered, id)
+			}
+		}
+		lateralIntentAssets = filtered
+	}
+
 	relevant := map[int64]bool{}
 	intentRelevant := map[int64]bool{}
 	seedAnchors := map[int64]bool{}
@@ -386,7 +414,7 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 		mark(id, true)
 	}
 	for _, fv := range confirmed {
-		if overlapsID(fv.assets, intentAssets) {
+		if overlapsID(fv.assets, lateralIntentAssets) {
 			mark(fv.node.ID, true)
 		}
 	}
@@ -394,9 +422,15 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 	// (prior-stage observations on a host this hop is continuing from).
 	// Isolate bare IPs that are shared across multiple VHosts (e.g. CDN/ALB) or
 	// collateral to a non-IP target unless the caller explicitly anchored that bare IP.
+	// Also suppress hub-anchor fan-out: when an anchor asset has >=10 confirmed facts
+	// AND the intent also anchors more specific non-hub assets, skip expanding laterally
+	// through that hub anchor (direct parentFacts and siblingFacts were already kept above).
 	expandAnchors := map[int64]bool{}
 	for a := range seedAnchors {
 		if isBareIPAsset(g, a) && (hasNonIPTarget || sharedIPs[a]) && !explicitIntentIPs[a] {
+			continue
+		}
+		if hasSpecificNonHubIntentAsset && isHubAnchor(a) {
 			continue
 		}
 		expandAnchors[a] = true
@@ -501,16 +535,19 @@ func BuildWorkerEntrySeed(g EntryGraph) WorkerEntrySeed {
 }
 
 // Entry-seed render caps: a long-running task can accumulate many relevant
-// confirmed facts with long details; the rest stay one list_facts call away.
+// confirmed facts with long details; the rest stay one list_facts/node_detail call away.
 const (
-	entrySeedFactCap    = 60
-	entrySeedKeyFactCap = 40
+	entrySeedHubAnchorThreshold   = 10
+	entrySeedFactCap              = 25
+	entrySeedKeyFactCap           = 12
 	// 阶段三(上下文控制)：关键事实(否定结果/范围限制/清理状态/带证据)保留内联细节但裁剪；
-	// 本意图的直接上游父事实(derived_from)保留更多细节(最多 8 条 × 600 字)，避免 worker
+	// 本意图的直接上游父事实(derived_from)保留更多细节(最多 4 条 × 350 字)，避免 worker
 	// 进场后反复调 node_detail 回查上游参数/凭据/路径；其余普通事实只给摘要。
-	entrySeedKeyDetailCap         = 300
-	entrySeedParentDetailCap      = 600
-	entrySeedParentDetailCountCap = 8
+	entrySeedKeyDetailCap         = 140
+	entrySeedParentDetailCap      = 350
+	entrySeedParentDetailCountCap = 4
+	entrySeedMaxRenderRunes       = 6000
+	entrySeedMaxHopsRenderRunes   = 900
 )
 
 func clipRunes(s string, n int) string {
@@ -521,45 +558,134 @@ func clipRunes(s string, n int) string {
 	return string(r[:n]) + "…（已截断，完整见 node_detail）"
 }
 
-// RenderWorkerEntrySeed formats the pre-seed, incomplete-graph marker, and
-// entry hard-step for the worker system prompt. Always fail-soft: an incomplete
-// graph still returns a prompt block and never a hard error.
-func RenderWorkerEntrySeed(seed WorkerEntrySeed) string {
+func formatEntrySeedOverflow(ids []int64, budget int) string {
+	if len(ids) == 0 || budget <= 0 {
+		return ""
+	}
+	prefix := fmt.Sprintf("（受 %d 字上限限制，另有 %d 条已选事实仅列 ID，按需调 node_detail 查看：", entrySeedMaxRenderRunes, len(ids))
+	suffix := "）\n"
+	baseRunes := utf8.RuneCountInString(prefix) + utf8.RuneCountInString(suffix)
+	if budget <= baseRunes+4 {
+		short := fmt.Sprintf("（受 %d 字上限限制，另有 %d 条事实见 node_detail）\n", entrySeedMaxRenderRunes, len(ids))
+		if utf8.RuneCountInString(short) <= budget {
+			return short
+		}
+		r := []rune(short)
+		if budget < len(r) {
+			return string(r[:budget])
+		}
+		return short
+	}
+	var list strings.Builder
+	used := baseRunes
+	for i, id := range ids {
+		tok := fmt.Sprintf("#%d", id)
+		if i > 0 {
+			tok = "、" + tok
+		}
+		tokRunes := utf8.RuneCountInString(tok)
+		// Reserve room for "…等" if more IDs remain after this one.
+		moreReserve := 0
+		if i < len(ids)-1 {
+			moreReserve = 2
+		}
+		if used+tokRunes+moreReserve > budget {
+			if i > 0 {
+				list.WriteString("…等")
+			}
+			break
+		}
+		list.WriteString(tok)
+		used += tokRunes
+	}
+	return prefix + list.String() + suffix
+}
+
+func renderEntrySeedNextHops(hops []EntryTarget, maxRunes int) string {
+	if len(hops) == 0 || maxRunes <= 0 {
+		return ""
+	}
 	var b strings.Builder
+	header := "\n【已确认可达但未兑现的目标（下一跳接着打，不是新开）】\n"
+	used := utf8.RuneCountInString(header)
+	if used >= maxRunes {
+		return ""
+	}
+	b.WriteString(header)
+	for i, h := range hops {
+		label := h.Label
+		if label == "" {
+			label = fmt.Sprintf("asset#%d", h.AssetID)
+		}
+		factNote := ""
+		if len(h.FactIDs) > 0 {
+			ids := make([]string, len(h.FactIDs))
+			for j, id := range h.FactIDs {
+				ids[j] = fmt.Sprintf("#%d", id)
+			}
+			factNote = "由事实 " + strings.Join(ids, "、") + " 确认可达，"
+		}
+		line := fmt.Sprintf("- %s（%s尚无对应已兑现结果，作为下一跳接着做，不要当新目标重开）\n", label, factNote)
+		lineRunes := utf8.RuneCountInString(line)
+		moreNote := ""
+		if i < len(hops)-1 {
+			moreNote = fmt.Sprintf("（另有 %d 个可达目标见 list_facts / list_assets）\n", len(hops)-i)
+		}
+		if used+lineRunes > maxRunes || (i < len(hops)-1 && used+lineRunes+utf8.RuneCountInString(moreNote) > maxRunes) {
+			rem := len(hops) - i
+			note := fmt.Sprintf("（另有 %d 个可达目标见 list_facts / list_assets）\n", rem)
+			if used+utf8.RuneCountInString(note) <= maxRunes {
+				b.WriteString(note)
+			}
+			break
+		}
+		b.WriteString(line)
+		used += lineRunes
+	}
+	return b.String()
+}
+
+// RenderWorkerEntrySeed formats the pre-seed, incomplete-graph marker, and
+// entry hard-step for the worker launch prompt. Always fail-soft: an incomplete
+// graph still returns a prompt block and never a hard error. Total rendered size
+// is strictly bounded by entrySeedMaxRenderRunes (6,000 runes) with a concise
+// node_detail ID fallback for any overflow facts.
+func RenderWorkerEntrySeed(seed WorkerEntrySeed) string {
+	var header strings.Builder
 	if seed.GraphIncomplete {
 		reason := strings.Join(seed.IncompleteReasons, ",")
 		if reason == "" {
 			reason = "unknown"
 		}
-		fmt.Fprintf(&b, "\n\n【%s】预取或图谱压缩失败（原因：%s）。以下内容可能不完整，进场不被阻断；不要把这次失败记录为目标失败，也不要假装图谱仍完整。\n",
+		fmt.Fprintf(&header, "\n\n【%s】预取或图谱压缩失败（原因：%s）。以下内容可能不完整，进场不被阻断；不要把这次失败记录为目标失败，也不要假装图谱仍完整。\n",
 			GraphIncompleteMarker, reason)
 	}
 
-	b.WriteString("\n\n【进场硬步骤】领取意图后，第一次工具调用必须是读图（list_facts，或 list_companies / node_detail 等只读查图工具）。")
-	b.WriteString("下面若已预塞相关已确认事实，视为读图已发生，不要对已确认可达的目标再开一轮扫描。")
-	b.WriteString("禁止把已确认可达但未兑现的目标当成新目标重开，应作为下一跳接着做。")
-	b.WriteString("关键事实中的否定结果、范围限制、清理状态及 inferred 推断不代表目标已确认可达，也不构成扩大授权范围的许可。")
+	header.WriteString("\n\n【进场硬步骤】领取意图后，第一次工具调用必须是读图（list_facts，或 list_companies / node_detail 等只读查图工具）。")
+	header.WriteString("下面若已预塞相关已确认事实，视为读图已发生，不要对已确认可达的目标再开一轮扫描。")
+	header.WriteString("禁止把已确认可达但未兑现的目标当成新目标重开，应作为下一跳接着做。")
+	header.WriteString("关键事实中的否定结果、范围限制、清理状态及 inferred 推断不代表目标已确认可达，也不构成扩大授权范围的许可。")
 	if seed.GraphIncomplete {
-		b.WriteString("若出现「" + GraphIncompleteMarker + "」，先用只读工具把能读到的补上，再行动。")
+		header.WriteString("若出现「" + GraphIncompleteMarker + "」，先用只读工具把能读到的补上，再行动。")
 	}
 
 	if len(seed.ConfirmedFacts) == 0 {
 		if seed.EmptyGraph {
-			b.WriteString("\n\n【进场预塞】当前探索图尚无已确认事实（任务开局），视为读图已完成；无需额外调 list_facts 空查，可直接围绕本意图开展探测。")
+			header.WriteString("\n\n【进场预塞】当前探索图尚无已确认事实（任务开局），视为读图已完成；无需额外调 list_facts 空查，可直接围绕本意图开展探测。")
 		} else if seed.Prefetched && !seed.GraphIncomplete {
-			b.WriteString("\n\n【进场预塞】暂无与本意图直接关联的已确认事实或关键限制/证据；如需查看全局其他分支结论，可按需调 list_facts / node_detail。")
+			header.WriteString("\n\n【进场预塞】暂无与本意图直接关联的已确认事实或关键限制/证据；如需查看全局其他分支结论，可按需调 list_facts / node_detail。")
 		} else {
-			b.WriteString("\n\n【进场预塞】没有相关事实或关键限制/证据。第一次工具仍须先读图（list_facts）。")
+			header.WriteString("\n\n【进场预塞】没有相关事实或关键限制/证据。第一次工具仍须先读图（list_facts）。")
 		}
-		return b.String()
+		return header.String()
 	}
 
-	b.WriteString("\n\n【进场预塞：相关事实与任务关键限制/证据】\n")
-	fmt.Fprintf(&b, "关键事实优先（最多 %d 条，本意图相关与范围/清理限制优先）；其余位置补最新相关普通事实，总计最多 %d 条。\n", entrySeedKeyFactCap, entrySeedFactCap)
-	b.WriteString("上游直接父事实与关键事实保留裁剪后的细节；其余普通事实只列摘要（含 evidence_ids、资产、来源意图），完整细节按需用 node_detail 查。\n")
+	header.WriteString("\n\n【进场预塞：相关事实与任务关键限制/证据】\n")
+	fmt.Fprintf(&header, "关键事实优先（最多 %d 条，本意图相关与范围/清理限制优先）；其余位置补最新相关普通事实，总计最多 %d 条。\n", entrySeedKeyFactCap, entrySeedFactCap)
+	header.WriteString("上游直接父事实与关键事实保留裁剪后的细节；其余普通事实只列摘要（含 evidence_ids、资产、来源意图），完整细节按需用 node_detail 查。\n")
 	keys, general, omittedKeys, omittedGeneral := selectedEntrySeedFacts(seed)
 	if omittedKeys+omittedGeneral > 0 {
-		fmt.Fprintf(&b, "（另有 %d 条事实未列出：关键事实 %d 条，相关普通事实 %d 条；需要时用 list_facts / node_detail 查）\n", omittedKeys+omittedGeneral, omittedKeys, omittedGeneral)
+		fmt.Fprintf(&header, "（另有 %d 条事实未列出：关键事实 %d 条，相关普通事实 %d 条；需要时用 list_facts / node_detail 查）\n", omittedKeys+omittedGeneral, omittedKeys, omittedGeneral)
 	}
 	facts := append(keys, general...)
 	inlineParents := map[int64]bool{}
@@ -576,63 +702,103 @@ func RenderWorkerEntrySeed(seed WorkerEntrySeed) string {
 	for _, id := range parentIDs {
 		inlineParents[id] = true
 	}
-	for _, f := range facts {
+
+	headerStr := header.String()
+	hopsStr := renderEntrySeedNextHops(seed.NextHops, entrySeedMaxHopsRenderRunes)
+	usedRunes := utf8.RuneCountInString(headerStr) + utf8.RuneCountInString(hopsStr)
+	const overflowReserveRunes = 160
+
+	var factsBuf strings.Builder
+	var overflowIDs []int64
+	for i, f := range facts {
 		conf := f.Confidence
 		if conf == "" {
 			conf = "confirmed"
 		}
-		fmt.Fprintf(&b, "- fact #%d (%s)：%s", f.ID, conf, strings.TrimSpace(f.Summary))
+		var line strings.Builder
+		fmt.Fprintf(&line, "- fact #%d (%s)：%s", f.ID, conf, strings.TrimSpace(f.Summary))
 		category := f.Category
 		if category == "" {
 			category = "general"
 		}
-		fmt.Fprintf(&b, " [category=%s]", category)
+		fmt.Fprintf(&line, " [category=%s]", category)
 		if len(f.EvidenceIDs) > 0 {
 			refs, _ := json.Marshal(f.EvidenceIDs)
-			fmt.Fprintf(&b, " [evidence_ids=%s]", refs)
+			fmt.Fprintf(&line, " [evidence_ids=%s]", refs)
 		}
 		if len(f.ArtifactPaths) > 0 {
-			fmt.Fprintf(&b, " [artifact_paths=%s]", strings.Join(f.ArtifactPaths, "；"))
+			fmt.Fprintf(&line, " [artifact_paths=%s]", strings.Join(f.ArtifactPaths, "；"))
 		}
 		if len(f.Assets) > 0 {
-			fmt.Fprintf(&b, "（资产：%s）", strings.Join(f.Assets, "、"))
+			fmt.Fprintf(&line, "（资产：%s）", strings.Join(f.Assets, "、"))
 		}
 		if f.FromIntent > 0 {
-			fmt.Fprintf(&b, "［来自意图 #%d］", f.FromIntent)
+			fmt.Fprintf(&line, "［来自意图 #%d］", f.FromIntent)
 		}
-		b.WriteByte('\n')
-		// 阶段三+优化：本意图直接上游父事实（derived_from，最多最新 8 条）保留最多 600 字细节，
-		// 减少 worker 开局反复调 node_detail 回查上游线索；关键事实保留 300 字细节；
-		// 其余普通事实仅给摘要，按需 node_detail 回查。
+		line.WriteByte('\n')
+		lineStr := line.String()
+		lineRunes := utf8.RuneCountInString(lineStr)
+
+		var detailStr string
+		var detailRunes int
 		if d := strings.TrimSpace(f.Detail); d != "" {
 			switch {
 			case inlineParents[f.ID]:
-				fmt.Fprintf(&b, "  细节：%s\n", clipRunes(d, entrySeedParentDetailCap))
+				detailStr = fmt.Sprintf("  细节：%s\n", clipRunes(d, entrySeedParentDetailCap))
+				detailRunes = utf8.RuneCountInString(detailStr)
 			case isKeyFact(f.Category, f.EvidenceIDs):
-				fmt.Fprintf(&b, "  细节：%s\n", clipRunes(d, entrySeedKeyDetailCap))
+				detailStr = fmt.Sprintf("  细节：%s\n", clipRunes(d, entrySeedKeyDetailCap))
+				detailRunes = utf8.RuneCountInString(detailStr)
 			}
 		}
+
+		// Reserve budget for the concise node_detail ID fallback line whenever more
+		// facts follow or overflow has already begun.
+		reserve := 0
+		if len(overflowIDs) > 0 || i < len(facts)-1 {
+			reserve = overflowReserveRunes
+		}
+		limit := entrySeedMaxRenderRunes - reserve
+		if len(overflowIDs) == 0 && usedRunes+lineRunes+detailRunes <= limit {
+			factsBuf.WriteString(lineStr)
+			factsBuf.WriteString(detailStr)
+			usedRunes += lineRunes + detailRunes
+			continue
+		}
+		// Prefer keeping the summary line inline (dropping detail) before falling back to ID-only.
+		if len(overflowIDs) == 0 && usedRunes+lineRunes <= limit {
+			factsBuf.WriteString(lineStr)
+			usedRunes += lineRunes
+			continue
+		}
+		// If this is the last fact and no overflow has occurred yet, check against the full ceiling.
+		if len(overflowIDs) == 0 && i == len(facts)-1 {
+			if usedRunes+lineRunes+detailRunes <= entrySeedMaxRenderRunes {
+				factsBuf.WriteString(lineStr)
+				factsBuf.WriteString(detailStr)
+				usedRunes += lineRunes + detailRunes
+				continue
+			}
+			if usedRunes+lineRunes <= entrySeedMaxRenderRunes {
+				factsBuf.WriteString(lineStr)
+				usedRunes += lineRunes
+				continue
+			}
+		}
+		overflowIDs = append(overflowIDs, f.ID)
 	}
 
-	if len(seed.NextHops) > 0 {
-		b.WriteString("\n【已确认可达但未兑现的目标（下一跳接着打，不是新开）】\n")
-		for _, h := range seed.NextHops {
-			label := h.Label
-			if label == "" {
-				label = fmt.Sprintf("asset#%d", h.AssetID)
-			}
-			factNote := ""
-			if len(h.FactIDs) > 0 {
-				ids := make([]string, len(h.FactIDs))
-				for i, id := range h.FactIDs {
-					ids[i] = fmt.Sprintf("#%d", id)
-				}
-				factNote = "由事实 " + strings.Join(ids, "、") + " 确认可达，"
-			}
-			fmt.Fprintf(&b, "- %s（%s尚无对应已兑现结果，作为下一跳接着做，不要当新目标重开）\n", label, factNote)
-		}
+	overflowStr := ""
+	if len(overflowIDs) > 0 {
+		overflowBudget := entrySeedMaxRenderRunes - usedRunes
+		overflowStr = formatEntrySeedOverflow(overflowIDs, overflowBudget)
 	}
-	return b.String()
+	out := headerStr + factsBuf.String() + overflowStr + hopsStr
+	if utf8.RuneCountInString(out) > entrySeedMaxRenderRunes {
+		r := []rune(out)
+		out = string(r[:entrySeedMaxRenderRunes])
+	}
+	return out
 }
 
 // graphIncompleteReader is the first-class compaction-failure signal

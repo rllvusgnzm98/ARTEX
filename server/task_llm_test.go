@@ -138,12 +138,18 @@ func accumulateStreamForTest(ctx context.Context, stream func(context.Context, l
 	return acc.Message(), acc.StopReason, acc.Usage, nil
 }
 
-// withZeroRetryBackoff sets the same-provider retry backoff to zero for the
-// duration of a (serial) test and returns a restore func for defer.
+// withZeroRetryBackoff sets the same-provider retry backoff (including the
+// transport retry ladder) to zero for the duration of a (serial) test and
+// returns a restore func for defer.
 func withZeroRetryBackoff() func() {
 	prev := sameProviderRetryBackoff
+	prevTransport := sameProviderTransportBackoff
 	sameProviderRetryBackoff = func(int) time.Duration { return 0 }
-	return func() { sameProviderRetryBackoff = prev }
+	sameProviderTransportBackoff = func(int) time.Duration { return 0 }
+	return func() {
+		sameProviderRetryBackoff = prev
+		sameProviderTransportBackoff = prevTransport
+	}
 }
 
 // flakyThenOKProvider fails its first failCount stream attempts pre-commit
@@ -803,5 +809,76 @@ func TestProfileDeleteRestoresQuotaBlockedIntentWhenFallbackAvailable(t *testing
 	state := task.llmStateSnapshot()
 	if len(state.ProfileIDs) != 0 || state.FailoverState != "default" {
 		t.Fatalf("task did not return to fallback state: %+v", state)
+	}
+}
+
+func TestTaskLLMTransportRetryLadderAndOverride(t *testing.T) {
+	want := []time.Duration{
+		1 * time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		15 * time.Second,
+		15 * time.Second,
+	}
+	for attempt, d := range want {
+		if got := sameProviderTransportBackoff(attempt); got != d {
+			t.Fatalf("sameProviderTransportBackoff(%d) = %v, want %v", attempt, got, d)
+		}
+	}
+
+	for _, msg := range []string{
+		"dial tcp 127.0.0.1:443: connect: connection refused",
+		"unexpected EOF",
+		"HTTP status 502 Bad Gateway",
+		"HTTP status 503 Service Unavailable",
+		"read tcp: connection reset by peer",
+		"i/o timeout",
+	} {
+		err := errors.New(msg)
+		if !isRetryableTransportError(err) {
+			t.Fatalf("expected transport error classification for %q", msg)
+		}
+		if got := sameProviderAttemptBackoff(agent.RetryConfig{}, sameProviderRetryBackoff, 3, err); got != 8*time.Second {
+			t.Fatalf("attempt 3 backoff for %q = %v, want 8s", msg, got)
+		}
+		_, explicitBackoff := sameProviderRetryPolicy(agent.RetryConfig{StreamInterval: 250 * time.Millisecond})
+		if got := sameProviderAttemptBackoff(agent.RetryConfig{StreamInterval: 250 * time.Millisecond}, explicitBackoff, 3, err); got != 250*time.Millisecond {
+			t.Fatalf("explicit StreamInterval should override transport ladder: got %v", got)
+		}
+	}
+
+	for _, nonTransport := range []string{
+		"HTTP status 429: rate limit exceeded",
+		"HTTP status 400: invalid request",
+		"openai: insufficient_quota",
+	} {
+		if isRetryableTransportError(errors.New(nonTransport)) {
+			t.Fatalf("unexpected transport classification for %q", nonTransport)
+		}
+	}
+
+	// Verify withZeroRetryBackoff overrides sameProviderTransportBackoff so 5 retries finish immediately.
+	defer withZeroRetryBackoff()()
+	start := time.Now()
+	provider := &flakyThenOKProvider{
+		failCount: 5,
+		failErr:   errors.New("HTTP status 502 Bad Gateway"),
+		okEvents:  []llm.StreamEvent{{Type: llm.SETextDelta, Text: "recovered"}},
+	}
+	hooks := taskLLMStreamHooks{
+		current: func() (taskLLMSelection, error) {
+			return taskLLMSelection{profileID: 11, provider: provider}, nil
+		},
+	}
+	msg, _, _, err := completeTaskLLM(context.Background(), "7", llm.CompletionRequest{}, hooks)
+	if err != nil {
+		t.Fatalf("completeTaskLLM after 5 transport retries failed: %v", err)
+	}
+	if provider.calls != 6 || len(msg.Content) == 0 {
+		t.Fatalf("calls=%d msg=%+v", provider.calls, msg)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("withZeroRetryBackoff did not zero transport backoff: elapsed=%v", elapsed)
 	}
 }

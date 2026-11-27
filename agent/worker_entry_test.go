@@ -3,8 +3,10 @@ package agent
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/db"
 	actool "github.com/Autumn-27/norma/tool"
@@ -479,5 +481,118 @@ func TestEntrySeedIsolatesWorkerYieldedUnanchoredCleanupAndNegativeFacts(t *test
 		if !gotCont[id] {
 			t.Fatalf("continuation intent missing lineage fact #%d: got %v", id, gotCont)
 		}
+	}
+}
+
+func TestEntrySeedSuppressesHubAnchorFanOut(t *testing.T) {
+	const (
+		hubAssetID      = int64(10)
+		specificAssetID = int64(20)
+	)
+	parentIntent := node(50, db.KindIntent, "done", map[string]any{"summary": "pivot from hub"})
+	parentFact := node(100, db.KindFact, "confirmed", map[string]any{
+		"summary":    "hub 192.168.111.20 exposes internal host 10.10.20.7",
+		"confidence": "observed",
+	})
+	siblingFact := node(101, db.KindFact, "confirmed", map[string]any{
+		"summary":    "sibling note on hub",
+		"confidence": "observed",
+	})
+	specificFact := node(102, db.KindFact, "confirmed", map[string]any{
+		"summary":    "10.10.20.7 runs SMB 445",
+		"confidence": "observed",
+	})
+	facts := []*db.Node{parentFact, siblingFact, specificFact}
+	anchors := map[int64][]int64{
+		parentFact.ID:   {hubAssetID, specificAssetID},
+		siblingFact.ID:  {hubAssetID},
+		specificFact.ID: {specificAssetID},
+	}
+	// Attach 12 unrelated confirmed facts to the hub anchor (>=10 threshold).
+	for i := int64(0); i < 12; i++ {
+		f := node(200+i, db.KindFact, "confirmed", map[string]any{
+			"summary":    fmt.Sprintf("unrelated hub fact #%d", i),
+			"confidence": "observed",
+		})
+		facts = append(facts, f)
+		anchors[f.ID] = []int64{hubAssetID}
+	}
+	intentBoth := node(60, db.KindIntent, "open", map[string]any{
+		"summary":   "audit 10.10.20.7 SMB via hub",
+		"asset_ids": []int64{hubAssetID, specificAssetID},
+	})
+	edges := []db.Edge{
+		{From: parentIntent.ID, Rel: db.RelYields, To: parentFact.ID},
+		{From: parentIntent.ID, Rel: db.RelYields, To: siblingFact.ID},
+		{From: parentFact.ID, Rel: db.RelDerivedFrom, To: intentBoth.ID},
+	}
+	g := EntryGraph{
+		Intent:         intentBoth,
+		IntentAssetIDs: []int64{hubAssetID, specificAssetID},
+		Facts:          facts,
+		Edges:          edges,
+		Anchors:        anchors,
+		Assets:         map[int64]string{hubAssetID: "192.168.111.20", specificAssetID: "10.10.20.7"},
+		AssetTypes:     map[int64]string{hubAssetID: "ip", specificAssetID: "ip"},
+	}
+	seed := BuildWorkerEntrySeed(g)
+	got := map[int64]bool{}
+	for _, f := range seed.ConfirmedFacts {
+		got[f.ID] = true
+	}
+	for _, want := range []int64{parentFact.ID, siblingFact.ID, specificFact.ID} {
+		if !got[want] {
+			t.Fatalf("missing direct lineage or specific-asset fact #%d: got %v", want, got)
+		}
+	}
+	for i := int64(0); i < 12; i++ {
+		if got[200+i] {
+			t.Fatalf("hub-anchor lateral fact #%d leaked despite specific non-hub asset", 200+i)
+		}
+	}
+
+	// Contrast: an intent anchored ONLY to the hub asset still receives hub facts.
+	intentHubOnly := node(61, db.KindIntent, "open", map[string]any{
+		"summary":   "continue auditing hub 192.168.111.20",
+		"asset_ids": []int64{hubAssetID},
+	})
+	gHubOnly := g
+	gHubOnly.Intent = intentHubOnly
+	gHubOnly.IntentAssetIDs = []int64{hubAssetID}
+	gHubOnly.Edges = nil
+	seedHubOnly := BuildWorkerEntrySeed(gHubOnly)
+	if len(seedHubOnly.ConfirmedFacts) < 10 {
+		t.Fatalf("hub-only intent should still see hub facts, got %d", len(seedHubOnly.ConfirmedFacts))
+	}
+}
+
+func TestRenderWorkerEntrySeedHard6000RuneCeilingWithNodeDetailFallback(t *testing.T) {
+	seed := WorkerEntrySeed{Prefetched: true}
+	longSummary := strings.Repeat("超长跨主机观察摘要信息", 45) // 450 runes each
+	longDetail := strings.Repeat("详细命令输出与证据内容", 40)
+	for i := int64(1); i <= 25; i++ {
+		f := EntryFact{
+			ID:           i,
+			Summary:      fmt.Sprintf("item-%d-%s", i, longSummary),
+			Detail:       longDetail,
+			Confidence:   "observed",
+			DirectParent: i <= 4,
+			Relevant:     true,
+		}
+		if i <= 12 {
+			f.Category = "evidence"
+			f.EvidenceIDs = []string{fmt.Sprintf("ev:%d", i)}
+		}
+		seed.ConfirmedFacts = append(seed.ConfirmedFacts, f)
+	}
+	out := RenderWorkerEntrySeed(seed)
+	if !utf8.ValidString(out) {
+		t.Fatal("rendered entry seed is not valid UTF-8")
+	}
+	if runes := utf8.RuneCountInString(out); runes > entrySeedMaxRenderRunes {
+		t.Fatalf("rendered entry seed exceeded hard cap: %d > %d runes", runes, entrySeedMaxRenderRunes)
+	}
+	if !strings.Contains(out, "node_detail") || !strings.Contains(out, "#25") {
+		t.Fatalf("expected concise node_detail ID fallback for overflow facts:\n%s", out)
 	}
 }

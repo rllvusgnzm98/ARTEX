@@ -59,6 +59,7 @@ func (e *Engine) runtimeProvenance() map[string]any {
 		"os":            runtime.GOOS,
 		"arch":          runtime.GOARCH,
 		"stop_loss": map[string]any{
+			"enabled":                stopLossEnabled(),
 			"safety_ceiling_seconds": int64(sl.SafetyCeiling.Seconds()),
 			"idle_probe_limit":       sl.IdleProbeLimit,
 			"repeat_command_limit":   sl.RepeatCommandLimit,

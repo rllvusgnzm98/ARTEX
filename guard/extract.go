@@ -20,13 +20,25 @@ var hostTools = map[string]bool{
 	"nmap": true, "ssh": true, "ping": true, "telnet": true, "dig": true,
 	"host": true, "nslookup": true, "masscan": true, "httpx": true,
 	"hydra": true, "smbclient": true, "rpcclient": true, "rdesktop": true,
-	"xfreerdp": true,
-	"ffuf":     true, "feroxbuster": true, "gobuster": true, "sqlmap": true,
+	"xfreerdp": true, "evil-winrm": true,
+	"ffuf": true, "feroxbuster": true, "gobuster": true, "sqlmap": true,
 	"nuclei": true, "whatweb": true, "commix": true, "katana": true, "nxc": true,
 	"naabu": true, "fscan": true, "gogo": true,
 	"impacket-secretsdump": true, "impacket-psexec": true,
 	"impacket-wmiexec": true, "impacket-smbclient": true,
 	"impacket-getuserspns": true,
+}
+
+func isHostTool(base string) bool {
+	return hostTools[base] || strings.HasPrefix(base, "impacket-")
+}
+
+func isSingleTargetTool(tool string) bool {
+	switch tool {
+	case "ssh", "smbclient", "rpcclient", "evil-winrm", "nxc":
+		return true
+	}
+	return strings.HasPrefix(tool, "impacket-")
 }
 
 // hostValueFlags 是按工具列出的「下一个参数(或 --flag=value)才是目标」的开关。
@@ -45,6 +57,7 @@ var hostValueFlags = map[string]map[string]bool{
 	"fscan":       {"-h": true},
 	"gogo":        {"-i": true},
 	"ssh":         {"-J": true},
+	"evil-winrm":  {"-i": true},
 }
 
 // valueFlags take a non-host value as the next token; that token must not be
@@ -66,11 +79,37 @@ var valueFlags = map[string]bool{
 
 var (
 	reScheme = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s'"<>|\\^` + "`" + `]+`)
+	// reXMLNSAttrPrefix matches XML/SOAP namespace attribute prefixes right before a URI:
+	// e.g. xmlns=", xmlns:soapenv=', xmlns:wsa=\".
+	reXMLNSAttrPrefix = regexp.MustCompile(`(?i)\bxmlns(?::[a-z0-9._-]+)?\s*=\s*\\?["']?$`)
 	// 主机名:至少一段点分且以字母 TLD 结尾(file.txt 这类误判由 valueFlags 与扩展名黑名单兜住)。
 	reHostName     = regexp.MustCompile(`^(?i)[a-z0-9]([a-z0-9-]*\.)+[a-z]{2,}$`)
 	reSegmentSplit = regexp.MustCompile(`[|;&\r\n]+`)
 	reTokenSplit   = regexp.MustCompile(`\s+`)
 )
+
+// xmlSchemaHosts are standard XML/SOAP/Spring/WebLogic namespace schema hosts
+// that appear inside payload bodies rather than as network targets.
+var xmlSchemaHosts = map[string]bool{
+	"www.w3.org":              true,
+	"schemas.xmlsoap.org":     true,
+	"schemas.microsoft.com":   true,
+	"www.bea.com":             true,
+	"www.springframework.org": true,
+}
+
+func isXMLNamespaceContext(prefix string) bool {
+	return reXMLNSAttrPrefix.MatchString(prefix)
+}
+
+func isXMLNamespaceToken(tok string) bool {
+	low := strings.ToLower(tok)
+	return strings.HasPrefix(low, "xmlns=") || strings.HasPrefix(low, "xmlns:")
+}
+
+func isXMLSchemaHost(h string) bool {
+	return xmlSchemaHosts[strings.ToLower(strings.TrimSuffix(strings.TrimSpace(h), "."))]
+}
 
 // ExtractHosts extracts likely interaction targets from a shell command line:
 // hosts of URLs (scheme://...), host:port / IP literals following common tool
@@ -88,9 +127,12 @@ func ExtractHosts(command string) []string {
 		out = append(out, h)
 	}
 
-	// Pass 1: URLs anywhere in the command.
-	for _, raw := range reScheme.FindAllString(command, -1) {
-		if h := extractURLHost(raw); h != "" {
+	// Pass 1: URLs anywhere in the command (skipping XML/SOAP xmlns namespace URIs).
+	for _, idx := range reScheme.FindAllStringIndex(command, -1) {
+		if isXMLNamespaceContext(command[:idx[0]]) {
+			continue
+		}
+		if h := extractURLHost(command[idx[0]:idx[1]]); h != "" {
 			add(h)
 		}
 	}
@@ -125,8 +167,11 @@ func ExtractHosts(command string) []string {
 				continue
 			}
 			if takeHost {
-				addHostCandidate(add, tok)
+				matched := addHostCandidate(add, tok)
 				takeHost = false
+				if matched && curTool == "evil-winrm" {
+					curTool = ""
+				}
 				continue
 			}
 			base := strings.ToLower(baseOf(tok))
@@ -134,7 +179,7 @@ func ExtractHosts(command string) []string {
 				curTool = ""
 				continue
 			}
-			if hostTools[base] {
+			if isHostTool(base) {
 				curTool = base
 				continue
 			}
@@ -143,7 +188,9 @@ func ExtractHosts(command string) []string {
 					name, inline := splitFlag(tok)
 					if hostValueFlags[curTool][name] {
 						if inline != "" {
-							addHostCandidate(add, inline)
+							if addHostCandidate(add, inline) && curTool == "evil-winrm" {
+								curTool = ""
+							}
 						} else {
 							takeHost = true
 						}
@@ -154,10 +201,10 @@ func ExtractHosts(command string) []string {
 					}
 					continue
 				}
-				addHostCandidate(add, tok)
-				// ssh takes one positional destination ([user@]host); subsequent tokens
-				// are the remote command string rather than additional ssh hosts.
-				if curTool == "ssh" {
+				matched := addHostCandidate(add, tok)
+				// Single-target remote tools take one destination; subsequent tokens
+				// are remote commands or share/module arguments rather than extra hosts.
+				if curTool == "ssh" || (matched && isSingleTargetTool(curTool)) {
 					curTool = ""
 				}
 				continue
@@ -253,17 +300,26 @@ func extractURLHost(raw string) string {
 		return ""
 	}
 	if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
-		return cleanExtractedHost(u.Hostname())
+		h := cleanExtractedHost(u.Hostname())
+		if isXMLSchemaHost(h) {
+			return ""
+		}
+		return h
 	}
 	if idx := strings.IndexByte(raw, '$'); idx >= 0 {
 		if u, err := url.Parse(raw[:idx]); err == nil && u.Hostname() != "" {
-			return cleanExtractedHost(u.Hostname())
+			h := cleanExtractedHost(u.Hostname())
+			if isXMLSchemaHost(h) {
+				return ""
+			}
+			return h
 		}
 	}
 	return ""
 }
 
-// parseBareIP returns the normalized IP if tok is an IP literal or ip:port.
+// parseBareIP returns the normalized IP if tok is an IP literal or ip:port,
+// filtering netmask/broadcast/unspecified addresses (255.*.*.*, 0.0.0.0, ::).
 func parseBareIP(tok string) string {
 	tok = stripShellVarSuffix(tok)
 	if tok == "" {
@@ -273,10 +329,17 @@ func parseBareIP(tok string) string {
 		tok = host
 	}
 	tok = strings.Trim(tok, "[]")
-	if net.ParseIP(tok) != nil {
-		return tok
+	ip := net.ParseIP(tok)
+	if ip == nil {
+		return ""
 	}
-	return ""
+	if ip.IsUnspecified() {
+		return ""
+	}
+	if v4 := ip.To4(); v4 != nil && v4[0] == 255 {
+		return ""
+	}
+	return tok
 }
 
 // stripPortMaybe drops a trailing :<numeric-port> from host:port (best effort).
@@ -289,12 +352,13 @@ func stripPortMaybe(tok string) string {
 	return tok
 }
 
-// addHostCandidate 按既有风格收下一条可能的目标:URL host、user@host 的 host、
-// 裸 IP 或点分主机名。CIDR 字面量故意不提取(与 nmap 192.168.1.0/24 既有语义一致)。
-func addHostCandidate(add func(string), tok string) {
+// addHostCandidate 按既有风格收下一条可能的目标:URL host、UNC //host/share、
+// user@host 的 host、裸 IP 或点分主机名。CIDR 字面量故意不提取(与 nmap 192.168.1.0/24
+// 既有语义一致)。返回值表示该 token 是否匹配到了目标(含 CIDR)，用于单目标工具重置上下文。
+func addHostCandidate(add func(string), tok string) bool {
 	tok = strings.Trim(tok, `"'`)
-	if tok == "" {
-		return
+	if tok == "" || isXMLNamespaceToken(tok) {
+		return false
 	}
 	if at := strings.LastIndex(tok, "@"); at >= 0 {
 		tok = tok[at+1:] // ssh / impacket user@host
@@ -302,24 +366,34 @@ func addHostCandidate(add func(string), tok string) {
 	if strings.Contains(tok, "://") {
 		if h := extractURLHost(tok); h != "" {
 			add(h)
+			return true
 		}
-		return
+		return false
+	}
+	if strings.HasPrefix(tok, "//") || strings.HasPrefix(tok, `\\`) {
+		rest := strings.TrimLeft(tok, `/\`)
+		if sep := strings.IndexAny(rest, `/\`); sep > 0 {
+			rest = rest[:sep]
+		}
+		tok = rest
 	}
 	if isCIDRLiteral(tok) {
-		return
+		return true
 	}
 	tok = stripShellVarSuffix(tok)
 	if tok == "" {
-		return
+		return false
 	}
 	if ip := parseBareIP(tok); ip != "" {
 		add(ip)
-		return
+		return true
 	}
 	host := stripPortMaybe(tok)
 	if reHostName.MatchString(host) && !hasNonTLDFileExt(host) {
 		add(tok)
+		return true
 	}
+	return false
 }
 
 var nonTLDFileExts = map[string]bool{
@@ -334,7 +408,10 @@ var nonTLDFileExts = map[string]bool{
 	".wordlist": true, ".dic": true, ".lst": true, ".md": true,
 	".ini": true, ".conf": true, ".cfg": true, ".toml": true,
 	".wasm": true, ".apk": true, ".ipa": true, ".jar": true, ".war": true,
-	".pyc": true,
+	".pyc":  true,
+	".save": true, ".hiv": true, ".parse": true, ".dmp": true, ".reg": true,
+	".kirbi": true, ".ccache": true, ".py": true, ".ps1": true, ".exe": true,
+	".dll": true, ".class": true,
 }
 
 func hasNonTLDFileExt(host string) bool {

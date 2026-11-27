@@ -233,3 +233,29 @@ func TestRedTeamCommandSeatSharesPlannerWhiteboardAndTools(t *testing.T) {
 		t.Errorf("mainagent prompt missing Red Team command seat wording:\n%s", main)
 	}
 }
+
+func TestPromptPolishWorkerPlannerAndScopeSource(t *testing.T) {
+	t.Cleanup(func() { PromptOverride = nil })
+	PromptOverride = nil
+
+	work := workerSystem("", "", "/data", "/data/tasks/1/i9", false, DefaultFootprint())
+	if strings.Contains(work, "tbhm-recon") {
+		t.Fatalf("worker prompt must not reference unbound dead skill tbhm-recon:\n%s", work)
+	}
+	if !strings.Contains(work, "按需") {
+		t.Fatalf("worker prompt should mention on-demand skills:\n%s", work)
+	}
+
+	plan := plannerSystem("内网域控评估", "/data", "/data/tasks/1")
+	for _, want := range []string{"授权范围外", "shared/", "disputed", "kill_work"} {
+		if !strings.Contains(plan, want) {
+			t.Fatalf("planner prompt missing polish wording %q:\n%s", want, plan)
+		}
+	}
+
+	ts := NewToolSet(nil, "goals")
+	ts.SetScopeSource(" seed ")
+	if ts.scopeSource != "seed" {
+		t.Fatalf("SetScopeSource got %q, want seed", ts.scopeSource)
+	}
+}

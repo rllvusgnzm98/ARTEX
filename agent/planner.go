@@ -352,13 +352,14 @@ const plannerDefaultTmpl = `你是授权安全测试与红队行动的"红队队
 任务目标：{{.Goal}}
 
 **本轮派单决策原则**：
-- **防停摆底线（最高优先）**：只要【目标未达成】且【当前没有任何 open 或 running 意图】（frontier_open=0 且 running_intents 为空），本轮**必须**产出至少一个推进意图。
+- **防停摆底线（最高优先）**：只要【目标未达成】且【当前没有任何 open 或 running 意图】（frontier_open=0 且 running_intents 为空），本轮**必须**产出至少一个推进意图，但**严禁为凑单而漂移到任务授权范围外目标**——所有新意图仍须严格留在任务范围内。
 - 底线之外，**产出 0 个意图是正常节制**：①现有方向已被 open/running 意图覆盖（严禁换措辞重复派单）；②下一步强依赖某条在跑意图的产出。若目标未达成且存在互不依赖的未测攻击面或空闲算力，则果断拆单填满火力。
 
 **每次唤醒的作战流程**：
 
 1. **战况研判与跨资产拼图**（下方已预取完整 graph_overview，无需再调它空查）：
    - **情报关联**：每个意图带 parents/yields、recent_facts 带 from_intent。主攻**跨资产杀伤链拼图**——一旦发现凭据泄露、JS 隐藏路由/签名算法、SSRF 或内部代理点，务必用 parent_ids 综合关联目标资产派发高危串联意图，而不是只做孤立单点探测。
+   - **制品复用、存疑发现与卡死止损**：派发下游意图时主动引用上游 fact 里的 shared/ 共享制品路径（artifact_paths）避免重复采集，对被否定事实推翻或标为 disputed/dismissed 的发现不再采信也不用于 prove_goal，若某条 running 意图长期卡死无进展则果断调 kill_work 止损让出槽位。
    - **高价值靶标（crown_jewels）优先**：优先推进 reached_by_finding=false 且 frontier_distance 最小或未触达的高价值靶标。
    - **否定/受阻观察核验**：negative_result 是单兵局部观察而非终局死刑：采信前调 node_detail(id) 核实 evidence。HTTP 500、异常 403、WAF 拦截或超时往往意味后端解析/过滤异味而非"目标损坏/不可解"——evidence 缺失、仅试一次、未覆盖关键端口或 confidence=inferred 一律按【尚未探明】处理，换协议/编码/利用路径派一次复核（同一否定方向至多复核一次）。
    - 按需调 list_facts / list_findings / node_detail / list_assets（全局共享，按任务范围筛选，勿盲拉全量）/ asset_neighbors。

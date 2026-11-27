@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent/chainskel"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/llmrec"
 	acperm "github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
@@ -87,6 +89,9 @@ type ToolSet struct {
 	ts              *db.ExplorationStore
 	worker          string
 	taskID          int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
+	// scopeSource overrides the source tag recorded by add_task_scope (e.g. "seed"
+	// during round-0 goal decomposition; empty defaults to "agent").
+	scopeSource string
 	// coverageDisabled mirrors tasks.coverage_enabled=false. Stored inverted so the
 	// zero value (all existing ToolSet constructions) means ENABLED — matching the
 	// DB default (true). When true: graphOverviewData drops the coverage block, the
@@ -266,6 +271,10 @@ func NewToolSet(ts *db.ExplorationStore, worker string) *ToolSet {
 // SetTaskID sets the PG task id on this ToolSet so that report_finding can
 // dual-write to the standalone findings table (which survives task deletion).
 func (t *ToolSet) SetTaskID(id int64) { t.taskID = id }
+
+// SetScopeSource configures the source tag written by add_task_scope (e.g. "seed"
+// for round-0 initial targets; empty falls back to "agent").
+func (t *ToolSet) SetScopeSource(s string) { t.scopeSource = strings.TrimSpace(s) }
 
 // SetCoverageEnabled records whether this task has the asset-coverage feature on
 // (default enabled). Passing false makes graphOverviewData omit the coverage block
@@ -570,6 +579,9 @@ func (t *ToolSet) graphOverviewDataFrom(g *graphSnapshot) map[string]any {
 		var fp map[string]any
 		_ = json.Unmarshal(n.Payload, &fp)
 		m := map[string]any{"id": n.ID, "summary": fp["summary"]}
+		if n.State != "" && n.State != "confirmed" {
+			m["state"] = n.State
+		}
 		if from := factFrom[n.ID]; from > 0 {
 			m["from_intent"] = from // 本漏洞由哪个意图产生
 		}
@@ -694,11 +706,11 @@ func (t *ToolSet) graphOverviewDataFrom(g *graphSnapshot) map[string]any {
 		recentDone = recentDone[:recentDoneCap]
 	}
 	out["recent_done_intents"] = compactIntents(recentDone, parentsOf, yieldsOf)
-	// cold-digest §6.1: 折叠冷区的 digest body，按最新成员时间降序取前 N；被截的更旧 digest
-	// 只给裸 id（仍可 expand_digest 展开），避免冷区唯一出口被无限拉长。
-	const coldDigestsCap = 15
+	// cold-digest §6.1: 折叠冷区的紧凑 digest 预览（≤6 条、每条 ≤120 字），按最新成员时间降序取前 N；
+	// 其余较旧 digest 只给裸 id（仍可 expand_digest 展开），避免冷区摘要膨胀撑爆规划上下文。
+	const coldDigestsCap = plannerColdDigestsCap
 	if cds, more := coldDigestsRecent(t.ts, coldDigestsCap); len(cds) > 0 {
-		out["cold_digests"] = cds // [{id, body, member_count}] —— 直接读 body (§6.1)
+		out["cold_digests"] = cds // [{id, body(clipped<=120), member_count}]
 		if len(more) > 0 {
 			out["cold_digests_more"] = more // 被截断的更旧 digest 的 id；用 expand_digest(id) 展开
 		}
@@ -1399,7 +1411,7 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 		"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（凡针对已知具体资产必传，0/1/多个；是 graph_overview.task_assets 或 list_assets 返回的资产 id，不是探索节点 id）：只要方向围绕某些具体资产就务必传上——用于覆盖去重、把意图连入资产链路，并让执行结论自动回锚到对应资产。仅当纯开局全局侦察、确实没有具体目标资产时才留空。"},
 		"parent_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
 		"priority":   intp("优先级 0-10，默认5"),
-		"chain_tags": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "【强烈建议传】本方向的主要攻击面标签，决定 worker 进场注入哪套反问决策链骨架（" + strings.Join(chainskel.Categories, "/") + "）。**至多 2 个**，仅首个合法标签注入主骨架，主要攻击面放首位；取值非法或超过 2 个会直接报错。只描述攻击面，不是优先级。"},
+		"chain_tags": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "【强烈建议传】本方向的主要攻击面标签，决定 worker 进场注入哪套反问决策链骨架（" + strings.Join(chainskel.Categories, "/") + "）。**至多 2 个**，合法标签按序注入对应骨架（单类约 4K 封顶），主要攻击面放首位；取值非法或超过 2 个会直接报错。只描述攻击面，不是优先级。"},
 	}
 	props := make(map[string]any, len(itemProps)+1)
 	for k, v := range itemProps {
@@ -1470,6 +1482,295 @@ func (t *ToolSet) listGoals() actool.CoreTool {
 		})
 }
 
+func scopeRulesFromTaskRows(rows []db.TaskScope, includeAgent, includeAuto bool) (rules []guard.ScopeRule, companyIDs map[int64]bool, hasInclusion bool) {
+	rules = make([]guard.ScopeRule, 0, len(rows))
+	for _, r := range rows {
+		src := strings.ToLower(strings.TrimSpace(r.Source))
+		switch r.Kind {
+		case "exclude_root_domain":
+			if r.Domain != "" {
+				rules = append(rules, guard.ScopeRule{Kind: "domain", Value: r.Domain, Exclude: true})
+			}
+		case "exclude_subdomain":
+			if r.Domain != "" {
+				rules = append(rules, guard.ScopeRule{Kind: "exact_domain", Value: r.Domain, Exclude: true})
+			}
+		case "exclude_ip", "exclude_cidr":
+			if r.Net != "" {
+				rules = append(rules, guard.ScopeRule{Kind: "cidr", Value: r.Net, Exclude: true})
+			}
+		case "company":
+			if src == "auto" && !includeAuto || src == "agent" && !includeAgent {
+				continue
+			}
+			if r.CompanyID != nil && *r.CompanyID > 0 {
+				if companyIDs == nil {
+					companyIDs = map[int64]bool{}
+				}
+				companyIDs[*r.CompanyID] = true
+				hasInclusion = true
+			}
+		case "root_domain":
+			if src == "auto" && !includeAuto || src == "agent" && !includeAgent {
+				continue
+			}
+			if r.Domain != "" {
+				rules = append(rules, guard.ScopeRule{Kind: "domain", Value: r.Domain})
+				hasInclusion = true
+			}
+		case "subdomain":
+			if src == "auto" && !includeAuto || src == "agent" && !includeAgent {
+				continue
+			}
+			if r.Domain != "" {
+				rules = append(rules, guard.ScopeRule{Kind: "exact_domain", Value: r.Domain})
+				hasInclusion = true
+			}
+		case "ip", "cidr":
+			if src == "auto" && !includeAuto || src == "agent" && !includeAgent {
+				continue
+			}
+			if r.Net != "" {
+				rules = append(rules, guard.ScopeRule{Kind: "cidr", Value: r.Net})
+				hasInclusion = true
+			}
+		case "icp":
+			if src == "auto" && !includeAuto || src == "agent" && !includeAgent {
+				continue
+			}
+			if r.Value != "" {
+				rules = append(rules, guard.ScopeRule{Kind: "icp", Value: r.Value})
+				hasInclusion = true
+			}
+		}
+	}
+	return rules, companyIDs, hasInclusion
+}
+
+func trustedScopeForTask(as *db.AssetStore, taskID int64) (*guard.ScopeMatcher, map[int64]bool, bool) {
+	if as == nil || taskID <= 0 {
+		return nil, nil, false
+	}
+	rows, err := as.ListTaskScope(taskID)
+	if err != nil || len(rows) == 0 {
+		return nil, nil, false
+	}
+	rules, companies, hasInclusion := scopeRulesFromTaskRows(rows, false, false)
+	if !hasInclusion {
+		return nil, nil, false
+	}
+	m := guard.NewScopeMatcher(rules)
+	m.AllowLocal = false
+	return m, companies, true
+}
+
+func assetScopeHosts(a *db.Asset) []string {
+	if a == nil {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	add := func(h string) {
+		h = strings.ToLower(strings.TrimSpace(h))
+		if h == "" || seen[h] {
+			return
+		}
+		seen[h] = true
+		out = append(out, h)
+	}
+	if a.Domain != "" {
+		add(a.Domain)
+	}
+	if a.URL != "" {
+		if u, err := url.Parse(a.URL); err == nil && u.Hostname() != "" {
+			add(u.Hostname())
+		}
+	}
+	if a.IP != "" {
+		add(a.IP)
+	}
+	if a.Type == "root_domain" && a.Domain == "" && a.RootDomain != "" {
+		add(a.RootDomain)
+	}
+	return out
+}
+
+func assetExcludedByRules(a *db.Asset, excl *guard.ScopeMatcher) bool {
+	if a == nil || excl == nil {
+		return false
+	}
+	for _, h := range assetScopeHosts(a) {
+		if excl.Check(h) == guard.ScopeOut {
+			return true
+		}
+	}
+	return false
+}
+
+func assetMatchesScope(a *db.Asset, m *guard.ScopeMatcher, companyIDs map[int64]bool) bool {
+	if a == nil {
+		return false
+	}
+	for _, h := range assetScopeHosts(a) {
+		if m != nil && m.Check(h) == guard.ScopeIn {
+			return true
+		}
+	}
+	if a.CompanyID != nil && companyIDs[*a.CompanyID] {
+		return true
+	}
+	return false
+}
+
+// evidenceAnchorIDs resolves the anchored asset IDs of an evidence node (or, if
+// the evidence node itself has no anchors, falls back to its producing intent's
+// anchors / payload asset_ids). Searches the owning exploration store (current
+// task or direct source task when inherited).
+func (t *ToolSet) evidenceAnchorIDs(evidenceNode *db.Node) []int64 {
+	if evidenceNode == nil || t.ts == nil {
+		return nil
+	}
+	store := t.ts
+	if evidenceNode.Inherited && evidenceNode.SourceTaskID > 0 {
+		if srcs, err := t.ts.DirectSourceStores(); err == nil {
+			for _, s := range srcs {
+				if s.Task.TaskID == evidenceNode.SourceTaskID {
+					store = s.Store
+					break
+				}
+			}
+		}
+	}
+	if m, err := store.NodeAssets([]int64{evidenceNode.ID}); err == nil && len(m[evidenceNode.ID]) > 0 {
+		return uniqueIDs(m[evidenceNode.ID])
+	}
+	// Fall back to the producing intent (intent --yields--> evidenceNode).
+	edges, err := store.Edges(5000)
+	if err != nil {
+		return nil
+	}
+	var producerIDs []int64
+	for _, e := range edges {
+		if e.Rel == db.RelYields && e.To == evidenceNode.ID && e.From > 0 {
+			producerIDs = append(producerIDs, e.From)
+		}
+	}
+	if len(producerIDs) == 0 {
+		return nil
+	}
+	var anchors []int64
+	if m, err := store.NodeAssets(producerIDs); err == nil {
+		for _, pid := range producerIDs {
+			anchors = append(anchors, m[pid]...)
+		}
+	}
+	if len(anchors) == 0 {
+		for _, pid := range producerIDs {
+			if pn, err := store.GetNode(pid); err == nil && pn != nil {
+				anchors = append(anchors, intentAssetIDs(pn)...)
+			}
+		}
+	}
+	return uniqueIDs(anchors)
+}
+
+func (t *ToolSet) validateProveGoalEvidence(ev int64, evidenceNode *db.Node) error {
+	if evidenceNode == nil {
+		return fmt.Errorf("evidence_id #%d 不存在", ev)
+	}
+	if evidenceNode.State == "dismissed" {
+		return fmt.Errorf("prove_goal 拒绝：%s #%d 已被标为 dismissed（无效/推翻），不能证明目标达成", evidenceNode.Kind, ev)
+	}
+	if evidenceNode.Kind == db.KindFact {
+		if evidenceNode.State == db.StateOrigin {
+			return fmt.Errorf("prove_goal 拒绝：origin 起点事实 #%d 不能作为目标达成证据", ev)
+		}
+		var fp struct {
+			Confidence string `json:"confidence"`
+		}
+		_ = json.Unmarshal(evidenceNode.Payload, &fp)
+		if !strings.EqualFold(strings.TrimSpace(fp.Confidence), "observed") {
+			return fmt.Errorf("prove_goal 拒绝：fact #%d 的 confidence=%q 不是 \"observed\"，不能作为目标达成的实锤证据（请提供直接观测到的 observed 事实或已确认的 finding）", ev, strings.TrimSpace(fp.Confidence))
+		}
+	}
+	if t.as == nil || t.ts == nil {
+		return nil
+	}
+	taskID := t.taskID
+	if taskID <= 0 {
+		taskID, _ = t.ts.TaskID()
+	}
+	if taskID <= 0 {
+		return nil
+	}
+	scopeRows, err := t.as.ListTaskScope(taskID)
+	if err != nil || len(scopeRows) == 0 {
+		return nil
+	}
+	_, _, hasTrusted := scopeRulesFromTaskRows(scopeRows, false, false)
+	nonAutoRules, nonAutoCompanies, hasNonAuto := scopeRulesFromTaskRows(scopeRows, true, false)
+	autoOnlyRules, autoOnlyCompanies, hasAutoOnly := func() ([]guard.ScopeRule, map[int64]bool, bool) {
+		var autoRows []db.TaskScope
+		for _, r := range scopeRows {
+			if strings.EqualFold(strings.TrimSpace(r.Source), "auto") {
+				autoRows = append(autoRows, r)
+			}
+		}
+		return scopeRulesFromTaskRows(autoRows, false, true)
+	}()
+	var excludeRules []guard.ScopeRule
+	for _, r := range nonAutoRules {
+		if r.Exclude {
+			excludeRules = append(excludeRules, r)
+		}
+	}
+	excludeMatcher := guard.NewScopeMatcher(excludeRules)
+	excludeMatcher.AllowLocal = false
+
+	anchorIDs := t.evidenceAnchorIDs(evidenceNode)
+	if hasTrusted && len(anchorIDs) == 0 {
+		return fmt.Errorf("prove_goal 拒绝：当前任务已配置可信范围（manual/seed），但证据节点 #%d 及其产出意图均未锚定任何目标资产，无法核验归属范围", ev)
+	}
+	if len(anchorIDs) == 0 {
+		return nil
+	}
+	assets, err := t.as.GetByIDs(anchorIDs)
+	if err != nil {
+		return fmt.Errorf("prove_goal 核验锚定资产失败：%w", err)
+	}
+	if len(assets) == 0 {
+		if hasTrusted {
+			return fmt.Errorf("prove_goal 拒绝：证据节点 #%d 锚定的资产记录不存在，无法核验归属范围", ev)
+		}
+		return nil
+	}
+	for _, a := range assets {
+		if assetExcludedByRules(a, excludeMatcher) {
+			return fmt.Errorf("prove_goal 拒绝：证据节点 #%d 锚定的资产 %s 命中任务排除范围（exclude），不能证明目标达成", ev, describeAsset(a))
+		}
+	}
+	if hasNonAuto {
+		nonAutoMatcher := guard.NewScopeMatcher(nonAutoRules)
+		nonAutoMatcher.AllowLocal = false
+		for _, a := range assets {
+			if assetMatchesScope(a, nonAutoMatcher, nonAutoCompanies) {
+				return nil
+			}
+		}
+		return fmt.Errorf("prove_goal 拒绝：证据节点 #%d 锚定的资产均不在本任务非 auto 授权范围（manual/seed/agent）内或仅经 source=\"auto\" 自动写入，不能用于证明目标达成", ev)
+	}
+	if hasAutoOnly {
+		autoMatcher := guard.NewScopeMatcher(autoOnlyRules)
+		autoMatcher.AllowLocal = false
+		for _, a := range assets {
+			if assetMatchesScope(a, autoMatcher, autoOnlyCompanies) {
+				return fmt.Errorf("prove_goal 拒绝：证据节点 #%d 锚定的资产仅通过 source=\"auto\" 自动写入范围，缺乏 manual/seed/agent 授权依据，不能证明目标达成", ev)
+			}
+		}
+	}
+	return nil
+}
+
 func (t *ToolSet) proveGoal() actool.CoreTool {
 	return t.writeExpTool("prove_goal", "当你判断某个发现/事实证明了某个目标达成时调用：把证据节点连到目标节点，并标记目标 met。",
 		obj(map[string]any{
@@ -1495,6 +1796,9 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			evidenceNode, err := t.ts.GetNodeWithSources(ev)
 			if err != nil || evidenceNode == nil || (evidenceNode.Kind != db.KindFact && evidenceNode.Kind != db.KindFinding) {
 				return actool.Errorf("evidence_id 必须是本任务或直接关联任务的事实/漏洞节点"), nil
+			}
+			if err := t.validateProveGoalEvidence(ev, evidenceNode); err != nil {
+				return actool.Errorf(err.Error()), nil
 			}
 			_ = t.ts.LinkCtx(ctx, ev, db.RelProves, goal)
 			_ = t.ts.SetNodeStateCtx(ctx, goal, "met")
@@ -1650,15 +1954,16 @@ func deriveFindingName(vulnClass, summary string) string {
 // must NOT be stuffed into the asset graph via upsert_asset.
 // factItem 是 record_fact 批量/单条的一条事实。
 type factItem struct {
-	Summary       string            `json:"summary"`
-	Detail        string            `json:"detail"`
-	Evidence      string            `json:"evidence"`   // 一行关键证据（命令+关键输出行），支撑结论、便于事后核对
-	Confidence    string            `json:"confidence"` // observed（直接看到）| inferred（据现象推断）
-	Category      string            `json:"category"`
-	EvidenceIDs   []string          `json:"evidence_ids"`
-	ArtifactPaths []string          `json:"artifact_paths"`
-	IntentID      json.RawMessage   `json:"intent_id"`
-	AssetIDs      []json.RawMessage `json:"asset_ids"`
+	Summary               string            `json:"summary"`
+	Detail                string            `json:"detail"`
+	Evidence              string            `json:"evidence"`   // 一行关键证据（命令+关键输出行），支撑结论、便于事后核对
+	Confidence            string            `json:"confidence"` // observed（直接看到）| inferred（据现象推断）
+	Category              string            `json:"category"`
+	EvidenceIDs           []string          `json:"evidence_ids"`
+	ArtifactPaths         []string          `json:"artifact_paths"`
+	InvalidatesFindingIDs []json.RawMessage `json:"invalidates_finding_ids"`
+	IntentID              json.RawMessage   `json:"intent_id"`
+	AssetIDs              []json.RawMessage `json:"asset_ids"`
 }
 
 // recordOneFact 写一条 fact 节点并连到意图（intent→yields→fact）。defaultIntent 为
@@ -1676,6 +1981,20 @@ func (t *ToolSet) recordOneFactCtx(ctx context.Context, it factItem, defaultInte
 	default:
 		return 0, fmt.Errorf("category 必须为 negative_result / scope_limit / cleanup_status / evidence，普通事实请省略")
 	}
+	invalIDs := uniqueIDs(pidList(it.InvalidatesFindingIDs))
+	if len(invalIDs) > 0 && it.Category != "negative_result" {
+		return 0, fmt.Errorf("invalidates_finding_ids 仅在 category=\"negative_result\" 时可用")
+	}
+	for _, fid := range invalIDs {
+		fn, err := t.ts.GetNodeCtx(ctx, fid)
+		if err != nil {
+			t.countWrites(WriteCounts{Failures: 1})
+			return 0, fmt.Errorf("lookup finding %d to invalidate: %w", fid, err)
+		}
+		if fn == nil || fn.Kind != db.KindFinding {
+			return 0, fmt.Errorf("invalidates_finding_ids 中的 #%d 不是本任务的 finding 节点", fid)
+		}
+	}
 	payload := map[string]any{"summary": it.Summary}
 	if it.Category != "" {
 		payload["category"] = it.Category
@@ -1691,6 +2010,9 @@ func (t *ToolSet) recordOneFactCtx(ctx context.Context, it factItem, defaultInte
 	}
 	if paths := cleanArtifactPaths(it.ArtifactPaths); len(paths) > 0 {
 		payload["artifact_paths"] = paths
+	}
+	if len(invalIDs) > 0 {
+		payload["invalidates_finding_ids"] = invalIDs
 	}
 	if c := strings.TrimSpace(it.Confidence); c != "" {
 		payload["confidence"] = c
@@ -1722,6 +2044,14 @@ func (t *ToolSet) recordOneFactCtx(ctx context.Context, it factItem, defaultInte
 			t.countWrites(WriteCounts{Failures: 1})
 		}
 		return 0, err
+	}
+	for _, fid := range invalIDs {
+		if err := t.ts.SetNodeStateCtx(ctx, fid, "dismissed"); err != nil {
+			log.Printf("[record_fact] invalidate finding #%d state update failed: %v", fid, err)
+		}
+		if err := t.ts.LinkCtx(ctx, fid, db.RelDerivedFrom, id); err != nil {
+			log.Printf("[record_fact] link invalidated finding #%d -> fact #%d failed: %v", fid, id, err)
+		}
 	}
 	t.countWrites(WriteCounts{Facts: 1})
 	if it.Category == "evidence" && strings.EqualFold(strings.TrimSpace(it.Confidence), "observed") && strings.TrimSpace(it.Evidence) != "" {
@@ -1769,20 +2099,22 @@ func isClientEvidenceInputError(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "intent_id 必须是本任务的意图") ||
-		strings.Contains(msg, "漏洞所属任务与探索记录不匹配")
+		strings.Contains(msg, "漏洞所属任务与探索记录不匹配") ||
+		strings.Contains(msg, "invalidates_finding_ids")
 }
 
 func (t *ToolSet) recordFact() actool.CoreTool {
 	itemProps := map[string]any{
-		"summary":        str("对本次探索结论的【总结性一句话】（是对 detail 的概括）"),
-		"intent_id":      idp("产生本事实的意图 id（你领到的意图；批量时作为各条默认）"),
-		"detail":         str("本事实的相关细节：把这次探索的多个观察事实都写进这里"),
-		"evidence":       str("【一行】关键证据：命令 + 最能证明结论的那一两行输出。务必简洁，不要粘大段输出（细节放 detail）。"),
-		"confidence":     str("observed（输出里直接看到）| inferred（据现象推断）。否定结论务必如实标注。"),
-		"asset_ids":      map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "相关资产 id（可选，0/1/多个）：该事实涉及哪些资产"},
-		"category":       map[string]any{"type": "string", "enum": []string{"negative_result", "scope_limit", "cleanup_status", "evidence"}, "description": "可选关键事实类别：否定结果 / 授权范围限制 / 清理状态 / 关键证据。省略表示 general 普通事实；漏洞 finding 仍用 report_finding 单独记录。"},
-		"evidence_ids":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选：支撑结论的已有证据记录 ID 或工件引用，保留可恢复的准确标识；不要编造。"},
-		"artifact_paths": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选：本事实依赖的跨单兵制品绝对路径，且文件已经放在任务 shared/ 目录（SSH 私钥、路由表、字典）。下游意图的进场预塞会原样带上这些路径。"},
+		"summary":                 str("对本次探索结论的【总结性一句话】（是对 detail 的概括）"),
+		"intent_id":               idp("产生本事实的意图 id（你领到的意图；批量时作为各条默认）"),
+		"detail":                  str("本事实的相关细节：把这次探索的多个观察事实都写进这里"),
+		"evidence":                str("【一行】关键证据：命令 + 最能证明结论的那一两行输出。务必简洁，不要粘大段输出（细节放 detail）。"),
+		"confidence":              str("observed（输出里直接看到）| inferred（据现象推断）。否定结论务必如实标注。"),
+		"asset_ids":               map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "相关资产 id（可选，0/1/多个）：该事实涉及哪些资产"},
+		"category":                map[string]any{"type": "string", "enum": []string{"negative_result", "scope_limit", "cleanup_status", "evidence"}, "description": "可选关键事实类别：否定结果 / 授权范围限制 / 清理状态 / 关键证据。省略表示 general 普通事实；漏洞 finding 仍用 report_finding 单独记录。"},
+		"evidence_ids":            map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选：支撑结论的已有证据记录 ID 或工件引用，保留可恢复的准确标识；不要编造。"},
+		"artifact_paths":          map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选：本事实依赖的跨单兵制品绝对路径，且文件已经放在任务 shared/ 目录（SSH 私钥、路由表、字典）。下游意图的进场预塞会原样带上这些路径。"},
+		"invalidates_finding_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "可选（仅 category=negative_result 时可用）：被本否定事实推翻/证伪的本任务 finding 节点 id 列表；系统会将对应 finding 状态置为 dismissed 并关联否定证据。"},
 	}
 	props := make(map[string]any, len(itemProps)+1)
 	for key, value := range itemProps {

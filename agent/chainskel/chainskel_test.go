@@ -71,6 +71,20 @@ func TestMatch(t *testing.T) {
 	}
 }
 
+func primarySkeletonCategory(out string) string {
+	const prefix = `<chains-skeleton source="chains-skeleton" category="`
+	idx := strings.Index(out, prefix)
+	if idx < 0 {
+		return ""
+	}
+	rest := out[idx+len(prefix):]
+	end := strings.IndexByte(rest, '"')
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
+}
+
 func TestP1RoutingMismatches(t *testing.T) {
 	for _, tc := range []struct {
 		summary  string
@@ -117,8 +131,9 @@ func TestP1RoutingMismatches(t *testing.T) {
 				}
 				return
 			}
-			if !strings.Contains(out, `category="`+tc.category+`"`) || strings.Count(out, "<chains-skeleton ") != 1 {
-				t.Fatalf("wrong primary skeleton, want %s: %s", tc.category, out)
+			n := strings.Count(out, "<chains-skeleton ")
+			if primarySkeletonCategory(out) != tc.category || n < 1 || n > MaxTagsPerIntent {
+				t.Fatalf("wrong primary skeleton, want %s (count 1..%d, got %d): %s", tc.category, MaxTagsPerIntent, n, out)
 			}
 		})
 	}
@@ -163,10 +178,10 @@ func TestForIntentByTags(t *testing.T) {
 	}
 }
 
-func TestForIntentFirstTagOnly(t *testing.T) {
+func TestForIntentUpToTwoTags(t *testing.T) {
 	out := ForIntent(payload(t, map[string]any{"summary": "x", "chain_tags": []string{"web", "ad", "pivot"}}))
-	if !strings.Contains(out, `category="web"`) || strings.Count(out, "<chains-skeleton ") != 1 {
-		t.Fatalf("只应注入首个合法 tag:\n%s", out)
+	if primarySkeletonCategory(out) != "web" || !strings.Contains(out, `category="ad"`) || strings.Count(out, "<chains-skeleton ") != MaxTagsPerIntent {
+		t.Fatalf("应按序注入前 %d 个合法 tag (web, ad):\n%s", MaxTagsPerIntent, out)
 	}
 	if strings.Contains(out, `category="pivot"`) {
 		t.Fatal("第 3 个 tag 超出 MaxTagsPerIntent,不应注入")
@@ -243,7 +258,8 @@ func TestOnDemandCategories(t *testing.T) {
 	} {
 		t.Run(tc.summary, func(t *testing.T) {
 			out := ForIntent(payload(t, map[string]any{"summary": tc.summary}))
-			if !strings.Contains(out, `category="`+tc.category+`"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+			n := strings.Count(out, "<chains-skeleton ")
+			if primarySkeletonCategory(out) != tc.category || n < 1 || n > MaxTagsPerIntent {
 				t.Fatalf("wrong primary skeleton: %s", out)
 			}
 		})
@@ -259,11 +275,11 @@ func TestOnDemandCategories(t *testing.T) {
 		}
 		p := payload(t, map[string]any{"summary": "sql injection", "chain_tags": []string{"bogus", " " + strings.ToUpper(category) + " ", "web"}})
 		out := ForIntent(p)
-		if !strings.Contains(out, `category="`+category+`"`) || strings.Count(out, "<chains-skeleton ") != 1 {
-			t.Fatalf("first valid tag lost: %s", out)
+		if primarySkeletonCategory(out) != category || !strings.Contains(out, `category="web"`) || strings.Count(out, "<chains-skeleton ") != 2 {
+			t.Fatalf("dual valid tags lost: %s", out)
 		}
-		if len([]rune(out)) > 8000 || strings.Contains(out, "已截断") {
-			t.Fatalf("primary skeleton exceeds default budget: %s", category)
+		if len([]rune(out)) > 8000 || strings.Contains(out, "总长超 8K 已截断") {
+			t.Fatalf("dual skeleton exceeds default budget: %s", category)
 		}
 		if guide := RefsGuideForIntent(p); guide != "" {
 			t.Fatalf("distilled category has no bundled L4 refs: %s", guide)
@@ -304,9 +320,9 @@ func TestBatch2Categories(t *testing.T) {
 			}
 		})
 	}
-	// explicit chain_tags take priority over summary keywords, first valid tag only, one block
+	// explicit chain_tags take priority over summary keywords, up to MaxTagsPerIntent blocks in order
 	out := ForIntent(payload(t, map[string]any{"summary": "做 sql 注入测试", "chain_tags": []string{"cloud", "web"}}))
-	if !strings.Contains(out, `category="cloud"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+	if primarySkeletonCategory(out) != "cloud" || !strings.Contains(out, `category="web"`) || strings.Count(out, "<chains-skeleton ") != 2 {
 		t.Fatalf("explicit tag priority failed: %s", out)
 	}
 	// api-security folds into the existing web tag (BOLA/GraphQL keywords route to web)
@@ -361,7 +377,8 @@ func TestAmbiguousLatinKeywordBoundaries(t *testing.T) {
 				}
 				return
 			}
-			if !strings.Contains(out, `category="`+tc.want+`"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+			n := strings.Count(out, "<chains-skeleton ")
+			if primarySkeletonCategory(out) != tc.want || n < 1 || n > MaxTagsPerIntent {
 				t.Fatalf("want primary %s, got %s", tc.want, out)
 			}
 		})
@@ -395,7 +412,8 @@ func TestWeb3Skeleton(t *testing.T) {
 				}
 				return
 			}
-			if !strings.Contains(out, `category="`+tc.category+`"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+			n := strings.Count(out, "<chains-skeleton ")
+			if primarySkeletonCategory(out) != tc.category || n < 1 || n > MaxTagsPerIntent {
 				t.Fatalf("summary %q want primary %s, got: %s", tc.summary, tc.category, out)
 			}
 		})
@@ -409,11 +427,11 @@ func TestWeb3Skeleton(t *testing.T) {
 	for _, tags := range [][]string{{"web3", "web"}, {"bogus", " WEB3 ", "web"}} {
 		p := payload(t, map[string]any{"summary": "做 sql 注入测试", "chain_tags": tags})
 		out := ForIntent(p)
-		if !strings.Contains(out, `category="web3"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+		if primarySkeletonCategory(out) != "web3" || !strings.Contains(out, `category="web"`) || strings.Count(out, "<chains-skeleton ") != 2 {
 			t.Fatalf("explicit tag priority failed: %s", out)
 		}
-		if len([]rune(out)) > 8000 || strings.Contains(out, "已截断") {
-			t.Fatal("web3 skeleton exceeds default budget")
+		if len([]rune(out)) > 8000 || strings.Contains(out, "总长超 8K 已截断") {
+			t.Fatal("web3+web skeleton exceeds default budget")
 		}
 		if guide := RefsGuideForIntent(p); guide != "" {
 			t.Fatalf("distilled category must have no bundled L4 refs: %s", guide)
@@ -480,14 +498,15 @@ func TestBatch3NewTags(t *testing.T) {
 	} {
 		t.Run(tc.summary, func(t *testing.T) {
 			out := ForIntent(payload(t, map[string]any{"summary": tc.summary}))
-			if !strings.Contains(out, `category="`+tc.category+`"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+			n := strings.Count(out, "<chains-skeleton ")
+			if primarySkeletonCategory(out) != tc.category || n < 1 || n > MaxTagsPerIntent {
 				t.Fatalf("summary %q want primary %s, got: %s", tc.summary, tc.category, out)
 			}
 		})
 	}
-	// explicit chain_tags take priority over summary keywords, first valid tag only, one block
+	// explicit chain_tags take priority over summary keywords, up to MaxTagsPerIntent blocks in order
 	out := ForIntent(payload(t, map[string]any{"summary": "做 sql 注入测试", "chain_tags": []string{"ai", "web"}}))
-	if !strings.Contains(out, `category="ai"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+	if primarySkeletonCategory(out) != "ai" || !strings.Contains(out, `category="web"`) || strings.Count(out, "<chains-skeleton ") != 2 {
 		t.Fatalf("explicit new-tag priority failed: %s", out)
 	}
 	// all-invalid tags stay fail-closed (no L3 injection)
@@ -512,7 +531,8 @@ func TestBatch3Folds(t *testing.T) {
 	} {
 		t.Run(tc.summary, func(t *testing.T) {
 			out := ForIntent(payload(t, map[string]any{"summary": tc.summary}))
-			if !strings.Contains(out, `category="`+tc.category+`"`) || strings.Count(out, "<chains-skeleton ") != 1 {
+			n := strings.Count(out, "<chains-skeleton ")
+			if primarySkeletonCategory(out) != tc.category || n < 1 || n > MaxTagsPerIntent {
 				t.Fatalf("fold summary %q want %s, got: %s", tc.summary, tc.category, out)
 			}
 		})
@@ -529,11 +549,11 @@ func TestBatch3SkeletonDiscipline(t *testing.T) {
 		}
 		p := payload(t, map[string]any{"summary": "sql injection", "chain_tags": []string{"bogus", " " + strings.ToUpper(category) + " ", "web"}})
 		out := ForIntent(p)
-		if !strings.Contains(out, `category="`+category+`"`) || strings.Count(out, "<chains-skeleton ") != 1 {
-			t.Fatalf("first valid tag lost: %s -> %s", category, out)
+		if primarySkeletonCategory(out) != category || !strings.Contains(out, `category="web"`) || strings.Count(out, "<chains-skeleton ") != 2 {
+			t.Fatalf("dual valid tags lost: %s -> %s", category, out)
 		}
-		if len([]rune(out)) > 8000 || strings.Contains(out, "已截断") {
-			t.Fatalf("primary skeleton exceeds default budget: %s", category)
+		if len([]rune(out)) > 8000 || strings.Contains(out, "总长超 8K 已截断") {
+			t.Fatalf("dual skeleton exceeds default budget: %s", category)
 		}
 		if guide := RefsGuideForIntent(p); guide != "" {
 			t.Fatalf("distilled category must have no bundled L4 refs: %s -> %s", category, guide)

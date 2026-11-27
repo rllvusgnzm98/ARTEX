@@ -9,7 +9,13 @@ import (
 func ShellHintAvailability(ctx context.Context, dataDir string) []tools.Availability {
 	var specs []tools.CommandSpec
 	for _, seed := range ShellHintSeeds() {
-		specs = append(specs, tools.CommandSpec{Name: seed.Key, Optional: seed.Key == "nxc"})
+		optional := seed.Key == "nxc" ||
+			seed.Key == "evil-winrm" ||
+			seed.Key == "impacket-ntlmrelayx" ||
+			seed.Key == "certipy" ||
+			seed.Key == "bloodhound-python" ||
+			seed.Key == "msfconsole"
+		specs = append(specs, tools.CommandSpec{Name: seed.Key, Optional: optional})
 	}
 	return tools.CheckCommands(ctx, specs, dataDir)
 }
@@ -62,6 +68,11 @@ func ShellHintSeeds() []ShellHintSeed {
 		{Key: "impacket-wmiexec", Desc: "已授权内网按需使用的环境声明，随镜像提供，在授权范围内按需使用。能力边界是在已授权前提下经 WMI 进行 Windows 远程执行；仅当 Bash 说明里已列出且任务需要时使用。不要为同一类事手写协议脚本。"},
 		{Key: "impacket-smbclient", Desc: "已授权内网按需使用的环境声明，随镜像提供，在授权范围内按需使用。能力边界是在已授权前提下访问或列举 SMB 共享；仅当 Bash 说明里已列出且任务需要时使用。不要为同一类事手写协议脚本。"},
 		{Key: "impacket-GetUserSPNs", Desc: "已授权内网按需使用的环境声明，随镜像提供，在授权范围内按需使用。能力边界是在已授权前提下查询 Kerberos 服务主体（SPN）信息；仅当 Bash 说明里已列出且任务需要时使用。不要为同一类事手写协议脚本。"},
+		{Key: "evil-winrm", Desc: "已授权内网按需使用的环境声明。能力边界是在已授权前提下经 WinRM 对 Windows 主机执行远程管理命令；仅当 Bash 说明里已列出且任务需要时使用，不要手写 WinRM 协议脚本。"},
+		{Key: "impacket-ntlmrelayx", Desc: "已授权内网按需使用的环境声明。能力边界是在已授权内网环境下验证 NTLM 中继风险与签名配置缺失影响；仅当 Bash 说明里已列出且任务需要时使用，不要手写协议中继脚本。"},
+		{Key: "certipy", Desc: "已授权内网按需使用的环境声明。能力边界是在已授权 AD 环境下枚举与核验 AD CS 证书模板及配置风险；仅当 Bash 说明里已列出且任务需要时使用，不要手写证书协议查询脚本。"},
+		{Key: "bloodhound-python", Desc: "已授权内网按需使用的环境声明。能力边界是在已授权 AD 环境下采集域内对象、ACL 与信任关系图谱；仅当 Bash 说明里已列出且任务需要时使用，不要手写大批量 LDAP 遍历脚本。"},
+		{Key: "msfconsole", Desc: "已授权环境下按需使用的环境声明。能力边界是以非交互方式（-q -x）调用成熟模块、监听器或路由与端口转发能力；仅当 Bash 说明里已列出且任务需要时使用。"},
 	}
 }
 

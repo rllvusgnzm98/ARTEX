@@ -10,10 +10,13 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -125,7 +128,38 @@ func (s *CredentialStore) decrypt(stored string) (string, error) {
 	return string(plain), nil
 }
 
+func credentialSecretHash(secret string) string {
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:])
+}
+
+func credentialDedupLockKey(taskID int64, userNorm, credType, secretHash string) int64 {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("artex:cred-dedup:%d:%s:%s:%s", taskID, userNorm, credType, secretHash)))
+	return int64(binary.BigEndian.Uint64(sum[:8]))
+}
+
+func mergeCredentialSource(existing, incoming string) string {
+	existing = strings.TrimSpace(existing)
+	incoming = strings.TrimSpace(incoming)
+	if incoming == "" {
+		return existing
+	}
+	if existing == "" {
+		return incoming
+	}
+	if strings.Contains(existing, incoming) {
+		return existing
+	}
+	merged := existing + "; " + incoming
+	if r := []rune(merged); len(r) > 2000 {
+		return string(r[:2000])
+	}
+	return merged
+}
+
 // Create 插入一条凭据并返回主键。Secret 加密存储。
+// 按 (task_id, lower(username), cred_type, secret_hash) 去重：若同任务已存在相同
+// 凭据则合并更新元数据（host_asset_id / domain / source / verified）并返回既有主键。
 func (s *CredentialStore) Create(ctx context.Context, rec *CredentialRecord) (int64, error) {
 	if rec.TaskID <= 0 {
 		return 0, fmt.Errorf("task_id 必填")
@@ -140,14 +174,96 @@ func (s *CredentialStore) Create(ctx context.Context, rec *CredentialRecord) (in
 	if err != nil {
 		return 0, err
 	}
+	userNorm := strings.ToLower(strings.TrimSpace(rec.Username))
+	wantHash := credentialSecretHash(rec.Secret)
+
+	tx, err := s.d.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`,
+		credentialDedupLockKey(rec.TaskID, userNorm, rec.CredType, wantHash)); err != nil {
+		return 0, err
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+SELECT `+credentialCols+` FROM credentials
+WHERE task_id = $1 AND lower(btrim(username)) = $2 AND cred_type = $3
+ORDER BY id`, rec.TaskID, userNorm, rec.CredType)
+	if err != nil {
+		return 0, err
+	}
+	var matched *CredentialRecord
+	for rows.Next() {
+		cand, candEnc, serr := s.scanMeta(rows)
+		if serr != nil {
+			rows.Close()
+			return 0, serr
+		}
+		plain, derr := s.decrypt(candEnc)
+		if derr != nil {
+			continue // undecryptable row (e.g. rotated key) cannot match plaintext
+		}
+		if credentialSecretHash(plain) == wantHash {
+			c := cand
+			matched = &c
+			break
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	if matched != nil {
+		hostAssetID := matched.HostAssetID
+		if hostAssetID == 0 && rec.HostAssetID > 0 {
+			hostAssetID = rec.HostAssetID
+		}
+		domain := matched.Domain
+		if strings.TrimSpace(domain) == "" && strings.TrimSpace(rec.Domain) != "" {
+			domain = strings.TrimSpace(rec.Domain)
+		}
+		source := mergeCredentialSource(matched.Source, rec.Source)
+		verified := matched.Verified || rec.Verified
+		if _, err := tx.ExecContext(ctx, `
+UPDATE credentials
+   SET host_asset_id = $2,
+       domain        = $3,
+       source        = $4,
+       verified      = $5
+ WHERE id = $1`, matched.ID, nilIfZero(hostAssetID), domain, source, verified); err != nil {
+			return 0, err
+		}
+		if err := tx.Commit(); err != nil {
+			return 0, err
+		}
+		return matched.ID, nil
+	}
+
 	var id int64
-	err = s.d.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, `
 INSERT INTO credentials(task_id, host_asset_id, username, cred_type, secret, domain, source, verified)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING id`,
 		rec.TaskID, nilIfZero(rec.HostAssetID), rec.Username, rec.CredType, enc,
 		rec.Domain, rec.Source, rec.Verified).Scan(&id)
-	return id, err
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// AddCredential 是 Create 的语义别名（按 task_id/lower(username)/cred_type/secret_hash 去重 upsert）。
+func (s *CredentialStore) AddCredential(ctx context.Context, rec *CredentialRecord) (int64, error) {
+	return s.Create(ctx, rec)
 }
 
 const credentialCols = `id, task_id, COALESCE(host_asset_id,0), username, cred_type, secret,

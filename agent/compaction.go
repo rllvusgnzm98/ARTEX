@@ -32,12 +32,23 @@ import (
 	"github.com/Autumn-27/norma/transcript"
 )
 
+const (
+	// maxDigestGeneration caps how many times a cold block may be refolded into a
+	// newer digest generation. Once an active digest reaches this generation, major
+	// compaction preserves it instead of repeatedly refolding it on minor changes.
+	maxDigestGeneration = 3
+	// smallDigestFragmentCap is the max member count for a single active digest to
+	// be considered a small fragment eligible for adjacent-node absorption in major.
+	smallDigestFragmentCap = 4
+)
+
 // Compactor performs background cold-node compaction for many explorations.
 type Compactor struct {
 	prov     llm.Provider
 	model    string
 	params   coldParams
 	n, m     int           // minor / major thresholds (§7 N=20, M=8)
+	maxGen   int           // max digest generation before freezing against churn
 	cooldown time.Duration // min gap between compactions per task (§7 60s)
 	maxDur   time.Duration // hard cap on one background compaction
 
@@ -55,6 +66,7 @@ func NewCompactor(prov llm.Provider, model string) *Compactor {
 		params:   defaultColdParams(),
 		n:        20,
 		m:        8,
+		maxGen:   maxDigestGeneration,
 		cooldown: 60 * time.Second,
 		maxDur:   5 * time.Minute,
 		running:  map[int64]bool{},
@@ -70,13 +82,13 @@ func (c *Compactor) OnPlannerRound(ctx context.Context, ts *db.ExplorationStore)
 	if c == nil || c.prov == nil || ts == nil {
 		return
 	}
-	round, uncompressed, activeDigests, err := c.maintain(ts)
+	st, err := c.maintainState(ts)
 	if err != nil {
 		log.Printf("[compaction] maintain exp=%d: %v", ts.ID(), err)
 		return
 	}
-	needMinor := uncompressed >= c.n
-	needMajor := activeDigests >= c.m
+	needMinor := st.uncompressed >= c.n
+	needMajor := st.needMajor
 	if !needMinor && !needMajor {
 		return
 	}
@@ -99,7 +111,14 @@ func (c *Compactor) OnPlannerRound(ctx context.Context, ts *db.ExplorationStore)
 			c.minor(bg, ts)
 		}
 	}()
-	_ = round
+	_ = st.round
+}
+
+type maintainResult struct {
+	round         int64
+	uncompressed  int
+	activeDigests int
+	needMajor     bool
 }
 
 // maintain bumps round_no, recomputes hot/cold over the whole graph, and applies
@@ -107,7 +126,12 @@ func (c *Compactor) OnPlannerRound(ctx context.Context, ts *db.ExplorationStore)
 // counts that drive the trigger: how many eligible-cold nodes are not yet covered
 // (minor) and how many active digests exist (major).
 func (c *Compactor) maintain(ts *db.ExplorationStore) (round int64, uncompressed, activeDigests int, err error) {
-	round, err = ts.BumpRound()
+	st, err := c.maintainState(ts)
+	return st.round, st.uncompressed, st.activeDigests, err
+}
+
+func (c *Compactor) maintainState(ts *db.ExplorationStore) (res maintainResult, err error) {
+	res.round, err = ts.BumpRound()
 	if err != nil {
 		return
 	}
@@ -121,27 +145,100 @@ func (c *Compactor) maintain(ts *db.ExplorationStore) (round int64, uncompressed
 	}
 	hot := g.hotSet()
 	structCold := g.structuralCold(hot)
-	ops := computeStampOps(structCold, stamps, round)
+	ops := computeStampOps(structCold, stamps, res.round)
 	if err = ts.ApplyStampOps(toDBStampOps(ops)); err != nil {
 		return
 	}
 	applyStampsInPlace(stamps, ops)
-	elig := g.eligibleCold(structCold, stamps, round, c.params)
+	elig := g.eligibleCold(structCold, stamps, res.round, c.params)
 	covered, err := ts.CoveredMembers()
 	if err != nil {
 		return
 	}
 	for id := range elig {
 		if _, ok := covered[id]; !ok {
-			uncompressed++
+			res.uncompressed++
 		}
 	}
 	ad, err := ts.ActiveDigests()
 	if err != nil {
 		return
 	}
-	activeDigests = len(ad)
+	res.activeDigests = len(ad)
+	res.needMajor = len(ad) >= c.m && hasMergeableMajorWork(g, elig, ad, covered, c.params, c.maxGen)
 	return
+}
+
+// hasMergeableMajorWork reports whether running a major compaction would perform
+// genuine consolidation rather than churning already-independent cold blocks.
+// It returns true only when at least one eligible block either:
+//   - merges >=2 distinct active digests (fragments that became connected or share
+//     an anchor) without exceeding maxGen; or
+//   - absorbs >=K newly uncovered cold nodes into a small active fragment
+//     (<=smallDigestFragmentCap members) without exceeding maxGen.
+func hasMergeableMajorWork(g *coldGraph, elig map[int64]bool, active []*db.Node, covered map[int64]int64, params coldParams, maxGen int) bool {
+	if g == nil || len(active) == 0 || len(elig) == 0 {
+		return false
+	}
+	genByDigest := make(map[int64]int, len(active))
+	sizeByDigest := make(map[int64]int, len(active))
+	for _, d := range active {
+		if d == nil {
+			continue
+		}
+		_, gen := digestSigGen(d)
+		if gen <= 0 {
+			gen = 1
+		}
+		genByDigest[d.ID] = gen
+		sizeByDigest[d.ID] = len(digestMemberIDs(d))
+	}
+	// Supplement size counts from actual covers edges when payload member_ids is empty.
+	covCount := map[int64]int{}
+	for _, did := range covered {
+		covCount[did]++
+	}
+	for did, n := range covCount {
+		if sizeByDigest[did] == 0 {
+			sizeByDigest[did] = n
+		}
+	}
+
+	blocks := g.group(elig, params)
+	for _, b := range blocks {
+		touching := map[int64]bool{}
+		uncovered := 0
+		maxOverlapGen := 0
+		for _, m := range b.Members {
+			if did, ok := covered[m]; ok {
+				if gval, exists := genByDigest[did]; exists {
+					touching[did] = true
+					if gval > maxOverlapGen {
+						maxOverlapGen = gval
+					}
+					continue
+				}
+			}
+			uncovered++
+		}
+		if len(touching) == 0 {
+			continue
+		}
+		if maxGen > 0 && maxOverlapGen >= maxGen {
+			continue // generation cap reached: stop refolding this branch
+		}
+		if len(touching) >= 2 {
+			return true // >=2 active digest fragments can genuinely merge into one block
+		}
+		// Exactly 1 active digest touched: only trigger major if it is a small fragment
+		// AND at least K newly cooled adjacent nodes can be consolidated into it.
+		for did := range touching {
+			if sizeByDigest[did] <= smallDigestFragmentCap && uncovered >= params.K {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // minor folds the not-yet-covered eligible-cold set into new digest segments
@@ -191,9 +288,12 @@ func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
 	if err := syncGraphIncompleteSignal(ts, compressionFailed, compressedOK); err != nil {
 		log.Printf("[compaction] graph incomplete signal exp=%d: %v", ts.ID(), err)
 	}
-	// A minor may have pushed the segment count over M → merge in the same run.
+	// A minor may have pushed the segment count over M → merge in the same run
+	// only when there is actual mergeable work (avoiding churn on independent blocks).
 	if ad, e := ts.ActiveDigests(); e == nil && len(ad) >= c.m {
-		c.majorWithFailure(ctx, ts, compressionFailed)
+		if freshCovered, ce := ts.CoveredMembers(); ce == nil && hasMergeableMajorWork(g, elig, ad, freshCovered, c.params, c.maxGen) {
+			c.majorWithFailure(ctx, ts, compressionFailed)
+		}
 	}
 }
 
@@ -204,6 +304,29 @@ func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
 // direction merge and where "later became connected" blocks unify (§5.2).
 func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
 	c.majorWithFailure(ctx, ts, false)
+}
+
+func overlappingDigests(b block, active []*db.Node) []*db.Node {
+	if len(active) == 0 || len(b.Members) == 0 {
+		return nil
+	}
+	memberSet := make(map[int64]bool, len(b.Members))
+	for _, m := range b.Members {
+		memberSet[m] = true
+	}
+	var out []*db.Node
+	for _, d := range active {
+		if d == nil {
+			continue
+		}
+		for _, m := range digestMemberIDs(d) {
+			if memberSet[m] {
+				out = append(out, d)
+				break
+			}
+		}
+	}
+	return out
 }
 
 func (c *Compactor) majorWithFailure(ctx context.Context, ts *db.ExplorationStore, compressionFailed bool) {
@@ -237,19 +360,34 @@ func (c *Compactor) majorWithFailure(ctx context.Context, ts *db.ExplorationStor
 		bySig[sig] = d
 	}
 	desired := map[string]bool{}
+	preservedIDs := map[int64]bool{}
 	var toCreate []block
 	for _, b := range blocks {
 		sig := blockSignature(b, cvers)
-		desired[sig] = true
 		if _, ok := bySig[sig]; ok {
+			desired[sig] = true
 			continue // unchanged → reuse the existing digest, skip LLM (§5.3)
 		}
+		// Generation cap: once a block's overlapping active digests have reached
+		// c.maxGen, preserve them rather than refolding endlessly (prevents gen8 churn).
+		if c.maxGen > 0 {
+			if overlaps := overlappingDigests(b, active); len(overlaps) > 0 && c.generationFor(b, overlaps) > c.maxGen {
+				for _, d := range overlaps {
+					preservedIDs[d.ID] = true
+				}
+				continue
+			}
+		}
+		desired[sig] = true
 		toCreate = append(toCreate, b)
 	}
 	// Supersede stale digests FIRST (atomic drop of their covers edges) so a member
 	// is never covered by both an old and a new digest (§5.1 one-member-one-digest).
 	var stale []int64
 	for _, d := range active {
+		if preservedIDs[d.ID] {
+			continue
+		}
 		sig, _ := digestSigGen(d)
 		if !desired[sig] {
 			stale = append(stale, d.ID)

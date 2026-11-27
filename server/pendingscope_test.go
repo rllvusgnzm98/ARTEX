@@ -116,6 +116,7 @@ func TestScopeRulesFromRowsForModeStrictAndExclusions(t *testing.T) {
 	rows := []db.TaskScope{
 		{Kind: "root_domain", Domain: "acme.test", Source: "manual"},
 		{Kind: "subdomain", Domain: "api.partner.test", Source: "manual"},
+		{Kind: "ip", Net: "192.168.111.20/32", Source: "seed"},
 		{Kind: "subdomain", Domain: "auto-leak.other.test", Source: "auto"},
 		{Kind: "ip", Net: "10.0.0.5/32", Source: "agent"},
 		{Kind: "exclude_subdomain", Domain: "blog.acme.test", Source: "manual"},
@@ -124,21 +125,33 @@ func TestScopeRulesFromRowsForModeStrictAndExclusions(t *testing.T) {
 	}
 
 	warnRules := scopeRulesFromRowsForMode(rows, "warn")
-	if len(warnRules) != 7 {
-		t.Fatalf("warn mode should keep all 7 rules, got %d: %+v", len(warnRules), warnRules)
+	if len(warnRules) != 8 {
+		t.Fatalf("warn mode should keep all 8 rules, got %d: %+v", len(warnRules), warnRules)
 	}
 	strictRules := scopeRulesFromRowsForMode(rows, "strict")
-	// Strict drops the 2 auto/agent inclusions, keeps 2 manual inclusions + 3 exclusions = 5.
-	if len(strictRules) != 5 {
-		t.Fatalf("strict mode should keep 5 rules (2 manual + 3 exclusions), got %d: %+v", len(strictRules), strictRules)
+	// Strict drops the 2 auto/agent inclusions, keeps 2 manual + 1 seed inclusions + 3 exclusions = 6.
+	if len(strictRules) != 6 {
+		t.Fatalf("strict mode should keep 6 rules (2 manual + 1 seed + 3 exclusions), got %d: %+v", len(strictRules), strictRules)
 	}
-	var sawExact bool
+	var sawExact, sawSeed bool
 	for _, r := range strictRules {
 		if r.Value == "api.partner.test" && r.Kind == "exact_domain" && !r.Exclude {
 			sawExact = true
 		}
+		if r.Value == "192.168.111.20/32" && r.Kind == "cidr" && !r.Exclude {
+			sawSeed = true
+		}
 	}
 	if !sawExact {
 		t.Fatalf("subdomain row should normalize to exact_domain: %+v", strictRules)
+	}
+	if !sawSeed {
+		t.Fatalf("seed scope row must be kept in strict mode: %+v", strictRules)
+	}
+
+	// Standard task with ONLY round-0 seed target must not collapse to empty rules in strict mode.
+	seedOnly := []db.TaskScope{{Kind: "ip", Net: "192.168.111.20/32", Source: "seed"}}
+	if got := scopeRulesFromRowsForMode(seedOnly, "strict"); len(got) != 1 {
+		t.Fatalf("seed-only task collapsed in strict mode: got %+v", got)
 	}
 }

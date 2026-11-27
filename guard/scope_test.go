@@ -138,16 +138,16 @@ func TestScopeMatcherExclusionsAndExactDomain(t *testing.T) {
 	}{
 		{"acme.com", ScopeIn},
 		{"api.acme.com", ScopeIn},
-		{"blog.acme.com", ScopeOut},           // excluded exact host
-		{"v2.blog.acme.com", ScopeIn},         // exact exclude only excludes blog.acme.com
-		{"status.acme.com", ScopeOut},         // excluded subtree root
-		{"api.status.acme.com", ScopeOut},     // excluded subtree child
-		{"partner.other.com", ScopeIn},        // exact_domain match
-		{"dev.partner.other.com", ScopeOut},   // exact_domain must NOT match subdomains
-		{"other.com", ScopeOut},               // exact_domain must NOT match parent
-		{"10.10.1.5", ScopeIn},                // included CIDR
-		{"10.10.99.5", ScopeOut},              // excluded CIDR overrides included CIDR
-		{"127.0.0.1", ScopeIn},                // AllowLocal still passes unless excluded
+		{"blog.acme.com", ScopeOut},         // excluded exact host
+		{"v2.blog.acme.com", ScopeIn},       // exact exclude only excludes blog.acme.com
+		{"status.acme.com", ScopeOut},       // excluded subtree root
+		{"api.status.acme.com", ScopeOut},   // excluded subtree child
+		{"partner.other.com", ScopeIn},      // exact_domain match
+		{"dev.partner.other.com", ScopeOut}, // exact_domain must NOT match subdomains
+		{"other.com", ScopeOut},             // exact_domain must NOT match parent
+		{"10.10.1.5", ScopeIn},              // included CIDR
+		{"10.10.99.5", ScopeOut},            // excluded CIDR overrides included CIDR
+		{"127.0.0.1", ScopeIn},              // AllowLocal still passes unless excluded
 	}
 	for _, c := range cases {
 		if got := m.Check(c.host); got != c.want {
@@ -172,5 +172,44 @@ func TestScopeMatcherExclusionsAndExactDomain(t *testing.T) {
 	}
 	if got := exclOnly.Check("allowed.target.com"); got != ScopeUnknown {
 		t.Errorf("non-excluded with no inclusion rules = %v, want ScopeUnknown", got)
+	}
+}
+
+func TestScopeMatcherExemptHosts(t *testing.T) {
+	m := NewScopeMatcher(scopeRules("ip", "192.168.111.20"))
+	m.AddExemptHosts([]string{"10.8.0.5", "192.168.111.25:4444", "callback.operator.local"})
+
+	for _, h := range []string{"10.8.0.5", "10.8.0.5:8000", "192.168.111.25", "callback.operator.local"} {
+		if got := m.Check(h); got != ScopeIn {
+			t.Errorf("exempt host %q = %v, want ScopeIn", h, got)
+		}
+	}
+	for _, h := range []string{"10.8.0.6", "sub.callback.operator.local", "192.168.111.26"} {
+		if got := m.Check(h); got != ScopeOut {
+			t.Errorf("non-exempt host %q = %v, want ScopeOut", h, got)
+		}
+	}
+
+	// Explicit exclusion overrides local/NIC exemption.
+	withExcl := NewScopeMatcher([]ScopeRule{
+		{Kind: "ip", Value: "192.168.111.20"},
+		{Kind: "exclude_ip", Value: "10.8.0.5"},
+	})
+	withExcl.AddExemptHosts([]string{"10.8.0.5"})
+	if got := withExcl.Check("10.8.0.5"); got != ScopeOut {
+		t.Errorf("explicit exclusion must override exempt host: got %v, want ScopeOut", got)
+	}
+
+	// Exempt hosts must not turn an empty scope into hasRules=true.
+	empty := NewScopeMatcher(nil)
+	empty.AddExemptHosts([]string{"10.8.0.5"})
+	if got := empty.Check("8.8.8.8"); got != ScopeUnknown {
+		t.Errorf("empty scope with exempt hosts should remain ScopeUnknown, got %v", got)
+	}
+
+	// AllowLocal=false disables exempt hosts as well.
+	m.AllowLocal = false
+	if got := m.Check("10.8.0.5"); got != ScopeOut {
+		t.Errorf("AllowLocal=false should disable exempt host, got %v", got)
 	}
 }

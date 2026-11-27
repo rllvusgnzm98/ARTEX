@@ -187,3 +187,98 @@ func TestCompactionDecisionTryStartAndFinish(t *testing.T) {
 	}
 	c.finish(first)
 }
+
+func TestHasMergeableMajorWorkStopsChurnOnIndependentBranches(t *testing.T) {
+	// 10 independent cold branches (each intent->fact covered by its own active digest):
+	// activeDigests=10 >= c.m(8), yet NO branches can merge → must return false (no infinite churn).
+	var nodes []cgNode
+	var edges []cgEdge
+	elig := map[int64]bool{}
+	covered := map[int64]int64{}
+	var active []*db.Node
+	for i := int64(0); i < 10; i++ {
+		iid := 100 + i*2
+		fid := 101 + i*2
+		did := 500 + i
+		nodes = append(nodes, intent(iid, "done"), fact(fid))
+		edges = append(edges, yields(iid, fid))
+		elig[iid] = true
+		elig[fid] = true
+		covered[iid] = did
+		covered[fid] = did
+		active = append(active, &db.Node{
+			ID:      did,
+			Kind:    db.KindDigest,
+			State:   db.StateDigestActive,
+			Payload: []byte(`{"signature":"sig","generation":1,"member_ids":{"intents":[` + string(rune('0'+i)) + `]}}`),
+		})
+	}
+	// Populate real member_ids via digestPayload helper.
+	for i := int64(0); i < 10; i++ {
+		iid := 100 + i*2
+		fid := 101 + i*2
+		active[i].Payload = []byte(
+			`{"signature":"sig","generation":1,"member_ids":{"facts":[` +
+				strconvI64(fid) + `],"intents":[` + strconvI64(iid) + `]}}`,
+		)
+	}
+	g := newColdGraph(nodes, edges)
+	if hasMergeableMajorWork(g, elig, active, covered, defaultColdParams(), maxDigestGeneration) {
+		t.Fatal("10 independent cold branches must not trigger major compaction churn")
+	}
+
+	// Connecting branch 0 and branch 1 via a cold edge makes 2 active digests mergeable → true.
+	edgesConnected := append(append([]cgEdge(nil), edges...), derived(101, 102))
+	gMerged := newColdGraph(nodes, edgesConnected)
+	if !hasMergeableMajorWork(gMerged, elig, active, covered, defaultColdParams(), maxDigestGeneration) {
+		t.Fatal("two newly connected active digests must trigger major merge")
+	}
+
+	// Once an overlapping digest already reached maxDigestGeneration (3), stop refolding → false.
+	active[0].Payload = []byte(`{"signature":"sig","generation":3,"member_ids":{"facts":[101],"intents":[100]}}`)
+	if hasMergeableMajorWork(gMerged, elig, active, covered, defaultColdParams(), maxDigestGeneration) {
+		t.Fatal("blocks at generation cap must not trigger further major refolding")
+	}
+}
+
+func TestHasMergeableMajorWorkSmallFragmentAbsorption(t *testing.T) {
+	// Small fragment (2 members <= 4) gains 1 trickle node (< K=2) → false;
+	// gains 2 newly cooled nodes (>= K=2) → true.
+	nodes := []cgNode{intent(10, "done"), fact(11), fact(12), fact(13)}
+	edges := []cgEdge{yields(10, 11), yields(10, 12), yields(10, 13)}
+	g := newColdGraph(nodes, edges)
+	active := []*db.Node{{
+		ID:      900,
+		Kind:    db.KindDigest,
+		State:   db.StateDigestActive,
+		Payload: []byte(`{"signature":"s","generation":1,"member_ids":{"intents":[10],"facts":[11]}}`),
+	}}
+	covered := map[int64]int64{10: 900, 11: 900}
+
+	if hasMergeableMajorWork(g, map[int64]bool{10: true, 11: true, 12: true}, active, covered, defaultColdParams(), maxDigestGeneration) {
+		t.Fatal("single trickle uncovered node must not trigger major refold")
+	}
+	if !hasMergeableMajorWork(g, map[int64]bool{10: true, 11: true, 12: true, 13: true}, active, covered, defaultColdParams(), maxDigestGeneration) {
+		t.Fatal("small fragment with >=K newly cooled adjacent nodes should allow major consolidation")
+	}
+
+	// Large digest (> smallDigestFragmentCap=4 members) must NOT refold on 2 adjacent nodes.
+	active[0].Payload = []byte(`{"signature":"s","generation":1,"member_ids":{"intents":[10],"facts":[11,20,21,22]}}`)
+	if hasMergeableMajorWork(g, map[int64]bool{10: true, 11: true, 12: true, 13: true}, active, covered, defaultColdParams(), maxDigestGeneration) {
+		t.Fatal("non-small digest should not trigger major without merging another active digest")
+	}
+}
+
+func strconvI64(v int64) string {
+	if v == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	i := len(buf)
+	for v > 0 {
+		i--
+		buf[i] = byte('0' + v%10)
+		v /= 10
+	}
+	return string(buf[i:])
+}

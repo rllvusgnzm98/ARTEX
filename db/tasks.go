@@ -490,34 +490,84 @@ func (d *DB) SetQueued(id int64, queued bool) error {
 	return d.Dequeue(id, true)
 }
 
-// SetStatus updates a task's lifecycle status. Entering a terminal state
+func explorationStatusForTaskStatus(status string) (string, bool) {
+	switch status {
+	case "done":
+		return "achieved", true
+	case "failed", "timeout":
+		return "failed", true
+	case "running", "created":
+		return "open", true
+	default:
+		return "", false
+	}
+}
+
+// SetStatus updates a task's lifecycle status and atomically synchronizes the
+// paired explorations.status in the same transaction. Entering a terminal state
 // (done/failed/timeout) stamps completed_at once (COALESCE keeps the first stamp
 // stable); moving back to a non-terminal state clears it, so a re-run has no stale
 // finish time.
 func (d *DB) SetStatus(id int64, status string) error {
-	_, err := d.Exec(`
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var expID int64
+	err = tx.QueryRow(`
 UPDATE tasks
    SET status = $1,
        completed_at = CASE WHEN $1 IN ('done','failed','timeout') THEN COALESCE(completed_at, now()) ELSE NULL END
- WHERE id = $2`, status, id)
-	return err
+ WHERE id = $2
+ RETURNING exploration_id`, status, id).Scan(&expID)
+	if err == sql.ErrNoRows {
+		return tx.Commit()
+	}
+	if err != nil {
+		return err
+	}
+	if expStatus, ok := explorationStatusForTaskStatus(status); ok && expID > 0 {
+		if _, err := tx.Exec(`UPDATE explorations SET status = $1 WHERE id = $2`, expStatus, expID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // SetTerminalStatusGuarded sets a terminal status only when the task is NOT already
-// terminal, so a completed↔timeout race resolves to the first writer (won=true).
+// terminal, so a completed↔timeout race resolves to the first writer (won=true),
+// and atomically updates explorations.status in the same transaction.
 // Returns won=false (no error) when another terminal status already stuck — the
 // caller then leaves it alone. Non-terminal transitions / re-run still use SetStatus.
 func (d *DB) SetTerminalStatusGuarded(id int64, status string) (won bool, err error) {
-	res, err := d.Exec(`
-UPDATE tasks
-   SET status = $1,
-       completed_at = COALESCE(completed_at, now())
- WHERE id = $2 AND status NOT IN ('done','failed','timeout')`, status, id)
+	tx, err := d.Begin()
 	if err != nil {
 		return false, err
 	}
-	n, _ := res.RowsAffected()
-	return n > 0, nil
+	defer tx.Rollback()
+	var expID int64
+	err = tx.QueryRow(`
+UPDATE tasks
+   SET status = $1,
+       completed_at = COALESCE(completed_at, now())
+ WHERE id = $2 AND status NOT IN ('done','failed','timeout')
+ RETURNING exploration_id`, status, id).Scan(&expID)
+	if err == sql.ErrNoRows {
+		return false, tx.Commit()
+	}
+	if err != nil {
+		return false, err
+	}
+	if expStatus, ok := explorationStatusForTaskStatus(status); ok && expID > 0 {
+		if _, err := tx.Exec(`UPDATE explorations SET status = $1 WHERE id = $2`, expStatus, expID); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // StampFirstRun records a task's first-real-run moment and computes its absolute

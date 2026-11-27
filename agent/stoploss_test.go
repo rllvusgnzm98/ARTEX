@@ -485,8 +485,8 @@ func TestStopLossDefaultPolicyAndEnvOverrides(t *testing.T) {
 	t.Setenv("ARTEX_STOPLOSS_NOVEL_RELIEF", "")
 	t.Setenv("ARTEX_STOPLOSS_WRITE_REMINDER", "")
 	def := DefaultStopLossPolicy()
-	if def.IdleProbeLimit != 14 || def.RepeatCommandLimit != 4 || def.MaxNovelRelief != 16 || def.WriteBackReminder {
-		t.Fatalf("default policy = %+v, want 14/4/16/WriteBackReminder=false", def)
+	if def.IdleProbeLimit != 24 || def.RepeatCommandLimit != 3 || def.MaxNovelRelief != 16 || def.WriteBackReminder {
+		t.Fatalf("default policy = %+v, want 24/3/16/WriteBackReminder=false", def)
 	}
 	t.Setenv("ARTEX_STOPLOSS_IDLE_PROBES", "18")
 	t.Setenv("ARTEX_STOPLOSS_REPEAT_LIMIT", "5")

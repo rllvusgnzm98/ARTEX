@@ -6,14 +6,14 @@ import "testing"
 // ip/cidr scope path so a target like "10.0.188.136:3000" no longer 404s.
 func TestStripHostPort(t *testing.T) {
 	cases := []struct{ in, want string }{
-		{"10.0.188.136:3000", "10.0.188.136"},          // the reported IP case
-		{"10.0.188.136", "10.0.188.136"},               // bare IPv4 unchanged
-		{"[2001:db8::1]:8080", "2001:db8::1"},          // bracketed IPv6 + port
-		{"2001:db8::1", "2001:db8::1"},                 // bare IPv6 unchanged (has colons)
-		{" 1.2.3.4:80 ", "1.2.3.4"},                    // trims surrounding space
-		{"example.com:443", "example.com"},             // domain + port → bare host
-		{"api.example.com:8080", "api.example.com"},    // subdomain + port
-		{"example.com", "example.com"},                 // bare domain unchanged
+		{"10.0.188.136:3000", "10.0.188.136"},       // the reported IP case
+		{"10.0.188.136", "10.0.188.136"},            // bare IPv4 unchanged
+		{"[2001:db8::1]:8080", "2001:db8::1"},       // bracketed IPv6 + port
+		{"2001:db8::1", "2001:db8::1"},              // bare IPv6 unchanged (has colons)
+		{" 1.2.3.4:80 ", "1.2.3.4"},                 // trims surrounding space
+		{"example.com:443", "example.com"},          // domain + port → bare host
+		{"api.example.com:8080", "api.example.com"}, // subdomain + port
+		{"example.com", "example.com"},              // bare domain unchanged
 	}
 	for _, c := range cases {
 		if got := stripHostPort(c.in); got != c.want {
@@ -102,5 +102,113 @@ func TestCovTargetCTEExcludesExcludedScopes(t *testing.T) {
 	}
 	if graphLabels["blog.cov-ex.test"] || graphLabels["cdn.sub.cov-ex.test"] {
 		t.Errorf("excluded assets leaked into BuildCoverageGraph InScope nodes: %+v", graph.Nodes)
+	}
+}
+
+func TestEvaluateAutoScopeContainment(t *testing.T) {
+	// 1. Zero existing scope rules → backwards-compatible autoScopeAllow.
+	dec, _, _ := evaluateAutoScope(nil, autoScopeCandidate(1, "ip", "", "", "192.168.52.30"))
+	if dec != autoScopeAllow {
+		t.Fatalf("empty existing scope should allow auto-scope, got %v", dec)
+	}
+
+	// 2. Only untrusted auto/agent rules → backwards-compatible autoScopeAllow.
+	untrustedOnly := []TaskScope{{Kind: "ip", Net: "10.0.0.1/32", Source: "auto"}}
+	dec, _, _ = evaluateAutoScope(untrustedOnly, autoScopeCandidate(1, "ip", "", "", "10.0.0.2"))
+	if dec != autoScopeAllow {
+		t.Fatalf("untrusted-only scope should allow auto-scope, got %v", dec)
+	}
+
+	// 3. Trusted manual/seed scope present: in-scope allowed, out-of-scope routed to pending_scope.
+	trusted := []TaskScope{
+		{Kind: "root_domain", Domain: "acme.test", Source: "manual"},
+		{Kind: "subdomain", Domain: "only.partner.test", Source: "seed"},
+		{Kind: "ip", Net: "192.168.111.20/32", Source: "seed"},
+		{Kind: "exclude_subdomain", Domain: "blog.acme.test", Source: "manual"},
+		{Kind: "exclude_cidr", Net: "10.99.0.0/16", Source: "manual"},
+	}
+
+	cases := []struct {
+		name      string
+		cand      TaskScope
+		wantDec   autoScopeDecision
+		wantKind  string
+		wantValue string
+	}{
+		{"in-scope subdomain under root", autoScopeCandidate(1, "subdomain", "api.acme.test", "", ""), autoScopeAllow, "", ""},
+		{"in-scope exact subdomain", autoScopeCandidate(1, "subdomain", "only.partner.test", "", ""), autoScopeAllow, "", ""},
+		{"in-scope ip", autoScopeCandidate(1, "ip", "", "", "192.168.111.20"), autoScopeAllow, "", ""},
+		{"in-scope IP-literal HTTP service", autoScopeCandidate(1, "service", "", "http://192.168.111.20:8080/login", ""), autoScopeAllow, "", ""},
+		{"out-of-scope subdomain routed to pending", autoScopeCandidate(1, "subdomain", "evil.other.test", "", ""), autoScopePending, "subdomain", "evil.other.test"},
+		{"broader root_domain must not match exact subdomain", autoScopeCandidate(1, "root_domain", "partner.test", "", ""), autoScopePending, "root_domain", "partner.test"},
+		{"out-of-scope IP routed to pending", autoScopeCandidate(1, "ip", "", "", "192.168.52.30"), autoScopePending, "ip", "192.168.52.30"},
+		{"out-of-scope IP-literal service routed to pending", autoScopeCandidate(1, "service", "", "http://192.168.52.30:8080/", ""), autoScopePending, "ip", "192.168.52.30"},
+		{"explicitly excluded subdomain skipped", autoScopeCandidate(1, "subdomain", "blog.acme.test", "", ""), autoScopeSkip, "", ""},
+		{"explicitly excluded CIDR IP skipped", autoScopeCandidate(1, "ip", "", "", "10.99.1.5"), autoScopeSkip, "", ""},
+		{"loopback IP skipped when trusted scope exists", autoScopeCandidate(1, "ip", "", "", "127.0.0.1"), autoScopeSkip, "", ""},
+	}
+	for _, tc := range cases {
+		gotDec, gotKind, gotVal := evaluateAutoScope(trusted, tc.cand)
+		if gotDec != tc.wantDec || gotKind != tc.wantKind || gotVal != tc.wantValue {
+			t.Errorf("%s: got (%v, %q, %q), want (%v, %q, %q)",
+				tc.name, gotDec, gotKind, gotVal, tc.wantDec, tc.wantKind, tc.wantValue)
+		}
+	}
+}
+
+func TestTaskScopeSeedSourceAndAutoScopeContainmentDB(t *testing.T) {
+	dsn, _, err := DSN()
+	if err != nil {
+		t.Skipf("no database config (%v)", err)
+	}
+	d, err := Open(dsn)
+	if err != nil {
+		t.Skipf("postgres unavailable (%v)", err)
+	}
+	defer d.Close()
+
+	task, err := d.CreateTask("seed and auto containment", "scope db test", nil, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	defer func() {
+		_, _ = d.Exec(`DELETE FROM pending_scope WHERE task_id=$1`, task.ID)
+		_ = d.DeleteTask(task.ID)
+	}()
+	as := d.Assets()
+
+	// Seed source is accepted by task_scope source check constraint.
+	if _, err := as.AddAgentScope(task.ID, "ip", "192.168.111.20", "round-0 seed target", "seed"); err != nil {
+		t.Fatalf("AddAgentScope(seed): %v", err)
+	}
+
+	// Out-of-scope AddAutoScope must NOT expand task_scope and MUST write pending_scope.
+	if err := as.AddAutoScope(task.ID, "ip", "", "", "192.168.52.30"); err != nil {
+		t.Fatalf("AddAutoScope(out-of-scope ip): %v", err)
+	}
+	if err := as.AddAutoScope(task.ID, "subdomain", "lateral.other.test", "", ""); err != nil {
+		t.Fatalf("AddAutoScope(out-of-scope subdomain): %v", err)
+	}
+
+	scopes, err := as.ListTaskScope(task.ID)
+	if err != nil {
+		t.Fatalf("ListTaskScope: %v", err)
+	}
+	if len(scopes) != 1 || scopes[0].Source != "seed" || scopes[0].Net != "192.168.111.20/32" {
+		t.Fatalf("task_scope must keep only the seed row, got %+v", scopes)
+	}
+
+	pending, err := as.ListPendingScope(task.ID, false)
+	if err != nil {
+		t.Fatalf("ListPendingScope: %v", err)
+	}
+	gotPending := map[string]bool{}
+	for _, p := range pending {
+		gotPending[p.Kind+":"+p.Value] = true
+	}
+	for _, want := range []string{"ip:192.168.52.30", "subdomain:lateral.other.test"} {
+		if !gotPending[want] {
+			t.Errorf("pending_scope missing %s; got %+v", want, pending)
+		}
 	}
 }

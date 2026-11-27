@@ -35,14 +35,28 @@ func (t *ToolSet) digestMemberEntry(store *db.ExplorationStore, id int64) map[st
 	return m
 }
 
-// coldDigestsRecent returns a store's active digests as flat bodies for
+const (
+	// plannerColdDigestsCap bounds inline cold_digests entries in graph_overview.
+	// Remaining active digest IDs are listed in cold_digests_more for expand_digest.
+	plannerColdDigestsCap = 6
+	// plannerColdDigestBodyMax clips each inline cold digest preview in graph_overview
+	// so cold history never bloats Planner prompts; full bodies stay one expand_digest away.
+	plannerColdDigestBodyMax = 120
+)
+
+// coldDigestsRecent returns a store's active digests as compact entries for
 // graph_overview, ordered by the recency of their freshest member (max member id ≈
 // latest cooled node — a digest near the live frontier is likelier relevant), and
-// capped at `cap`. Overflow digest ids are returned separately (moreIDs) so they
-// stay reachable via expand_digest even when not shown inline — cold_digests is the
-// only exit for folded cold nodes. Shared by the current task overview and the
-// read-only related-task overview (§2 cross-task reuse).
+// capped at `cap` with bodies clipped to plannerColdDigestBodyMax runes. Overflow
+// digest ids are returned separately (moreIDs) so they stay reachable via
+// expand_digest even when not shown inline — cold_digests is the only exit for
+// folded cold nodes. Shared by the current task overview and the read-only
+// related-task overview (§2 cross-task reuse).
 func coldDigestsRecent(store *db.ExplorationStore, cap int) (shown []map[string]any, moreIDs []int64) {
+	return coldDigestsRecentWithBodyCap(store, cap, plannerColdDigestBodyMax)
+}
+
+func coldDigestsRecentWithBodyCap(store *db.ExplorationStore, cap, bodyMax int) (shown []map[string]any, moreIDs []int64) {
 	ads, err := store.ActiveDigests()
 	if err != nil || len(ads) == 0 {
 		return nil, nil
@@ -58,6 +72,10 @@ func coldDigestsRecent(store *db.ExplorationStore, cap int) (shown []map[string]
 			Body string `json:"body"`
 		}
 		_ = json.Unmarshal(d.Payload, &p)
+		body := p.Body
+		if bodyMax > 0 {
+			body = clipPlainRunes(body, bodyMax)
+		}
 		ms, _ := store.DigestMembers(d.ID) // sorted asc → last = freshest
 		var fresh int64
 		if len(ms) > 0 {
@@ -65,7 +83,7 @@ func coldDigestsRecent(store *db.ExplorationStore, cap int) (shown []map[string]
 		}
 		items = append(items, dg{
 			id:        d.ID,
-			entry:     map[string]any{"id": d.ID, "body": p.Body, "member_count": len(ms)},
+			entry:     map[string]any{"id": d.ID, "body": body, "member_count": len(ms)},
 			freshness: fresh,
 		})
 	}

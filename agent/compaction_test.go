@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/norma/llm"
@@ -379,4 +380,145 @@ func countNodesAndGoals(t *testing.T, ts *db.ExplorationStore) (nodes, goals int
 		t.Fatal(err)
 	}
 	return len(all), len(goalNodes)
+}
+
+func TestCompactorMajorPreservesMaxGenerationAndSkipsIndependentChurn(t *testing.T) {
+	_, ts := retentionStore(t)
+	// Create 9 independent cold branches (exceeding default c.m=8).
+	var firstIntent, firstFact int64
+	for i := 0; i < 9; i++ {
+		iid, err := ts.AddNode(db.KindIntent, map[string]any{"summary": fmt.Sprintf("branch-%d", i)}, 0, "done", "test", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fid, err := ts.AddNode(db.KindFact, map[string]any{"summary": fmt.Sprintf("fact-%d", i)}, 0, "confirmed", "test", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ts.Link(iid, db.RelYields, fid); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			firstIntent, firstFact = iid, fid
+		}
+	}
+	prov := &scriptedCompactorProvider{steps: []scriptedComplete{{text: "独立分支摘要"}}}
+	c := NewCompactor(prov, "test-model")
+	c.params.R = 0
+	c.cooldown = 0
+	if _, _, _, err := c.maintain(ts); err != nil {
+		t.Fatal(err)
+	}
+	c.minor(t.Context(), ts)
+	callsAfterMinor := prov.callCount()
+	if callsAfterMinor != 9 {
+		t.Fatalf("expected 9 initial minor compressions, got %d", callsAfterMinor)
+	}
+	// Next maintainState: activeDigests=9 >= c.m(8), but all 9 are independent → needMajor must be false!
+	st, err := c.maintainState(ts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.activeDigests != 9 || st.needMajor {
+		t.Fatalf("independent 9 digests should not trigger major: %+v", st)
+	}
+
+	// Verify generation cap in major(): seed a gen=maxDigestGeneration digest covering branch 0,
+	// attach a new cold fact so branch 0's signature changes, and confirm major() preserves it
+	// without refolding into gen4+.
+	active, err := ts.ActiveDigests()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var branch0Digest int64
+	for _, d := range active {
+		for _, m := range digestMemberIDs(d) {
+			if m == firstIntent {
+				branch0Digest = d.ID
+			}
+		}
+	}
+	if branch0Digest == 0 {
+		t.Fatal("branch 0 digest not found")
+	}
+	if err := ts.SupersedeDigests([]int64{branch0Digest}); err != nil {
+		t.Fatal(err)
+	}
+	genCapDigest, err := ts.AddDigest(map[string]any{
+		"body":       "frozen gen3 body",
+		"member_ids": map[string]any{"facts": []int64{firstFact}, "intents": []int64{firstIntent}},
+		"generation": maxDigestGeneration,
+		"signature":  "old-gen3-sig",
+	}, []int64{firstIntent, firstFact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	extraFact, err := ts.AddNode(db.KindFact, map[string]any{"summary": "late fact on branch 0"}, 0, "confirmed", "test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.Link(firstIntent, db.RelYields, extraFact); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := c.maintain(ts); err != nil {
+		t.Fatal(err)
+	}
+	callsBeforeMajor := prov.callCount()
+	c.major(t.Context(), ts)
+	if prov.callCount() != callsBeforeMajor {
+		t.Fatalf("major refolded gen=%d digest (extra calls=%d)", maxDigestGeneration, prov.callCount()-callsBeforeMajor)
+	}
+	activeAfter, err := ts.ActiveDigests()
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundFrozen := false
+	for _, d := range activeAfter {
+		if d.ID == genCapDigest {
+			foundFrozen = true
+		}
+		if _, gen := digestSigGen(d); gen > maxDigestGeneration {
+			t.Fatalf("digest #%d exceeded max generation %d: gen=%d", d.ID, maxDigestGeneration, gen)
+		}
+	}
+	if !foundFrozen {
+		t.Fatalf("gen=%d digest #%d was superseded instead of preserved", maxDigestGeneration, genCapDigest)
+	}
+}
+
+func TestGraphOverviewColdDigestsCompactAndOverflowIDs(t *testing.T) {
+	_, ts := retentionStore(t)
+	longBody := strings.Repeat("冷区历史折叠正文", 40) // 320 runes (>120)
+	var digestIDs []int64
+	for i := 0; i < 10; i++ {
+		fid, err := ts.AddNode(db.KindFact, map[string]any{"summary": fmt.Sprintf("cold-%d", i)}, 0, "confirmed", "test", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		did, err := ts.AddDigest(map[string]any{
+			"body":       longBody,
+			"member_ids": map[string]any{"facts": []int64{fid}},
+			"generation": 1,
+			"signature":  fmt.Sprintf("sig-%d", i),
+		}, []int64{fid})
+		if err != nil {
+			t.Fatal(err)
+		}
+		digestIDs = append(digestIDs, did)
+	}
+	ov := NewToolSet(ts, "planner").graphOverviewData()
+	cds, ok := ov["cold_digests"].([]map[string]any)
+	if !ok || len(cds) != plannerColdDigestsCap {
+		t.Fatalf("cold_digests len=%d want %d (ok=%v)", len(cds), plannerColdDigestsCap, ok)
+	}
+	for _, entry := range cds {
+		body, _ := entry["body"].(string)
+		if utf8.RuneCountInString(body) > plannerColdDigestBodyMax+1 {
+			t.Fatalf("cold digest body not clipped to <=%d runes: got %d (%q)", plannerColdDigestBodyMax, utf8.RuneCountInString(body), body)
+		}
+	}
+	more, ok := ov["cold_digests_more"].([]int64)
+	if !ok || len(more) != len(digestIDs)-plannerColdDigestsCap {
+		t.Fatalf("cold_digests_more=%v want %d overflow IDs", more, len(digestIDs)-plannerColdDigestsCap)
+	}
 }

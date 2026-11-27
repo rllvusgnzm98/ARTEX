@@ -102,11 +102,19 @@ func TestToolAvailabilityAPIRequiresAuthentication(t *testing.T) {
 		if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &report) != nil || len(report) != len(agent.ShellHintSeeds()) {
 			t.Fatalf("availability API: %d %s", rec.Code, rec.Body)
 		}
+		expectedOptional := map[string]bool{
+			"nxc":                true,
+			"evil-winrm":         true,
+			"impacket-ntlmrelayx": true,
+			"certipy":            true,
+			"bloodhound-python":  true,
+			"msfconsole":         true,
+		}
 		for _, r := range report {
 			if r.Name == "ffuf" && (!r.Available || r.Path != filepath.Join(data, "tools", "ffuf")) {
 				t.Fatalf("wrong report: %+v", r)
 			}
-			if r.Optional != (r.Name == "nxc") {
+			if r.Optional != expectedOptional[r.Name] {
 				t.Fatalf("wrong optional policy: %+v", r)
 			}
 		}

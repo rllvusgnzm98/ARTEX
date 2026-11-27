@@ -774,7 +774,8 @@ WHERE t.active_llm_profile_id IS NULL
 --   自动填(source='auto')：insertAssets 顶层按 worker 显式插入的资产类型加保守范围
 --     （root_domain→root_domain，subdomain/service/endpoint→subdomain(host)，ip→ip）；
 --     side-effect 派生的资产不入范围（钩子在 handler 顶层，派生在 db 层内部）。
---   agent 填(source='agent')：add_task_scope 加 company/root_domain/subdomain/ip。
+--   初始种子(source='seed')：round-0 目标拆解 DecomposeGoals 从用户任务目标提取的初始范围。
+--   agent 填(source='agent')：运行时 add_task_scope 加 company/root_domain/subdomain/ip。
 -- 覆盖度 = 匹配 active 行的 assets（分母）中，被 fact 节点锚定过的占比（分子）。
 CREATE TABLE IF NOT EXISTS task_scope (
     id          BIGSERIAL PRIMARY KEY,
@@ -784,7 +785,7 @@ CREATE TABLE IF NOT EXISTS task_scope (
     domain      TEXT,          -- root_domain / subdomain
     net         CIDR,          -- ip / cidr
     value       TEXT,          -- icp / keyword
-    source      TEXT NOT NULL DEFAULT 'auto' CHECK (source IN ('auto','agent','manual')),
+    source      TEXT NOT NULL DEFAULT 'auto' CHECK (source IN ('auto','agent','seed','manual')),
     reason      TEXT,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -793,6 +794,9 @@ ALTER TABLE task_scope ADD COLUMN IF NOT EXISTS value TEXT;
 ALTER TABLE task_scope DROP CONSTRAINT IF EXISTS task_scope_kind_check;
 ALTER TABLE task_scope ADD CONSTRAINT task_scope_kind_check
     CHECK (kind IN ('company','root_domain','subdomain','ip','cidr','icp','keyword','exclude_root_domain','exclude_subdomain','exclude_ip','exclude_cidr'));
+ALTER TABLE task_scope DROP CONSTRAINT IF EXISTS task_scope_source_check;
+ALTER TABLE task_scope ADD CONSTRAINT task_scope_source_check
+    CHECK (source IN ('auto','agent','seed','manual'));
 -- 去重：同一 task 的同一条范围只存一次（自动填批量插入靠它幂等）。
 DROP INDEX IF EXISTS uq_task_scope;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_task_scope_v2 ON task_scope(

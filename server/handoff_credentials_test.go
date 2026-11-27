@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -278,7 +279,7 @@ func TestHandoffInheritTruncatesAt20(t *testing.T) {
 	ids := make([]int64, 0, 21)
 	for i := 0; i < 21; i++ {
 		ids = append(ids, env.cred(&db.CredentialRecord{
-			Username: "fixture-user", Verified: true, HostAssetID: host,
+			Username: fmt.Sprintf("fixture-user-%02d", i), Verified: true, HostAssetID: host,
 			Secret: handoffFixtureSecret,
 		}))
 	}

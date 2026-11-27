@@ -27,10 +27,23 @@ func scopeRulesFromRows(rows []db.TaskScope) []guard.ScopeRule {
 	return scopeRulesFromRowsForMode(rows, "warn")
 }
 
+// isTrustedStrictScopeSource reports whether a task_scope inclusion row is
+// trusted in strict RoE mode: operator-entered ("manual"), round-0 task goal
+// seed ("seed"), or legacy empty-source (""). Runtime "agent" and "auto" rows
+// cannot widen the strict boundary.
+func isTrustedStrictScopeSource(src string) bool {
+	switch strings.ToLower(strings.TrimSpace(src)) {
+	case "manual", "seed", "":
+		return true
+	default:
+		return false
+	}
+}
+
 // scopeRulesFromRowsForMode normalizes task_scope rows into guard ScopeRules for
-// a given RoE mode. In strict mode, agent/auto-discovered inclusion rows cannot
-// widen the authorized boundary (only manual/empty-source inclusions are trusted),
-// while exclusion rules apply unconditionally.
+// a given RoE mode. In strict mode, runtime agent/auto-discovered inclusion rows
+// cannot widen the authorized boundary (only manual/seed/empty-source inclusions
+// are trusted), while exclusion rules apply unconditionally.
 func scopeRulesFromRowsForMode(rows []db.TaskScope, mode string) []guard.ScopeRule {
 	strict := normalizeRoEMode(mode) == "strict"
 	out := make([]guard.ScopeRule, 0, len(rows))
@@ -49,28 +62,28 @@ func scopeRulesFromRowsForMode(rows []db.TaskScope, mode string) []guard.ScopeRu
 				out = append(out, guard.ScopeRule{Kind: "cidr", Value: r.Net, Exclude: true})
 			}
 		case "root_domain":
-			if strict && (r.Source == "auto" || r.Source == "agent") {
+			if strict && !isTrustedStrictScopeSource(r.Source) {
 				continue
 			}
 			if r.Domain != "" {
 				out = append(out, guard.ScopeRule{Kind: "domain", Value: r.Domain})
 			}
 		case "subdomain":
-			if strict && (r.Source == "auto" || r.Source == "agent") {
+			if strict && !isTrustedStrictScopeSource(r.Source) {
 				continue
 			}
 			if r.Domain != "" {
 				out = append(out, guard.ScopeRule{Kind: "exact_domain", Value: r.Domain})
 			}
 		case "ip", "cidr":
-			if strict && (r.Source == "auto" || r.Source == "agent") {
+			if strict && !isTrustedStrictScopeSource(r.Source) {
 				continue
 			}
 			if r.Net != "" {
 				out = append(out, guard.ScopeRule{Kind: "cidr", Value: r.Net})
 			}
 		case "icp":
-			if strict && (r.Source == "auto" || r.Source == "agent") {
+			if strict && !isTrustedStrictScopeSource(r.Source) {
 				continue
 			}
 			if r.Value != "" {

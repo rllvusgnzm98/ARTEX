@@ -94,6 +94,32 @@ func sessionItem(rec *db.SessionRecord) map[string]any {
 	if err := json.Unmarshal(rec.Secret, &sec); err == nil && sec.Platform != "" {
 		item["platform"] = sec.Platform
 	}
+	if isLogicalSessionKind(rec.Kind) {
+		var meta struct {
+			Host     string `json:"host"`
+			Port     int    `json:"port"`
+			Username string `json:"username"`
+			Method   string `json:"method"`
+			Notes    string `json:"notes"`
+		}
+		if err := json.Unmarshal(rec.Secret, &meta); err == nil {
+			if meta.Host != "" {
+				item["host"] = meta.Host
+			}
+			if meta.Port > 0 {
+				item["port"] = meta.Port
+			}
+			if meta.Username != "" {
+				item["username"] = meta.Username
+			}
+			if meta.Method != "" {
+				item["method"] = meta.Method
+			}
+			if meta.Notes != "" {
+				item["notes"] = meta.Notes
+			}
+		}
+	}
 	return item
 }
 
@@ -548,10 +574,7 @@ func buildTopology(assets []*db.Asset, recs []*db.SessionRecord, tunnels []topoT
 	}
 	sessionHost := map[int64]string{}
 	for _, rec := range recs {
-		host := ""
-		if u, err := url.Parse(rec.URL); err == nil {
-			host = u.Hostname()
-		}
+		host := sessionRecordHost(rec)
 		ip := assetIP[rec.HostAssetID]
 		if ip == "" {
 			ip = host
@@ -696,10 +719,31 @@ func (s *Server) intranetTopology(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, buildTopology(assets, recs, tuns, callbackHostForTopo()))
 }
 
+func sessionRecordHost(rec *db.SessionRecord) string {
+	if rec == nil {
+		return ""
+	}
+	if u, err := url.Parse(rec.URL); err == nil && u.Hostname() != "" {
+		return u.Hostname()
+	}
+	var meta struct {
+		Host string `json:"host"`
+	}
+	if json.Unmarshal(rec.Secret, &meta) == nil && strings.TrimSpace(meta.Host) != "" {
+		return strings.TrimSpace(meta.Host)
+	}
+	if h, _, err := net.SplitHostPort(strings.TrimSpace(rec.URL)); err == nil && h != "" {
+		return h
+	}
+	if raw := strings.TrimSpace(rec.URL); raw != "" && !strings.Contains(raw, "://") {
+		return raw
+	}
+	return ""
+}
+
 // taskIntranet 判定任务是否处于内网期(worker.intranet 短纪律变体的开关):
-// 存在该任务创建的存活立足点会话。worker 每次 run 现查,会话状态变化即时生效;
-// 读取失败按外网处理(不误切变体)。隧道台账本刀不移植:若后续接入,必须对
-// nil 存储与读取失败保持安全,不得为了做这个检查而搬隧道台账。
+// 存在该任务创建的存活立足点会话（含逻辑会话）或 DB 已登记的活跃隧道。
+// worker 每次 run 现查,会话/隧道状态变化即时生效; 读取失败按外网处理(不误切变体)。
 func (s *Server) taskIntranet(taskID int64) bool {
 	if taskID <= 0 {
 		return false
@@ -714,11 +758,22 @@ func (s *Server) taskIntranet(taskID int64) bool {
 			return true
 		}
 	}
-	// 隧道台账未接线或查找失败：保持外网变体（nil-safe）。
-	if s != nil && s.tunnelLive != nil {
-		recs, err := s.tunnelLive.ListByTask(ctx, taskID)
-		if hasLiveTaskTunnel(recs, err) {
-			return true
+	// 隧道台账：优先 s.tunnelLive，未接线时回落 s.tunnels.store 或 DB TunnelStore（nil-safe）。
+	if s != nil {
+		var lister tunnelLiveLister
+		switch {
+		case s.tunnelLive != nil:
+			lister = s.tunnelLive
+		case s.tunnels != nil && s.tunnels.store != nil:
+			lister = s.tunnels.store
+		case s.m != nil && s.m.pg != nil:
+			lister = db.NewTunnelStore(s.m.pg)
+		}
+		if lister != nil {
+			recs, err := lister.ListByTask(ctx, taskID)
+			if hasLiveTaskTunnel(recs, err) {
+				return true
+			}
 		}
 	}
 	return false
@@ -743,12 +798,13 @@ func hasLiveTaskTunnel(recs []*db.TunnelRecord, err error) bool {
 }
 
 // hasLiveTaskSession 把「查找失败 / 非法 task / 无存活会话」一律视为外网。
+// 同时覆盖 HTTP 会话与逻辑会话（winrm/ssh/msf_bind）。
 func hasLiveTaskSession(recs []*db.SessionRecord, err error, taskID int64) bool {
 	if err != nil || taskID <= 0 {
 		return false
 	}
 	for _, r := range recs {
-		if r != nil && r.CreatedByTask == taskID {
+		if r != nil && r.CreatedByTask == taskID && (r.Status == "" || r.Status == db.SessionAlive) {
 			return true
 		}
 	}

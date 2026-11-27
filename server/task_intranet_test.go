@@ -140,3 +140,76 @@ func TestTaskIntranetLiveTunnelSwitchesAndLookupFailureStaysExternal(t *testing.
 		t.Fatal("本任务存活隧道应切内网变体")
 	}
 }
+
+func TestTaskIntranetDBRegisteredTunnelsAndLogicalSessions(t *testing.T) {
+	pg := openIntranetTestDB(t)
+	task, err := pg.CreateTask("intranet db tunnel test", "tunnel_register activates intranet", nil, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	store := db.NewTunnelStore(pg)
+	t.Cleanup(func() {
+		recs, _ := store.ListByTask(context.Background(), task.ID)
+		for _, r := range recs {
+			_ = store.Delete(context.Background(), r.ID)
+		}
+		_ = pg.DeleteTask(task.ID)
+	})
+
+	// Even when s.tunnelLive is nil, taskIntranet checks s.tunnels.store and s.m.pg.
+	sNoLive := &Server{ctx: context.Background(), tunnels: &tunnelRuntime{store: store}}
+	sPGOnly := &Server{ctx: context.Background(), m: &Manager{pg: pg}}
+	if sNoLive.taskIntranet(task.ID) || sPGOnly.taskIntranet(task.ID) {
+		t.Fatal("无隧道时必须保持外网")
+	}
+
+	tid, err := store.Create(context.Background(), &db.TunnelRecord{
+		TaskID: task.ID, Kind: "portfwd", Adapter: "external",
+		ListenHost: "127.0.0.1", ListenPort: 18888,
+		TargetHost: "10.0.0.5", TargetPort: 445,
+		State: db.TunnelAlive,
+	})
+	if err != nil {
+		t.Fatalf("Create tunnel: %v", err)
+	}
+	if !sNoLive.taskIntranet(task.ID) {
+		t.Fatal("DB 登记的 alive 隧道应 via s.tunnels.store 激活 taskIntranet")
+	}
+	if !sPGOnly.taskIntranet(task.ID) {
+		t.Fatal("DB 登记的 alive 隧道应 via s.m.pg 激活 taskIntranet")
+	}
+
+	if err := store.UpdateState(context.Background(), tid, db.TunnelStopped, ""); err != nil {
+		t.Fatalf("UpdateState stopped: %v", err)
+	}
+	if sNoLive.taskIntranet(task.ID) || sPGOnly.taskIntranet(task.ID) {
+		t.Fatal("stopped 隧道不应激活 taskIntranet")
+	}
+
+	// Logical sessions integrate cleanly in hasLiveTaskSession and buildTopology.
+	for _, kind := range []string{"winrm", "ssh", "msf_bind"} {
+		if !hasLiveTaskSession([]*db.SessionRecord{{CreatedByTask: task.ID, Kind: kind, Status: db.SessionAlive}}, nil, task.ID) {
+			t.Fatalf("alive logical session kind=%s should activate taskIntranet", kind)
+		}
+		if hasLiveTaskSession([]*db.SessionRecord{{CreatedByTask: task.ID, Kind: kind, Status: db.SessionDead}}, nil, task.ID) {
+			t.Fatalf("dead logical session kind=%s must not activate taskIntranet", kind)
+		}
+	}
+	topo := buildTopology(nil, []*db.SessionRecord{
+		{ID: 501, Kind: "ssh", URL: "ssh://10.20.30.40:22", Status: db.SessionAlive, CreatedByTask: task.ID},
+		{ID: 502, Kind: "winrm", URL: "", Secret: json.RawMessage(`{"host":"10.20.30.41","port":5985}`), Status: db.SessionAlive, CreatedByTask: task.ID},
+	}, []topoTunnel{
+		{ID: 601, Kind: "portfwd", TargetHost: "10.20.30.40", TargetPort: 22, State: db.TunnelAlive},
+	}, "203.0.113.5")
+	nodes := topo["nodes"].([]*topoNode)
+	seenIP := map[string]*topoNode{}
+	for _, n := range nodes {
+		seenIP[n.IP] = n
+	}
+	if seenIP["10.20.30.40"] == nil || !seenIP["10.20.30.40"].HasSession || seenIP["10.20.30.40"].AliveSessions != 1 {
+		t.Fatalf("topology missing ssh logical session node: %+v", nodes)
+	}
+	if seenIP["10.20.30.41"] == nil || !seenIP["10.20.30.41"].HasSession {
+		t.Fatalf("topology missing winrm Secret.host fallback node: %+v", nodes)
+	}
+}
