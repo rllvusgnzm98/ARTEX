@@ -562,3 +562,116 @@ func TestSettlementTransientExhaustedWritesPartialProgressAndReturnsTransientErr
 		t.Fatalf("fallback fact missing partial_progress or observed tool output: %s", fn.Payload)
 	}
 }
+
+func setupBudgetWorkerStore(t *testing.T, summary string) (*db.DB, int64, *db.ExplorationStore, *db.Node, int64) {
+	t.Helper()
+	d, store := retentionStore(t)
+	var taskID int64
+	if err := d.QueryRow(`SELECT id FROM tasks WHERE exploration_id=$1`, store.ID()).Scan(&taskID); err != nil {
+		t.Fatal(err)
+	}
+	iid, err := store.AddIntent(map[string]any{"summary": summary}, 0, nil, "planner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := store.GetNode(iid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d, taskID, store, intent, iid
+}
+
+func TestWorkerStopLossTriggersSettlementAndCountsTurnsWithSideCapture(t *testing.T) {
+	_, taskID, store, intent, iid := setupBudgetWorkerStore(t, "stop-loss-settle")
+	var calls, settleSawNoStopLoss int
+	fake := budgetFakeProvider{complete: func(call context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+		calls++
+		b, _ := call.Value(runBudgetKey{}).(runBudget)
+		if !b.recovery {
+			if calls == 1 {
+				return llm.Message{
+					Role: llm.RoleAssistant,
+					Content: []llm.ContentBlock{{
+						Type:  llm.BlockToolUse,
+						ID:    "probe-1",
+						Name:  "Bash",
+						Input: json.RawMessage(`{"command":"python3 -c \"import socket; print('probe-ok')\""}`),
+					}},
+				}, "tool_use", llm.Usage{}, nil
+			}
+			// Second turn receives stop-loss block text instead of further Bash probes.
+			return assistantText("waiting without writing"), "end_turn", llm.Usage{}, nil
+		}
+		settleSawNoStopLoss++
+		for _, tool := range req.Tools {
+			if tool.Name == "Bash" {
+				t.Error("Bash must be disabled during StopLoss recovery settlement")
+			}
+		}
+		if calls == 2 || settleSawNoStopLoss == 1 {
+			msg := budgetToolMessage("record_fact")
+			msg.Content[0].Input, _ = json.Marshal(map[string]any{"summary": "settlement evidence", "confidence": "observed", "intent_id": iid})
+			return msg, "tool_use", llm.Usage{}, nil
+		}
+		return assistantText("saved on settle"), "end_turn", llm.Usage{}, nil
+	}}
+
+	dir := t.TempDir()
+	w := NewWorker(fake, "fake", dir, transcript.NewStore(dir), 128000, 10)
+	w.SetRunTimeout(28 * time.Second)
+	w.SetSettleTimeout(7 * time.Second)
+	w.SetNonStreaming(func() bool { return true })
+	// IdleProbeLimit=1 latches immediately on the fast network-capable python probe.
+	hooks := WrapStopLoss(nil, NewStopLossMonitor(StopLossPolicy{IdleProbeLimit: 1, RepeatCommandLimit: 5, MaxNovelRelief: -1}))
+
+	reason, writes, runErr := w.Execute(t.Context(), "stoploss-worker", taskID, nil, store, intent, hooks, nil, nil, nil)
+	if runErr != nil {
+		t.Fatalf("StopLoss run must not wrap transient error on successful settlement, got err=%v", runErr)
+	}
+	if reason != harness.ReasonStopHookPrevented || writes.Facts != 1 {
+		t.Fatalf("expected ReasonStopHookPrevented and 1 settled fact write, reason=%s writes=%+v", reason, writes)
+	}
+	if settleSawNoStopLoss < 1 {
+		t.Fatal("expected recoverSettlement to execute after StopLoss with 0 post-latch writes")
+	}
+	factIDs, err := store.FactsYielded(iid)
+	if err != nil || len(factIDs) != 1 {
+		t.Fatalf("expected 1 settled fact for intent %d, got ids=%v err=%v", iid, factIDs, err)
+	}
+
+	// nil recoveryErr fallback path (settlement returns pure text with 0 writes): must not panic.
+	var textOnlyCalls int
+	textOnly := budgetFakeProvider{complete: func(call context.Context, _ llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+		textOnlyCalls++
+		b, _ := call.Value(runBudgetKey{}).(runBudget)
+		if !b.recovery {
+			if textOnlyCalls == 1 {
+				return llm.Message{
+					Role: llm.RoleAssistant,
+					Content: []llm.ContentBlock{{
+						Type:  llm.BlockToolUse,
+						ID:    "probe-text-only",
+						Name:  "Bash",
+						Input: json.RawMessage(`{"command":"python3 -c \"import socket; print('probe-ok')\""}`),
+					}},
+				}, "tool_use", llm.Usage{}, nil
+			}
+			return assistantText("done text only"), "end_turn", llm.Usage{}, nil
+		}
+		return assistantText("forgot to call write tool"), "end_turn", llm.Usage{}, nil
+	}}
+	_, taskID2, store2, intent2, iid2 := setupBudgetWorkerStore(t, "stop-loss-fallback")
+	dir2 := t.TempDir()
+	w2 := NewWorker(textOnly, "fake", dir2, transcript.NewStore(dir2), 128000, 10)
+	w2.SetRunTimeout(28 * time.Second)
+	w2.SetSettleTimeout(7 * time.Second)
+	w2.SetNonStreaming(func() bool { return true })
+	hooks2 := WrapStopLoss(nil, NewStopLossMonitor(StopLossPolicy{IdleProbeLimit: 1, RepeatCommandLimit: 5, MaxNovelRelief: -1}))
+	if _, writes2, err2 := w2.Execute(t.Context(), "stoploss-fallback", taskID2, nil, store2, intent2, hooks2, nil, nil, nil); err2 != nil || writes2.Facts != 1 {
+		t.Fatalf("expected deterministic partial_progress fallback without panic, writes=%+v err=%v", writes2, err2)
+	}
+	fids2, err2 := store2.FactsYielded(iid2)
+	if err2 != nil || len(fids2) != 1 {
+		t.Fatalf("expected 1 partial_progress fact on text-only settlement, ids=%v err=%v", fids2, err2)
+	}
+}

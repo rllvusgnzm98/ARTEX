@@ -461,11 +461,12 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		Provider:        p.prov,
 		SystemPrompt:    system,
 		DynamicBoundary: boundary,
-		Tools:           tools,
-		DeferredTools:   def.Deferred,
-		UnlockSet:       def.Unlock,
-		PermissionMode:  permission.ModeBypass,
-		EnableWebFetch:  true, // 走记录代理留痕；载入代理 CA 验证 MITM 重签的 HTTPS 证书
+		Tools:                  tools,
+		DeferredTools:          def.Deferred,
+		UnlockSet:              def.Unlock,
+		PermissionMode:         permission.ModeBypass,
+		DisableBackgroundTasks: true, // planner 不应持有 Monitor/TaskOutput 自起后台轮询
+		EnableWebFetch:         true, // 走记录代理留痕；载入代理 CA 验证 MITM 重签的 HTTPS 证书
 		WebFetchProxy:   p.proxyAddr,
 		WebFetchCACert:  p.proxyCACert,
 		// 联网搜索(可选)。ddgs 无需 key；brave-free 需 BraveKey；tavily 需 TavilyKey。
@@ -494,14 +495,14 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		MaxTokens:    p.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
 	}
 	AttachStableWebFetch(&opts, p.uaForTask(taskID))
-	// 默认摘除 plannerProbeHooks 硬拦截（保留 Guard/RoE/Intercept 内层钩子），恢复 e6ec5699
-	// 中规划者读取平台/靶场账本的能力；如需强制代码级探针上限可显式设 ARTEX_ENABLE_PLANNER_PROBE_GUARD=1。
+	// 默认开启 plannerProbeHooks 探测上限守卫（Read/LS/Glob/Grep/Write 不受影响，仍然可读取
+	// 共享目录与台账），防止 Planner 越界用 Bash 替代 worker；如需关闭可设 ARTEX_ENABLE_PLANNER_PROBE_GUARD=0。
 	var innerHooks harness.HookRunner
 	if p.guardFn != nil {
 		innerHooks = p.guardFn(taskID)
 	}
 	opts.Hooks = innerHooks
-	if envBoolFlag("ARTEX_ENABLE_PLANNER_PROBE_GUARD", false) {
+	if envBoolFlag("ARTEX_ENABLE_PLANNER_PROBE_GUARD", true) {
 		opts.Hooks = WrapPlannerProbe(innerHooks, p.probeFor(ts.ID()), PlannerProbeLimit, func() (int, bool) {
 			n, err := ts.CountWorkerFacts()
 			if err != nil {

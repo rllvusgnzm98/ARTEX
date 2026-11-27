@@ -43,9 +43,31 @@ func TestProxyEnvInjectsCAWhenRecording(t *testing.T) {
 		}
 		return false
 	}
-	for _, want := range []string{"SSL_CERT_FILE=", "CURL_CA_BUNDLE=", "REQUESTS_CA_BUNDLE=", "NODE_EXTRA_CA_CERTS="} {
+	for _, want := range []string{"SSL_CERT_FILE=", "CURL_CA_BUNDLE=", "REQUESTS_CA_BUNDLE=", "NODE_EXTRA_CA_CERTS=", "NO_PROXY=", "no_proxy="} {
 		if !has(want) {
 			t.Errorf("proxyEnv with CA missing %s: %v", want, env)
+		}
+	}
+}
+
+func TestProxyEnvIncludesLocalLoopbackAndCallbackInNoProxy(t *testing.T) {
+	t.Setenv("ARTEX_CALLBACK_ADDR", "10.8.0.6:8443")
+	env := proxyEnv("http://127.0.0.1:8788", "")
+	var upper, lower string
+	for _, e := range env {
+		if strings.HasPrefix(e, "NO_PROXY=") {
+			upper = strings.TrimPrefix(e, "NO_PROXY=")
+		}
+		if strings.HasPrefix(e, "no_proxy=") {
+			lower = strings.TrimPrefix(e, "no_proxy=")
+		}
+	}
+	if upper == "" || upper != lower {
+		t.Fatalf("NO_PROXY (%q) and no_proxy (%q) must both be populated and equal", upper, lower)
+	}
+	for _, host := range []string{"127.0.0.1", "localhost", "::1", "10.8.0.6"} {
+		if !strings.Contains(","+upper+",", ","+host+",") {
+			t.Errorf("NO_PROXY %q missing %q", upper, host)
 		}
 	}
 }

@@ -164,5 +164,19 @@ func TestPlannerProbeDelegatesAllowedProbesToInnerGuard(t *testing.T) {
 	if !block2 || !strings.Contains(msg2, PlannerProbeMessagePrefix) || inner2.called != 0 {
 		t.Fatalf("expected boundary 1 short-circuit, block=%v msg=%q called=%d", block2, msg2, inner2.called)
 	}
+	if !strings.Contains(msg2, "Read / LS / Glob / Grep") {
+		t.Fatalf("probe block message should remind Planner to use Read/LS/Glob/Grep for local files, got %q", msg2)
+	}
+}
+
+func TestPlannerDefaultProbeGuardEnabledByDefault(t *testing.T) {
+	t.Setenv("ARTEX_ENABLE_PLANNER_PROBE_GUARD", "")
+	if !envBoolFlag("ARTEX_ENABLE_PLANNER_PROBE_GUARD", true) {
+		t.Fatal("ARTEX_ENABLE_PLANNER_PROBE_GUARD must default to true when unset")
+	}
+	t.Setenv("ARTEX_ENABLE_PLANNER_PROBE_GUARD", "0")
+	if envBoolFlag("ARTEX_ENABLE_PLANNER_PROBE_GUARD", true) {
+		t.Fatal("ARTEX_ENABLE_PLANNER_PROBE_GUARD=0 must allow explicit opt-out")
+	}
 }
 

@@ -121,14 +121,20 @@ func isTransientSettlementError(err error) bool {
 	return false
 }
 
+var errStopLossUnsettled = errors.New("worker stop-loss latched with zero post-latch writes")
+
 func (w *Worker) recoverSettlement(ctx context.Context, previous *agentcore.Session, opts agentcore.Options, settle *harness.Settlement, runErr error, tsx *ToolSet, emit func(db.Activity)) error {
 	b, ok := ctx.Value(runBudgetKey{}).(runBudget)
-	if !ok || b.reserve <= 0 || ctx.Err() != nil || (!isRunBudgetError(runErr) && !IsCallTimeout(runErr)) {
+	stopLossSettling := errors.Is(runErr, errStopLossUnsettled)
+	if !ok || b.reserve <= 0 || ctx.Err() != nil || (!isRunBudgetError(runErr) && !IsCallTimeout(runErr) && !stopLossSettling) {
 		return nil
 	}
 	why := "run_budget"
 	hard := b.hardDeadline()
-	if IsCallTimeout(runErr) {
+	if stopLossSettling {
+		why = "stop_loss"
+		hard = minTime(hard, time.Now().Add(b.reserve))
+	} else if IsCallTimeout(runErr) {
 		why = "call_timeout"
 		hard = minTime(hard, time.Now().Add(b.reserve))
 	}
@@ -181,9 +187,24 @@ func (w *Worker) recoverSettlement(ctx context.Context, previous *agentcore.Sess
 			tools = append(tools, tool)
 		}
 	}
+	if h, ok := opts.Hooks.(stopLossHooks); ok {
+		opts.Hooks = h.inner
+	}
 	opts.Tools, opts.Settlement = tools, nil
 	opts.MaxTurns, opts.MaxDuration = settle.MaxTurns, time.Until(hard)
-	opts.Provider = &runBudgetProvider{inner: opts.Provider, calls: &calls}
+	innerProv := w.prov
+	if innerProv == nil {
+		if rbp, ok := opts.Provider.(*runBudgetProvider); ok && rbp.inner != nil {
+			innerProv = rbp.inner
+		} else {
+			innerProv = opts.Provider
+		}
+	}
+	opts.Provider = &runBudgetProvider{inner: innerProv, calls: &calls}
+	// Rebuild QueryDeps against the fresh recovery provider so SideQuestion /
+	// calls telemetry don't stay pinned to the initial runBudgetProvider.
+	opts.Deps = harness.QueryDeps{}
+	ctx = attachSideCapture(ctx, &opts)
 	b.recovery = true
 	ctx = context.WithValue(ctx, runBudgetKey{}, b)
 	s := agentcore.NewSession(opts)
@@ -199,7 +220,7 @@ func (w *Worker) recoverSettlement(ctx context.Context, previous *agentcore.Sess
 		snapshotMsgs = s.Messages()
 	}
 	prompt := settle.Prompt
-	if isRunBudgetError(runErr) {
+	if isRunBudgetError(runErr) || stopLossSettling {
 		if p := settle.PromptByReason[harness.ReasonTimeout]; p != "" {
 			prompt = p
 		}
@@ -210,6 +231,14 @@ func (w *Worker) recoverSettlement(ctx context.Context, previous *agentcore.Sess
 	for attempt := 0; ; attempt++ {
 		_, _, recoveryErr = captureRunSession(ctx, s, prompt, emit)
 		if recoveryErr == nil {
+			after := tsx.Writes()
+			if (after.Facts+after.Assets+after.Findings) == 0 && tsx != nil && tsx.ts != nil && ctx.Err() == nil {
+				msgs := s.Messages()
+				if len(msgs) == 0 {
+					msgs = snapshotMsgs
+				}
+				w.recordDeterministicPartialProgress(ctx, tsx, msgs, why, nil)
+			}
 			return nil
 		}
 		if ctx.Err() != nil || !isTransientSettlementError(recoveryErr) {
@@ -316,8 +345,12 @@ func (w *Worker) recordDeterministicPartialProgress(ctx context.Context, tsx *To
 		return
 	}
 	var detail strings.Builder
+	errMsg := "none"
+	if recoveryErr != nil {
+		errMsg = clipPlainRunes(recoveryErr.Error(), 160)
+	}
 	fmt.Fprintf(&detail, "partial_progress（结算原因=%s，结算 LLM 错误=%s）；自动保存最近 %d 步已观察工具调用与输出：\n",
-		reason, clipPlainRunes(recoveryErr.Error(), 160), len(steps))
+		reason, errMsg, len(steps))
 	var lastEvidence string
 	for i, st := range steps {
 		status := "ok"

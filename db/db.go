@@ -426,16 +426,21 @@ ON CONFLICT DO NOTHING`, r.kind, r.pattern, r.note); err != nil {
 // builtinSkillVisibility maps a normalized shipped skill's directory name → the
 // built-in agent keys that should see it by default.
 //
-// 归一化后的 5 个正交技能默认可见性：
-//   - worker：仅看单目标高频实战技能（js-api-recon / tbhm-app-analysis / playwright-cli）
-//   - mainagent / pentest / auto：全 5 个可见（含外部测绘 tbhm-recon 与 ScopeSentry 平台管理）
+// 归一化后的 5 个正交基础技能 + 任务 346 复盘新增的 5 个按需战术技能默认可见性：
+//   - worker：高信噪比单目标实战技能 + 编码/WebLogic/内网跳板/域后渗透/AD-Exchange 技能
+//   - mainagent / pentest / auto：全量 10 个可见
 //   - planner / goals / reporter / retester：不绑技能，保持轻量高速
 var builtinSkillVisibility = map[string][]string{
-	"js-api-recon":      {"worker", "mainagent", "pentest", "auto"},
-	"tbhm-app-analysis": {"worker", "mainagent", "pentest", "auto"},
-	"playwright-cli":    {"worker", "mainagent", "pentest", "auto"},
-	"tbhm-recon":        {"mainagent", "pentest", "auto"},
-	"scopesentry":       {"mainagent", "pentest", "auto"},
+	"js-api-recon":              {"worker", "mainagent", "pentest", "auto"},
+	"tbhm-app-analysis":         {"worker", "mainagent", "pentest", "auto"},
+	"playwright-cli":            {"worker", "mainagent", "pentest", "auto"},
+	"tbhm-recon":                {"mainagent", "pentest", "auto"},
+	"scopesentry":               {"mainagent", "pentest", "auto"},
+	"cross-os-payload-encoding": {"worker", "mainagent", "pentest", "auto"},
+	"weblogic-java-rce":         {"worker", "mainagent", "pentest", "auto"},
+	"multi-hop-pivoting":        {"worker", "mainagent", "pentest", "auto"},
+	"windows-ad-postex":         {"worker", "mainagent", "pentest", "auto"},
+	"ad-exchange-relay":         {"worker", "mainagent", "pentest", "auto"},
 }
 
 // seedBuiltinSkillVisibility binds the shipped built-in skills to their default

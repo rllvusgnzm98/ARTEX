@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -190,8 +191,63 @@ func parseCandidateIP(raw string) net.IP {
 	return net.ParseIP(raw)
 }
 
+// CSegment24 maps an IPv4 address to its /24 CIDR and an IPv6 address to its
+// /48 CIDR. Non-IP inputs return "".
+func CSegment24(ipStr string) string {
+	ipStr = stripHostPort(strings.TrimSpace(ipStr))
+	if ipStr == "" {
+		return ""
+	}
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return ""
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return fmt.Sprintf("%d.%d.%d.0/24", v4[0], v4[1], v4[2])
+	}
+	_, ipnet, err := net.ParseCIDR(ip.String() + "/48")
+	if err != nil {
+		return ""
+	}
+	return ipnet.String()
+}
+
+var interfaceAddrsFn = net.InterfaceAddrs
+
+func localHostAndCallbackIPs() []net.IP {
+	var out []net.IP
+	if addrs, err := interfaceAddrsFn(); err == nil {
+		for _, a := range addrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip != nil {
+				out = append(out, ip)
+			}
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("ARTEX_CALLBACK_ADDR")); raw != "" {
+		if ip := net.ParseIP(stripHostPort(raw)); ip != nil {
+			out = append(out, ip)
+		}
+	}
+	return out
+}
+
 func isLocalScopeIP(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+		return true
+	}
+	for _, localIP := range localHostAndCallbackIPs() {
+		if localIP != nil && localIP.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // evaluateAutoScope checks whether an auto-scope candidate should be written to
@@ -296,6 +352,11 @@ func evaluateAutoScope(existing []TaskScope, cand TaskScope) (autoScopeDecision,
 		if isLocalScopeIP(candIP) {
 			return autoScopeSkip, "", ""
 		}
+		if candIP.IsPrivate() {
+			if seg := CSegment24(candIP.String()); seg != "" {
+				return autoScopePending, "cidr", seg
+			}
+		}
 		return autoScopePending, "ip", candIP.String()
 	}
 	if candDomain == "localhost" || strings.HasSuffix(candDomain, ".localhost") {
@@ -313,6 +374,10 @@ func evaluateAutoScope(existing []TaskScope, cand TaskScope) (autoScopeDecision,
 func (s *AssetStore) AddAutoScope(taskID int64, assetType, domain, rawURL, ip string) error {
 	return s.AddAutoScopeCtx(context.Background(), taskID, assetType, domain, rawURL, ip)
 }
+
+// PendingScopeCreated is invoked after AddAutoScopeCtx inserts a brand-new
+// pending_scope row so the server can emit a concise operator notification.
+var PendingScopeCreated func(taskID int64, kind, value, example string)
 
 func (s *AssetStore) AddAutoScopeCtx(ctx context.Context, taskID int64, assetType, domain, rawURL, ip string) error {
 	s = s.withContext(ctx)
@@ -333,8 +398,17 @@ func (s *AssetStore) AddAutoScopeCtx(ctx context.Context, taskID int64, assetTyp
 		return s.upsertTaskScope(cand)
 	case autoScopePending:
 		if s.db != nil && pendingKind != "" && pendingVal != "" {
-			_, err := s.UpsertPendingScope(taskID, pendingKind, pendingVal)
-			return err
+			created, err := s.UpsertPendingScope(taskID, pendingKind, pendingVal)
+			if err != nil {
+				return err
+			}
+			if created && PendingScopeCreated != nil {
+				example := pendingVal
+				if parsed := parseCandidateIP(cand.Net); parsed != nil {
+					example = parsed.String()
+				}
+				PendingScopeCreated(taskID, pendingKind, pendingVal, example)
+			}
 		}
 		return nil
 	default:

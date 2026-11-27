@@ -141,8 +141,9 @@ func TestEvaluateAutoScopeContainment(t *testing.T) {
 		{"in-scope IP-literal HTTP service", autoScopeCandidate(1, "service", "", "http://192.168.111.20:8080/login", ""), autoScopeAllow, "", ""},
 		{"out-of-scope subdomain routed to pending", autoScopeCandidate(1, "subdomain", "evil.other.test", "", ""), autoScopePending, "subdomain", "evil.other.test"},
 		{"broader root_domain must not match exact subdomain", autoScopeCandidate(1, "root_domain", "partner.test", "", ""), autoScopePending, "root_domain", "partner.test"},
-		{"out-of-scope IP routed to pending", autoScopeCandidate(1, "ip", "", "", "192.168.52.30"), autoScopePending, "ip", "192.168.52.30"},
-		{"out-of-scope IP-literal service routed to pending", autoScopeCandidate(1, "service", "", "http://192.168.52.30:8080/", ""), autoScopePending, "ip", "192.168.52.30"},
+		{"out-of-scope private IP aggregates to /24 cidr", autoScopeCandidate(1, "ip", "", "", "192.168.52.30"), autoScopePending, "cidr", "192.168.52.0/24"},
+		{"out-of-scope private IP-literal service aggregates to /24 cidr", autoScopeCandidate(1, "service", "", "http://192.168.52.30:8080/", ""), autoScopePending, "cidr", "192.168.52.0/24"},
+		{"out-of-scope public IP stays /32 ip", autoScopeCandidate(1, "ip", "", "", "203.0.113.45"), autoScopePending, "ip", "203.0.113.45"},
 		{"explicitly excluded subdomain skipped", autoScopeCandidate(1, "subdomain", "blog.acme.test", "", ""), autoScopeSkip, "", ""},
 		{"explicitly excluded CIDR IP skipped", autoScopeCandidate(1, "ip", "", "", "10.99.1.5"), autoScopeSkip, "", ""},
 		{"loopback IP skipped when trusted scope exists", autoScopeCandidate(1, "ip", "", "", "127.0.0.1"), autoScopeSkip, "", ""},
@@ -153,6 +154,12 @@ func TestEvaluateAutoScopeContainment(t *testing.T) {
 			t.Errorf("%s: got (%v, %q, %q), want (%v, %q, %q)",
 				tc.name, gotDec, gotKind, gotVal, tc.wantDec, tc.wantKind, tc.wantValue)
 		}
+	}
+
+	// Local/callback interface IP is skipped by isLocalScopeIP unless explicitly trusted.
+	t.Setenv("ARTEX_CALLBACK_ADDR", "192.168.111.25:8443")
+	if dec, _, _ := evaluateAutoScope(trusted, autoScopeCandidate(1, "ip", "", "", "192.168.111.25")); dec != autoScopeSkip {
+		t.Fatalf("callback/local IP should be autoScopeSkip, got %v", dec)
 	}
 }
 
@@ -182,9 +189,28 @@ func TestTaskScopeSeedSourceAndAutoScopeContainmentDB(t *testing.T) {
 		t.Fatalf("AddAgentScope(seed): %v", err)
 	}
 
-	// Out-of-scope AddAutoScope must NOT expand task_scope and MUST write pending_scope.
+	var notifications []string
+	prevHook := PendingScopeCreated
+	PendingScopeCreated = func(tid int64, kind, val, example string) {
+		if tid == task.ID {
+			notifications = append(notifications, kind+":"+val+":"+example)
+		}
+	}
+	t.Cleanup(func() { PendingScopeCreated = prevHook })
+
+	// Multiple out-of-scope private IPs in the same /24 aggregate to 1 cidr row (hits=2, 1 notification).
+	t.Setenv("ARTEX_CALLBACK_ADDR", "192.168.111.25:8443")
+	if err := as.AddAutoScope(task.ID, "ip", "", "", "192.168.111.25"); err != nil {
+		t.Fatalf("AddAutoScope(local callback ip): %v", err)
+	}
 	if err := as.AddAutoScope(task.ID, "ip", "", "", "192.168.52.30"); err != nil {
-		t.Fatalf("AddAutoScope(out-of-scope ip): %v", err)
+		t.Fatalf("AddAutoScope(out-of-scope private ip 1): %v", err)
+	}
+	if err := as.AddAutoScope(task.ID, "ip", "", "", "192.168.52.31"); err != nil {
+		t.Fatalf("AddAutoScope(out-of-scope private ip 2): %v", err)
+	}
+	if err := as.AddAutoScope(task.ID, "ip", "", "", "203.0.113.45"); err != nil {
+		t.Fatalf("AddAutoScope(out-of-scope public ip): %v", err)
 	}
 	if err := as.AddAutoScope(task.ID, "subdomain", "lateral.other.test", "", ""); err != nil {
 		t.Fatalf("AddAutoScope(out-of-scope subdomain): %v", err)
@@ -202,13 +228,22 @@ func TestTaskScopeSeedSourceAndAutoScopeContainmentDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListPendingScope: %v", err)
 	}
-	gotPending := map[string]bool{}
+	gotPending := map[string]PendingScope{}
 	for _, p := range pending {
-		gotPending[p.Kind+":"+p.Value] = true
+		gotPending[p.Kind+":"+p.Value] = p
 	}
-	for _, want := range []string{"ip:192.168.52.30", "subdomain:lateral.other.test"} {
-		if !gotPending[want] {
+	for _, want := range []string{"cidr:192.168.52.0/24", "ip:203.0.113.45", "subdomain:lateral.other.test"} {
+		if _, ok := gotPending[want]; !ok {
 			t.Errorf("pending_scope missing %s; got %+v", want, pending)
 		}
+	}
+	if _, leaked := gotPending["ip:192.168.111.25"]; leaked {
+		t.Fatalf("local callback IP leaked into pending_scope: %+v", pending)
+	}
+	if hits := gotPending["cidr:192.168.52.0/24"].Hits; hits != 2 {
+		t.Errorf("cidr:192.168.52.0/24 hits = %d, want 2", hits)
+	}
+	if len(notifications) != 3 {
+		t.Errorf("expected 3 PendingScopeCreated notifications (1 per unique pending entry), got %v", notifications)
 	}
 }

@@ -179,3 +179,42 @@ func TestWorkerExecuteStaticSystemPromptAndNoOutOfScopeAutoExpand(t *testing.T) 
 	}
 	_ = json.Marshal
 }
+
+func TestAddTaskScopePerEntryReasonAndExcludeIP(t *testing.T) {
+	dsn, _, err := db.DSN()
+	if err != nil {
+		t.Skipf("no database config (%v)", err)
+	}
+	pg, err := db.Open(dsn)
+	if err != nil {
+		t.Skipf("postgres unavailable (%v)", err)
+	}
+	defer pg.Close()
+
+	task, err := pg.CreateTask("add_task_scope per-entry reason", "fixture", nil, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	defer func() { _ = pg.DeleteTask(task.ID) }()
+
+	tsx := NewToolSet(pg.Exploration(task.ExplorationID), "goals")
+	tsx.SetTaskID(task.ID)
+	tsx.SetAssetStore(pg.Assets(), pg.Companies())
+	tool := tsx.addTaskScope()
+
+	res, err := tool.Call(context.Background(), json.RawMessage(`{"entries":[{"kind":"ip","value":"192.168.111.79","reason":"seed target"},{"kind":"exclude_ip","value":"192.168.111.25","reason":"attacker host"}]}`), nil)
+	if err != nil || res.IsError {
+		t.Fatalf("add_task_scope failed: res=%s err=%v", res.Flatten(), err)
+	}
+	rows, err := pg.Assets().ListTaskScope(task.ID)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("expected 2 task_scope rows, got %+v err=%v", rows, err)
+	}
+	reasons := map[string]string{}
+	for _, r := range rows {
+		reasons[r.Kind+":"+r.Net] = r.Reason
+	}
+	if reasons["ip:192.168.111.79/32"] != "seed target" || reasons["exclude_ip:192.168.111.25/32"] != "attacker host" {
+		t.Fatalf("per-entry reasons not persisted cleanly: %+v", reasons)
+	}
+}

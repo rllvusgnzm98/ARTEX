@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -373,6 +375,23 @@ func RecordFindingTx(ctx context.Context, tx *sql.Tx, health *PersistenceHealth,
 			return nil, errors.New("intent_id 必须是本任务的意图（关联任务意图只读）")
 		}
 	}
+	if dupID, dupNodeID, matched, err := findDuplicateConfirmedFindingTx(ctx, tx, in); err != nil {
+		return nil, err
+	} else if matched {
+		if in.IntentID > 0 {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_edges(exploration_id,src_id,rel,dst_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, in.ExplorationID, in.IntentID, RelYields, dupNodeID); err != nil {
+				return nil, err
+			}
+		}
+		if err := AddFindingTrafficTxCtx(ctx, tx, dupID, prepared); err != nil {
+			return nil, err
+		}
+		tf, err := FindingTrafficTx(tx, dupID)
+		if err != nil {
+			return nil, err
+		}
+		return &RecordedFinding{FindingID: dupID, NodeID: dupNodeID, Traffic: tf}, nil
+	}
 	payload, _ := json.Marshal(map[string]any{"vulnclass": in.VulnClass, "name": in.Name, "severity": in.Severity, "summary": in.Summary, "evidence": map[string]any{"by": in.Worker, "poc": in.Evidence}})
 	out := &RecordedFinding{}
 	if err := tx.QueryRowContext(ctx, `INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
@@ -422,6 +441,77 @@ VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, in.TaskID, out.NodeI
 	var err error
 	out.Traffic, err = FindingTrafficTx(tx, out.FindingID)
 	return out, err
+}
+
+var reFindingCVE = regexp.MustCompile(`(?i)\bCVE-\d{4}-\d{4,7}\b`)
+
+func extractFindingCVEs(text string) []string {
+	raw := reFindingCVE.FindAllString(text, -1)
+	if len(raw) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(raw))
+	for _, c := range raw {
+		u := strings.ToUpper(c)
+		if !seen[u] {
+			seen[u] = true
+			out = append(out, u)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+func sameSortedInt64Set(a, b []int64) bool {
+	if len(a) == 0 || len(a) != len(b) {
+		return false
+	}
+	sa := append([]int64(nil), a...)
+	sb := append([]int64(nil), b...)
+	slices.Sort(sa)
+	slices.Sort(sb)
+	return slices.Equal(sa, sb)
+}
+
+func findDuplicateConfirmedFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput) (int64, int64, bool, error) {
+	if in.TaskID <= 0 || len(in.AssetIDs) == 0 {
+		return 0, 0, false, nil
+	}
+	rows, err := tx.QueryContext(ctx, `
+SELECT f.id, f.node_id, COALESCE(f.vulnclass,''), COALESCE(f.name,''), COALESCE(f.asset_ids::text,'[]')
+FROM findings f
+JOIN exploration_nodes n ON n.id = f.node_id
+WHERE f.task_id = $1 AND n.state = 'confirmed'
+ORDER BY f.id ASC`, in.TaskID)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	defer rows.Close()
+
+	inCVEs := extractFindingCVEs(in.VulnClass + " " + in.Name)
+	inVC := strings.TrimSpace(in.VulnClass)
+	inName := strings.TrimSpace(in.Name)
+
+	for rows.Next() {
+		var fid, nid int64
+		var vc, name, rawAssets string
+		if err := rows.Scan(&fid, &nid, &vc, &name, &rawAssets); err != nil {
+			return 0, 0, false, err
+		}
+		var existingAssets []int64
+		if json.Unmarshal([]byte(rawAssets), &existingAssets) != nil || !sameSortedInt64Set(existingAssets, in.AssetIDs) {
+			continue
+		}
+		exCVEs := extractFindingCVEs(vc + " " + name)
+		if len(inCVEs) > 0 && slices.Equal(inCVEs, exCVEs) {
+			return fid, nid, true, nil
+		}
+		if inName != "" && strings.EqualFold(strings.TrimSpace(vc), inVC) && strings.EqualFold(strings.TrimSpace(name), inName) {
+			return fid, nid, true, nil
+		}
+	}
+	return 0, 0, false, rows.Err()
 }
 
 // RecordFinding is the atomic legacy/no-recorder path used by tools and tests.

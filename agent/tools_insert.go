@@ -502,15 +502,15 @@ func (t *ToolSet) addTaskScope() actool.CoreTool {
 	return writeTool(
 		"add_task_scope",
 		"把测试范围加入【本任务】——这是本任务的授权边界，也是资产测试覆盖度的分母。\n"+
-			"kind 支持：company(整个公司名下资产) / root_domain(整个根域，含所有子域) / subdomain(单个精确子域) / ip / cidr / icp / keyword。\n"+
-			"说明：worker 逐个碰到的主机会被系统【自动】加进范围(精确子域)；本工具用于【主动扩大】——把整个根域/整个公司纳入，或补充指定某子域/IP。\n"+
-			"value：company 传公司名或 id(公司须已存在)；root_domain/subdomain 传域名；ip/cidr 传 IP 或网段；icp/keyword 传备案号或企业关键词。\n"+
-			"务必给 reason 说明依据(可审计)。多条用 entries 数组。",
+			"kind 支持：company(整个公司名下资产) / root_domain(整个根域，含所有子域) / subdomain(单个精确子域) / ip / cidr / icp / keyword，以及反向排除 exclude_root_domain / exclude_subdomain / exclude_ip / exclude_cidr。\n"+
+			"说明：worker 逐个碰到的主机会被系统【自动】加进范围(精确子域，若任务已有可信范围则范围外内网段按 /24 进 pending_scope)；本工具用于【主动扩大/排除】。\n"+
+			"value：company 传公司名或 id(公司须已存在)；root_domain/subdomain 传域名；ip/cidr 传 IP 或网段；icp/keyword 传备案号或企业关键词；exclude_* 传需排除的域名/IP/CIDR。\n"+
+			"务必给 reason 说明依据(可审计)。多条用 entries 数组（reason 可写在顶层或每条 entry 内）。",
 		obj(map[string]any{
-			"entries": map[string]any{"type": "array", "description": "批量：[{kind, value}]。kind∈company/root_domain/subdomain/ip/cidr/icp/keyword。", "items": map[string]any{"type": "object"}},
-			"kind":    str("[单条] company / root_domain / subdomain / ip / cidr / icp / keyword"),
+			"entries": map[string]any{"type": "array", "description": "批量：[{kind, value, reason?}]。kind∈company/root_domain/subdomain/ip/cidr/icp/keyword/exclude_*。", "items": map[string]any{"type": "object"}},
+			"kind":    str("[单条] company / root_domain / subdomain / ip / cidr / icp / keyword / exclude_root_domain / exclude_subdomain / exclude_ip / exclude_cidr"),
 			"value":   str("[单条] 公司名或id / 域名 / IP / CIDR / ICP / 关键词"),
-			"reason":  str("加入依据(用于审计)，务必填写"),
+			"reason":  str("加入或排除依据(用于审计)，务必填写"),
 		}),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.as == nil {
@@ -520,8 +520,9 @@ func (t *ToolSet) addTaskScope() actool.CoreTool {
 				return actool.Errorf("add_task_scope 需要任务上下文(当前无 task)"), nil
 			}
 			type scopeEntry struct {
-				Kind  string `json:"kind"`
-				Value string `json:"value"`
+				Kind   string `json:"kind"`
+				Value  string `json:"value"`
+				Reason string `json:"reason"`
 			}
 			var a struct {
 				Entries    []scopeEntry `json:"entries"`
@@ -537,14 +538,22 @@ func (t *ToolSet) addTaskScope() actool.CoreTool {
 			if strings.TrimSpace(t.scopeSource) == "seed" {
 				src = "seed"
 			}
-			reason := strings.TrimSpace(a.Reason)
-			if src == "agent" && reason == "" {
-				return actool.Errorf("add_task_scope 必须填写 reason 说明范围依据（便于审计）"), nil
+			topReason := strings.TrimSpace(a.Reason)
+			if src == "agent" {
+				for _, e := range items {
+					if topReason == "" && strings.TrimSpace(e.Reason) == "" {
+						return actool.Errorf("add_task_scope 必须填写 reason 说明范围依据（便于审计）"), nil
+					}
+				}
 			}
 			var added []map[string]any
 			errs := map[string]string{}
 			for i, e := range items {
-				ts, err := t.as.AddAgentScopeCtx(ctx, t.taskID, strings.TrimSpace(e.Kind), e.Value, reason, src)
+				entryReason := strings.TrimSpace(e.Reason)
+				if entryReason == "" {
+					entryReason = topReason
+				}
+				ts, err := t.as.AddAgentScopeCtx(ctx, t.taskID, strings.TrimSpace(e.Kind), e.Value, entryReason, src)
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
 					continue

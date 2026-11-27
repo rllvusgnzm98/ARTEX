@@ -15,6 +15,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent/chainskel"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/harness"
@@ -296,10 +297,20 @@ func proxyEnv(proxyAddr, caCert string) []string {
 	if proxyAddr == "" {
 		return nil
 	}
+	noProxyParts := []string{"127.0.0.1", "localhost", "::1"}
+	seenNoProxy := map[string]bool{"127.0.0.1": true, "localhost": true, "::1": true}
+	for _, h := range guard.LocalExemptHosts() {
+		if h != "" && !seenNoProxy[h] {
+			seenNoProxy[h] = true
+			noProxyParts = append(noProxyParts, h)
+		}
+	}
+	noProxy := strings.Join(noProxyParts, ",")
 	env := []string{
 		"HTTP_PROXY=" + proxyAddr, "HTTPS_PROXY=" + proxyAddr,
 		"http_proxy=" + proxyAddr, "https_proxy=" + proxyAddr,
 		"ALL_PROXY=" + proxyAddr, "all_proxy=" + proxyAddr, // socks5 egress: curl reads only this
+		"NO_PROXY=" + noProxy, "no_proxy=" + noProxy,
 		"NODE_USE_ENV_PROXY=1", // Node 24+: honor HTTP(S)_PROXY in built-in fetch/http
 	}
 	if caCert != "" {
@@ -332,7 +343,7 @@ const workerDefaultTmpl = `你是授权安全测试与红队行动的"执行者"
 **红队单兵铁律**：
 1. **一单只打一靶，严禁越权自调度**：只执行本条意图锁定的目标与假设。即使提前完成，或从响应头/报错/源码里发现本意图之外的新域名、旁路服务、另一条攻击链线索，**一律通过 insert_assets / record_fact 交回规划者统筹排单，严禁私自拉取未分配目标列表或连续切换新靶开打**。
 	2. **边界异味深挖与诚实结论**：初次受阻（WAF 拦截 / 403 / HTTP 500 / 无回显）往往意味触及后端解析或过滤边界——穷尽本方向的编码变形、Content-Type 切换、参数污染与逻辑绕过再输出判断；写事实须如实标注**实测覆盖边界**（如"已测标准 Web 端口"），严禁未扫其他端口就妄断"仅开放某端口"，更严禁凭 HTTP 500 轻率定性为"目标损坏/不可利用"（手段未穷尽或属推断一律标 confidence=inferred）。
-3. **边缘感知与授权红线**：严格遵守顶部【操作约束】与脚印红线；先判目标是否位于 CDN/WAF 共享边缘，避免对共享边缘 IP 做无意义全端口扫描。
+3. **边缘感知与授权红线**：严格遵守顶部【操作约束】与脚印红线；先判目标是否位于 CDN/WAF 共享边缘，避免对共享边缘 IP 做无意义全端口扫描。**严禁修改宿主机网络、路由、防火墙或启停系统级服务**（如 ip route / iptables / openvpn / systemctl）；若目标连续多次网络层超时不可达，如实通过 record_fact(category="scope_limit" 或 "negative_result") 记录阻塞现象后立即收队，切勿自行排障宿主机网络或盲目长时 sleep。
 
 **高信噪比写回与赏金级实锤门禁（Signal Gate）**：
 - **新资产 → insert_assets**：登记子域 / service / endpoint / 指纹 / 认证信息等资产本身；探索结论不写这里。
@@ -340,8 +351,8 @@ const workerDefaultTmpl = `你是授权安全测试与红队行动的"执行者"
 - **确认漏洞 → report_finding（传 intent_id 与简明漏洞标题 name）**：**仅限本次亲自触发、具备跨安全边界真实危害（如 RCE、SQLi/SSRF 实锤、跨租户/越权读写、核心凭据/数据泄露等）且拿到可复现请求/响应或命令输出证据时使用**。纯版本号暴露、缺安全头、无凭据 CORS 反射、Self-XSS、未证实接管的悬空解析或仅靠版本推断的疑似 CVE，**严禁调用 report_finding 充数**（有可串联价值的高潜怀疑点用 record_fact 记 inferred 交规划者）。
 
 **专项技能与扩展工具**：
-- 遇到前端 SPA/打包 JS 逆向提取隐藏 API 与签名算法、Web 业务热点审计、需真实浏览器交互、跨系统载荷编码、Java/WebLogic 评估、多层内网跳板或 Windows/AD 后渗透等场景时，先查 Skill 工具列表按需加载已装配的对应技能（如 js-api-recon / tbhm-app-analysis / playwright-cli 等按需技能）。
-- 涉及双账号/多租户越权（IDOR/BOLA）验证或立足点会话纳管时，按需检索并调用 dual_account_verify、register_session 等扩展工具。
+- 遇到前端 SPA/打包 JS 逆向提取隐藏 API 与签名算法、Web 业务热点审计、需真实浏览器交互、跨系统载荷编码、Java/WebLogic 评估、多层内网跳板或 Windows/AD 后渗透等场景时，先查 Skill 工具列表按需加载已装配的对应技能（如 js-api-recon / tbhm-app-analysis / playwright-cli / cross-os-payload-encoding / weblogic-java-rce / multi-hop-pivoting / windows-ad-postex / ad-exchange-relay 等）。
+- 涉及双账号/多租户越权（IDOR/BOLA）验证、立足点会话或内网端口转发/SOCKS 通道纳管时，按需检索并调用 dual_account_verify、register_session、tunnel_register 等扩展工具。
 
 完成本意图后用一句话总结你做了什么、写回了哪些核心结论。
 
@@ -349,11 +360,12 @@ const workerDefaultTmpl = `你是授权安全测试与红队行动的"执行者"
 
 // workerIntranetDiscipline 是内网期追加进 worker 正文的短纪律段落(可编辑变体
 // "worker.intranet")。只追加,不替换 worker 默认正文,也不覆盖进场预塞。
-// 不把 pending_scope 写成出界动作的硬门闩,也不提隧道四件套(本刀不移植)。
+// 不把 pending_scope 写成出界动作的硬门闩；外部自建转发与会话需按需登记复用。
 const workerIntranetDiscipline = `**内网期纪律**(本任务已有存活立足点会话,处于内网横向阶段):
 - **被动优先**:新方向先用 session_recon 只读命令包(网卡/路由/邻居/hosts/监听)拿信息,被动不够再考虑主动探测。
 - **新网段进扩展队列**:出当前 task_scope 的 IP 可以已经写入资产图,并按 /24 记入 pending_scope。pending_scope 是官方的 task_scope 扩展队列:人工 approve 后写入 task_scope;它不是对出界动作的硬门闩,不要把资产写回或后续动作卡在「批准之前」。
 - **下一跳要挂边或锚**:从已确认的侦察事实开下一跳时,必须经 add_intent 带上 parent_ids(该 fact,形成 derived_from)或对应资产的 asset_ids。既无边也无锚的新意图,进场预塞看不到这些已确认事实。
+- **会话与隧道复用**:立足点会话优先用 register_session 纳管，已建立的端口转发/SOCKS 代理用 tunnel_register 登记入库，公共脚本与战果产物放入 <taskDir>/shared/ 并在 fact 中附 artifact_paths。
 - **动静控制**:经会话执行的命令注意目标侧日志/进程/网络留痕,避免大批量高噪声动作。`
 
 // workerIntranetRules 是内网期的代码固定尾(不可被 DB 变体正文覆盖)。
@@ -896,6 +908,11 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		if recErr := w.recoverSettlement(ctx, s, opts, settle, err, tsx, emitWrap); recErr != nil && isTransientSettlementError(recErr) {
 			err = &SettlementTransientError{BudgetErr: err, RecoveryErr: recErr}
 		}
+	} else if wroteAfter, ok := budgetProvider.loss.WritesSinceLatch(); ok && wroteAfter == 0 && ctx.Err() == nil {
+		// StopLoss latched without post-latch DB writes: run write-only settlement
+		// (or deterministic partial_progress fallback) without marking the stalled
+		// intent as a transient retryable outage.
+		_ = w.recoverSettlement(ctx, s, opts, settle, errStopLossUnsettled, tsx, emitWrap)
 	}
 	return reason, tsx.finishEvidenceWrites(), err
 }

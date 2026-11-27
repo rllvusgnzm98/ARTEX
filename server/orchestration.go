@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -508,10 +509,7 @@ func (s *Server) seedOrchestrationTools() {
 	s.seedWorkerFactsRebind()     // 读侧闭环：把 list_facts/list_companies 补绑回 worker(一次性；不覆盖用户事后手动解绑)
 	s.seedAutoReportFindingBinding()
 	s.unbindGoalMetDefault()
-	s.reseedGoalsPrompt()             // goals 提示词加入「抽操作约束」步 → 旧库追加一版新默认(一次性)
-	s.reseedMainAgentPrompt()         // mainagent 提示词加入「目标达成后 add_intent 反问是否建目标」(一次性)
-	s.reseedPlannerPrompt()           // planner 提示词:重写「0 意图」正当理由 + 加量化验收核对(一次性)
-	s.reseedWorkerPrompt()            // worker 提示词:加否定结论证据门槛(一次性)
+	s.refreshBuiltinPrompts()         // 按 SHA-256 同步未人工修改过的内置 agent 默认提示词
 	s.seedReporterAgent()             // 预置「报告撰写」agent + 工具绑定 + finding 触发器(一次性)
 	s.upgradeReporterTriggerMessage() // 老库补迁移:让 reporter 回传 evidence_version(一次性)
 	s.seedFindingTrafficTools()       // 增加可选证据参数及只读证据工具，保留用户配置
@@ -674,123 +672,81 @@ func (s *Server) unbindGoalMetDefault() {
 	_ = s.m.pg.SetSetting(flag, "true")
 }
 
-// reseedGoalsPrompt 把 goals 目标拆解器的提示词刷成【当前代码默认】——因为默认正文新增了
-// 「先抽操作约束(set_constraints)再拆目标」这一步,而 SeedPromptIfEmpty 首插入only,旧库
-// 已有的 version 1 收不到这步。这里用版本管理【追加一个新版本】并切过去(ResetPromptToDefault),
-// 旧的版本仍保留在历史里,用户若自定义过可从版本记录找回。settings flag 守卫 → 只做一次;
-// 以后默认再变就 bump 这个 flag。全新库无需处理(SeedPromptIfEmpty 已 seed 最新默认)。
-func (s *Server) reseedGoalsPrompt() {
-	const flag = "goals_prompt_constraint_step_v1"
-	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
-		return
-	}
-	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // 无论成功与否只尝试一次
-	a, err := s.m.pg.GetAgentByKey("goals")
-	if err != nil || a == nil {
-		return // 全新库尚未建 agent 行时,seedPrompts 会直接 seed 最新默认,无需此迁移
-	}
-	tmpl := agent.BuiltinPromptSeeds()["goals"]
-	if tmpl == "" {
-		return
-	}
-	// 全新库 seedPrompts 已 seed 最新默认 → 当前版本已等于代码默认,不必再追加重复版本。
-	if cur, err := s.m.pg.CurrentPrompt(a.ID); err == nil && cur == tmpl {
-		return
-	}
-	if _, err := s.m.pg.ResetPromptToDefault(a.ID, tmpl); err != nil {
-		log.Printf("[prompts] goals 提示词重刷为新默认失败: %v", err)
-		return
-	}
-	log.Printf("[prompts] goals 提示词已追加新默认版本(加入抽操作约束步,一次性)")
+const promptDefaultHashSettingPrefix = "prompt_default_hash:"
+
+func promptTemplateHash(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
 }
 
-// reseedMainAgentPrompt 把 mainagent 提示词刷成【当前代码默认】——默认正文新增了「目标全部
-// 达成后 add_intent 直投意图时,反问人是否登记为正式目标」这段引导,而 SeedPromptIfEmpty 首插入
-// only,旧库已有版本收不到。用版本管理【追加一个新版本】并切过去(ResetPromptToDefault),旧版本仍
-// 保留在历史里,用户若自定义过可从版本记录找回。settings flag 守卫 → 只做一次。全新库无需处理
-// (SeedPromptIfEmpty 已 seed 最新默认)。与 reseedGoalsPrompt 完全同构。
-func (s *Server) reseedMainAgentPrompt() {
-	const flag = "mainagent_prompt_redteam_v4"
-	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
-		return
+// syncBuiltinAgentPrompt compares an agent's code-default prompt hash against
+// the last synced hash stored in settings (`prompt_default_hash:<key>`),
+// upgrading system-managed defaults via ResetPromptToDefault while preserving
+// any prompt manually customized by an operator.
+func (s *Server) syncBuiltinAgentPrompt(key, codeTmpl string) bool {
+	if s == nil || s.m == nil || s.m.pg == nil || key == "" || codeTmpl == "" {
+		return false
 	}
-	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // 无论成功与否只尝试一次
-	a, err := s.m.pg.GetAgentByKey("mainagent")
+	a, err := s.m.pg.GetAgentByKey(key)
 	if err != nil || a == nil {
-		return // 全新库尚未建 agent 行时,seedPrompts 会直接 seed 最新默认,无需此迁移
+		return false
 	}
-	if managed, err := s.m.pg.IsPromptSystemManaged(a.ID); err == nil && !managed {
-		return // skip overwriting manual operator-customized prompt
+	cur, err := s.m.pg.CurrentPrompt(a.ID)
+	if err != nil {
+		return false
 	}
-	tmpl := agent.BuiltinPromptSeeds()["mainagent"]
-	if tmpl == "" {
-		return
+	codeHash := promptTemplateHash(codeTmpl)
+	dbHash := promptTemplateHash(cur)
+	settingKey := promptDefaultHashSettingPrefix + key
+	lastHash, hasSetting, err := s.m.pg.GetSetting(settingKey)
+	if err != nil {
+		log.Printf("[prompts] read %s failed: %v", settingKey, err)
+		return false
 	}
-	// 全新库 seedPrompts 已 seed 最新默认 → 当前版本已等于代码默认,不必再追加重复版本。
-	if cur, err := s.m.pg.CurrentPrompt(a.ID); err == nil && cur == tmpl {
-		return
+	if cur == codeTmpl {
+		if !hasSetting || lastHash != codeHash {
+			_ = s.m.pg.SetSetting(settingKey, codeHash)
+		}
+		return false
 	}
-	if _, err := s.m.pg.ResetPromptToDefault(a.ID, tmpl); err != nil {
-		log.Printf("[prompts] mainagent 提示词重刷为新默认失败: %v", err)
-		return
+	if hasSetting && lastHash == codeHash {
+		return false
 	}
-	log.Printf("[prompts] mainagent 提示词已升级为红队队长直通指挥席默认版本(一次性)")
+	if managed, merr := s.m.pg.IsPromptSystemManaged(a.ID); merr != nil || !managed {
+		return false
+	}
+	if hasSetting && lastHash != "" && dbHash != lastHash {
+		// DB prompt diverged from the last synced built-in default; keep operator edit.
+		return false
+	}
+	if _, err := s.m.pg.ResetPromptToDefault(a.ID, codeTmpl); err != nil {
+		log.Printf("[prompts] auto-sync %s prompt failed: %v", key, err)
+		return false
+	}
+	if err := s.m.pg.SetSetting(settingKey, codeHash); err != nil {
+		log.Printf("[prompts] save %s failed: %v", settingKey, err)
+	}
+	return true
 }
 
-func (s *Server) reseedPlannerPrompt() {
-	const flag = "planner_prompt_redteam_v5"
-	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
-		return
+// refreshBuiltinPrompts automatically appends updated built-in default prompt
+// versions whenever BuiltinPromptSeeds() changes, respecting manual edits.
+func (s *Server) refreshBuiltinPrompts() {
+	seeds := agent.BuiltinPromptSeeds()
+	keys := make([]string, 0, len(seeds))
+	for k := range seeds {
+		keys = append(keys, k)
 	}
-	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // 无论成功与否只尝试一次
-	a, err := s.m.pg.GetAgentByKey("planner")
-	if err != nil || a == nil {
-		return // 全新库尚未建 agent 行时,seedPrompts 会直接 seed 最新默认,无需此迁移
+	sort.Strings(keys)
+	updated := 0
+	for _, key := range keys {
+		if s.syncBuiltinAgentPrompt(key, seeds[key]) {
+			updated++
+		}
 	}
-	if managed, err := s.m.pg.IsPromptSystemManaged(a.ID); err == nil && !managed {
-		return // skip overwriting manual operator-customized prompt
+	if updated > 0 {
+		log.Printf("[prompts] 已按 default hash 自动同步 %d 个内置 agent 提示词到代码默认", updated)
 	}
-	tmpl := agent.BuiltinPromptSeeds()["planner"]
-	if tmpl == "" {
-		return
-	}
-	// 全新库 seedPrompts 已 seed 最新默认 → 当前版本已等于代码默认,不必再追加重复版本。
-	if cur, err := s.m.pg.CurrentPrompt(a.ID); err == nil && cur == tmpl {
-		return
-	}
-	if _, err := s.m.pg.ResetPromptToDefault(a.ID, tmpl); err != nil {
-		log.Printf("[prompts] planner 提示词重刷为新默认失败: %v", err)
-		return
-	}
-	log.Printf("[prompts] planner 提示词已升级为红队队长条令版本(严禁盲盒自调度+禁止空刷待办,一次性)")
-}
-
-func (s *Server) reseedWorkerPrompt() {
-	const flag = "worker_prompt_redteam_v7"
-	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
-		return
-	}
-	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // 无论成功与否只尝试一次
-	a, err := s.m.pg.GetAgentByKey("worker")
-	if err != nil || a == nil {
-		return // 全新库尚未建 agent 行时,seedPrompts 会直接 seed 最新默认,无需此迁移
-	}
-	if managed, err := s.m.pg.IsPromptSystemManaged(a.ID); err == nil && !managed {
-		return // skip overwriting manual operator-customized prompt
-	}
-	tmpl := agent.BuiltinPromptSeeds()["worker"]
-	if tmpl == "" {
-		return
-	}
-	// 全新库 seedPrompts 已 seed 最新默认 → 当前版本已等于代码默认,不必再追加重复版本。
-	if cur, err := s.m.pg.CurrentPrompt(a.ID); err == nil && cur == tmpl {
-		return
-	}
-	if _, err := s.m.pg.ResetPromptToDefault(a.ID, tmpl); err != nil {
-		log.Printf("[prompts] worker 提示词重刷为新默认失败: %v", err)
-		return
-	}
-	log.Printf("[prompts] worker 提示词已升级为红队突击手默认版本(单目标纪律+Signal门禁+技能引导,一次性)")
 }
 
 // reporterToolCallMessage 必须无条件要求先读一次 get_finding_traffic 再写报告。

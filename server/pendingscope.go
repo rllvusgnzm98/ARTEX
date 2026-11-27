@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -96,25 +95,7 @@ func scopeRulesFromRowsForMode(rows []db.TaskScope, mode string) []guard.ScopeRu
 
 // cSegment24：IPv4 → /24,IPv6 → /48,非法 → ""。
 func cSegment24(ipStr string) string {
-	if ipStr == "" {
-		return ""
-	}
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return ""
-	}
-	if ip.To4() != nil {
-		parts := strings.Split(ipStr, ".")
-		if len(parts) == 4 {
-			return parts[0] + "." + parts[1] + "." + parts[2] + ".0/24"
-		}
-		return ""
-	}
-	_, ipnet, err := net.ParseCIDR(ipStr + "/48")
-	if err != nil {
-		return ""
-	}
-	return ipnet.String()
+	return db.CSegment24(ipStr)
 }
 
 // reconRegisterPendingScope 对侦察新发现的 IP 逐个过当前任务 scope：
@@ -157,6 +138,10 @@ func (s *Server) reconRegisterPendingScope(taskID int64, ips map[string]bool) {
 }
 
 func (s *Server) notifyPendingScope(taskID int64, seg, exampleIP string) {
+	s.notifyPendingScopeItem(taskID, "cidr", seg, exampleIP)
+}
+
+func (s *Server) notifyPendingScopeItem(taskID int64, kind, value, example string) {
 	if s.m == nil || s.engine == nil {
 		return
 	}
@@ -164,13 +149,20 @@ func (s *Server) notifyPendingScope(taskID int64, seg, exampleIP string) {
 	if !ok {
 		return
 	}
-	detail, _ := json.Marshal(map[string]any{
-		"cidr": seg, "example_ip": exampleIP,
+	detailMap := map[string]any{
+		"kind": kind, "value": value,
 		"list_api": fmt.Sprintf("/api/tasks/%d/pending-scope", taskID),
-	})
-	s.engine.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
-		Summary: fmt.Sprintf("发现未授权网段 %s(示例 IP %s),已登记待授权;人工批准后才扩 scope", seg, exampleIP),
-		Detail:  string(detail)})
+	}
+	summary := fmt.Sprintf("发现范围外资产 %s=%s,已登记待授权;人工批准后才扩 scope", kind, value)
+	if kind == "cidr" {
+		detailMap["cidr"] = value
+		detailMap["example_ip"] = example
+		summary = fmt.Sprintf("发现未授权网段 %s(示例 IP %s),已登记待授权;人工批准后才扩 scope", value, example)
+	} else if example != "" && example != value {
+		detailMap["example"] = example
+	}
+	detail, _ := json.Marshal(detailMap)
+	s.engine.emitActivity(t, db.Activity{Worker: "system", Kind: "text", Summary: summary, Detail: string(detail)})
 }
 
 // GET /api/tasks/{id}/pending-scope — 待授权网段列表(默认只 pending,?all=1 含已决)。

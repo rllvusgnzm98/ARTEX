@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -783,6 +784,51 @@ func TestStopLossReportFindingGrantsMilestoneBonus(t *testing.T) {
 		if mon.Fired() {
 			t.Fatalf("milestone bonus should keep run alive at probe %d, verdict=%+v", i+1, mon.Verdict())
 		}
+	}
+}
+
+func TestStopLossSleepAndPollToolsAccountIdleAndPostLatchSharedWrite(t *testing.T) {
+	p := StopLossPolicy{IdleProbeLimit: 6, RepeatCommandLimit: 3, MaxNovelRelief: 16}
+	mon := NewStopLossMonitor(p)
+	writes := WriteCounts{}
+	mon.SetWriteSnapshot(func() (WriteCounts, bool) { return writes, true })
+	hooks := WrapStopLoss(nil, mon)
+
+	// TaskOutput / Monitor polling counts toward IdleProbes (without novel relief)
+	// and does NOT falsely trip repeat_command_limit at 3 polls.
+	for i := 0; i < 4; i++ {
+		hooks.PostToolUse(context.Background(), "TaskOutput", []byte(`{"task_id":"scan-1"}`), []byte(fmt.Sprintf("chunk %d", i)), false)
+	}
+	if sig := mon.Signals(); sig.IdleProbes != 4 || sig.RepeatCount != 0 || mon.Fired() {
+		t.Fatalf("expected 4 IdleProbes and RepeatCount=0 after TaskOutput polls, got sig=%+v fired=%v", sig, mon.Fired())
+	}
+
+	// Long sleep (>=30s) in Bash is NOT exempted even if combined with local read-only cat,
+	// and weights >=60s sleeps so sleep 180 adds 1+3=4 idle probes, latching StopLoss at 8 >= 6.
+	hooks.PostToolUse(context.Background(), "Bash", bashJSON("sleep 180 && cat out.txt"), []byte("done"), false)
+	if !mon.Fired() || mon.Verdict().Kind != StopLossNoProgress {
+		t.Fatalf("long sleep should bypass novel/local exemptions and trip no_progress, verdict=%+v sig=%+v", mon.Verdict(), mon.Signals())
+	}
+
+	// Before any write-back after latch, WritesSinceLatch == (0, true).
+	if after, ok := mon.WritesSinceLatch(); !ok || after != 0 {
+		t.Fatalf("WritesSinceLatch = (%d, %v), want (0, true)", after, ok)
+	}
+
+	// Post-latch Read and bounded Write(shared/...) are permitted; Write outside shared/ is blocked.
+	if blk, msg, _ := hooks.PreToolUse(context.Background(), "Read", []byte(`{"file_path":"/tmp/task/out.txt"}`)); blk {
+		t.Fatalf("post-latch Read should be allowed, got blocked: %q", msg)
+	}
+	for i := 0; i < maxPostLatchSharedWrites; i++ {
+		if blk, msg, _ := hooks.PreToolUse(context.Background(), "Write", []byte(fmt.Sprintf(`{"file_path":"shared/note_%d.md"}`, i))); blk {
+			t.Fatalf("post-latch Write to shared/ (%d) should be allowed, got blocked: %q", i, msg)
+		}
+	}
+	if blk, _, _ := hooks.PreToolUse(context.Background(), "Write", []byte(`{"file_path":"shared/note_extra.md"}`)); !blk {
+		t.Fatal("post-latch Write to shared/ beyond cap must be blocked")
+	}
+	if blk, _, _ := hooks.PreToolUse(context.Background(), "Write", []byte(`{"file_path":"../shared/escape.md"}`)); !blk {
+		t.Fatal("post-latch Write with parent traversal must be blocked")
 	}
 }
 

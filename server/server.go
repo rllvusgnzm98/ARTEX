@@ -253,6 +253,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		s.seedNodeInterpreter()       // Hackbots 的 node 脚本同样只在设置为空时写入
 		s.initEmp3r0r()               // emp3r0r cc sidecar 桥接（enabled 才装配）
 		s.initSessions()              // 立足点会话：Registry + 启动恢复与陈旧探活
+		db.PendingScopeCreated = s.notifyPendingScopeItem
 		s.seedSessionTools()          // register_session / session_recon 默认绑 worker
 		s.seedEmp3r0rTools()          // deploy_emp3r0r 默认绑 worker（启用时）
 		s.initTunnels(dataDir)        // 隧道台账（本刀不拉起外部适配器进程）

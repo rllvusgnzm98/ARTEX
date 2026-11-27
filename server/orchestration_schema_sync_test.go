@@ -72,3 +72,73 @@ func TestCanonicalSchemaHashAndSyncBuiltinToolSchema(t *testing.T) {
 		t.Fatalf("admin edit was overwritten: %+v", row2)
 	}
 }
+
+func TestSyncBuiltinAgentPromptAndSkillVisibility(t *testing.T) {
+	pg := openIntranetTestDB(t)
+	s := &Server{m: &Manager{pg: pg}}
+
+	worker, err := pg.GetAgentByKey("worker")
+	if err != nil || worker == nil {
+		t.Fatalf("GetAgentByKey(worker): %v", err)
+	}
+	names, err := pg.AgentSkillNames(worker.ID)
+	if err != nil {
+		t.Fatalf("AgentSkillNames(worker): %v", err)
+	}
+	visible := map[string]bool{}
+	for _, n := range names {
+		visible[n] = true
+	}
+	for _, want := range []string{
+		"cross-os-payload-encoding",
+		"weblogic-java-rce",
+		"multi-hop-pivoting",
+		"windows-ad-postex",
+		"ad-exchange-relay",
+	} {
+		if !visible[want] {
+			t.Errorf("worker missing built-in tactical skill %q (got %v)", want, names)
+		}
+	}
+
+	key := fmt.Sprintf("test_prompt_agent_%d", time.Now().UnixNano())
+	settingKey := promptDefaultHashSettingPrefix + key
+	if _, err := pg.Exec(`INSERT INTO agents(key, name, role, builtin, enabled) VALUES ($1, $2, 'worker', true, true)`, key, key); err != nil {
+		t.Fatalf("insert test agent: %v", err)
+	}
+	a, err := pg.GetAgentByKey(key)
+	if err != nil || a == nil {
+		t.Fatalf("GetAgentByKey(%s): %v", key, err)
+	}
+	t.Cleanup(func() {
+		_, _ = pg.Exec(`UPDATE agents SET current_prompt_id=NULL WHERE id=$1`, a.ID)
+		_, _ = pg.Exec(`DELETE FROM agent_prompts WHERE agent_id=$1`, a.ID)
+		_, _ = pg.Exec(`DELETE FROM agents WHERE id=$1`, a.ID)
+		_, _ = pg.Exec(`DELETE FROM settings WHERE key=$1`, settingKey)
+	})
+
+	if err := pg.SeedPromptIfEmpty(a.ID, "system prompt v1"); err != nil {
+		t.Fatalf("SeedPromptIfEmpty: %v", err)
+	}
+	// Baseline matches v1 -> no new version appended, hash recorded.
+	if changed := s.syncBuiltinAgentPrompt(key, "system prompt v1"); changed {
+		t.Fatal("unchanged prompt must not trigger sync")
+	}
+	// Code evolves to v2 -> auto-upgrades system-managed prompt.
+	if changed := s.syncBuiltinAgentPrompt(key, "system prompt v2"); !changed {
+		t.Fatal("stale system-managed prompt should auto-sync to v2")
+	}
+	if cur, _ := pg.CurrentPrompt(a.ID); cur != "system prompt v2" {
+		t.Fatalf("CurrentPrompt = %q, want v2", cur)
+	}
+	// Admin customizes prompt -> subsequent v3 must NOT overwrite operator edit.
+	if _, err := pg.SavePrompt(a.ID, "operator custom prompt", "manual tweak", "alice"); err != nil {
+		t.Fatalf("SavePrompt(alice): %v", err)
+	}
+	if changed := s.syncBuiltinAgentPrompt(key, "system prompt v3"); changed {
+		t.Fatal("operator-edited prompt must not be overwritten")
+	}
+	if cur, _ := pg.CurrentPrompt(a.ID); cur != "operator custom prompt" {
+		t.Fatalf("operator custom prompt overwritten: %q", cur)
+	}
+}

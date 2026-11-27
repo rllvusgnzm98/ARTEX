@@ -245,30 +245,33 @@ func IntentStateAfterRun(reason harness.TerminalReason, runErr error, loss StopL
 // StopLossMonitor observes tool use during a run and decides stop-loss.
 // It is safe for concurrent hook calls.
 type StopLossMonitor struct {
-	mu             sync.Mutex
-	policy         StopLossPolicy
-	started        time.Time
-	writes         func() (WriteCounts, bool)
-	writeBaseline  WriteCounts
-	baselineSet    bool
-	verdict        StopLossVerdict
-	factsOK        bool
-	assetsOK       bool
-	cmdsOK         bool
-	newFacts       int
-	newAssets      int
-	newFinds       int
-	idle           int
-	inFlightProbes int
-	repeats        map[string]int
-	maxRepeat      int
-	seenObs        map[string]int
-	novelCount     int
-	milestoneBonus int
-	preWriteNudged bool
-	cleanupUsed    bool
-	turnSeq        int64
-	nudgedTurn     int64
+	mu                    sync.Mutex
+	policy                StopLossPolicy
+	started               time.Time
+	writes                func() (WriteCounts, bool)
+	writeBaseline         WriteCounts
+	baselineSet           bool
+	latchWrites           WriteCounts
+	latched               bool
+	postLatchSharedWrites int
+	verdict               StopLossVerdict
+	factsOK               bool
+	assetsOK              bool
+	cmdsOK                bool
+	newFacts              int
+	newAssets             int
+	newFinds              int
+	idle                  int
+	inFlightProbes        int
+	repeats               map[string]int
+	maxRepeat             int
+	seenObs               map[string]int
+	novelCount            int
+	milestoneBonus        int
+	preWriteNudged        bool
+	cleanupUsed           bool
+	turnSeq               int64
+	nudgedTurn            int64
 }
 
 // NewStopLossMonitor starts observing from now.
@@ -373,25 +376,37 @@ func (m *StopLossMonitor) ObserveToolResult(name string, input, result []byte, i
 			return
 		}
 		if isCountableIdleProbe(name, input) {
+			sleepSec := extractWaitSleepSeconds(name, input)
+			waitLike := isWaitOrPollTool(name) || (name == "Bash" && sleepSec >= 30)
+			idleInc := 1
+			if sleepSec >= 60 {
+				bonus := sleepSec / 60
+				if bonus > 3 {
+					bonus = 3
+				}
+				idleInc += bonus
+			}
 			sig := observationSignature(result, isErr)
 			novelCap := m.policy.novelLimit()
 			switch {
-			case sig == "" || novelCap <= 0 || len(m.seenObs) == 0:
+			case waitLike || sig == "" || novelCap <= 0 || len(m.seenObs) == 0:
 				if sig != "" {
 					m.seenObs[sig]++
 				}
-				m.idle++
+				m.idle += idleInc
 			case m.seenObs[sig] == 0 && m.novelCount < novelCap:
 				m.seenObs[sig] = 1
 				m.novelCount++
 			default:
 				m.seenObs[sig]++
-				m.idle++
+				m.idle += idleInc
 			}
 		}
-		m.repeats[fp]++
-		if m.repeats[fp] > m.maxRepeat {
-			m.maxRepeat = m.repeats[fp]
+		if !isWaitOrPollTool(name) {
+			m.repeats[fp]++
+			if m.repeats[fp] > m.maxRepeat {
+				m.maxRepeat = m.repeats[fp]
+			}
 		}
 		// A genuinely new local file edit (Write/Edit/MultiEdit or local heredoc
 		// script creation) mutates scripts/payloads in the workspace, so re-running
@@ -536,8 +551,37 @@ func (m *StopLossMonitor) recomputeLocked() StopLossVerdict {
 	if v.Fired() {
 		v.Signals = signals
 		m.verdict = v
+		if !m.latched {
+			m.latched = true
+			if m.writes != nil {
+				if w, ok := m.writes(); ok {
+					m.latchWrites = w
+				}
+			}
+		}
 	}
 	return m.verdict
+}
+
+// WritesSinceLatch reports total write-back deltas (facts+assets+findings)
+// recorded after stop-loss latched. Returns (0, false) when stop-loss has not
+// latched or no write snapshot function was configured.
+func (m *StopLossMonitor) WritesSinceLatch() (int, bool) {
+	if m == nil {
+		return 0, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.latched || m.writes == nil {
+		return 0, false
+	}
+	w, ok := m.writes()
+	if !ok {
+		return 0, false
+	}
+	return writeDelta(w.Facts, m.latchWrites.Facts) +
+		writeDelta(w.Assets, m.latchWrites.Assets) +
+		writeDelta(w.Findings, m.latchWrites.Findings), true
 }
 
 // Verdict returns the last fired stop-loss, or a zero verdict.
@@ -697,6 +741,42 @@ func (m *StopLossMonitor) allowPostLatchCleanup(name string, input []byte) bool 
 		return false
 	}
 	m.cleanupUsed = true
+	return true
+}
+
+const maxPostLatchSharedWrites = 2
+
+// allowPostLatchSharedWrite lets a stop-loss-latched worker persist a final
+// cross-intent summary note under <taskDir>/shared/ (without parent traversal)
+// so valuable local intel isn't trapped when stop-loss fires.
+func (m *StopLossMonitor) allowPostLatchSharedWrite(name string, input []byte) bool {
+	if m == nil || name != "Write" || len(input) == 0 {
+		return false
+	}
+	var raw struct {
+		FilePath string `json:"file_path"`
+		Path     string `json:"path"`
+	}
+	if json.Unmarshal(input, &raw) != nil {
+		return false
+	}
+	target := strings.TrimSpace(raw.FilePath)
+	if target == "" {
+		target = strings.TrimSpace(raw.Path)
+	}
+	if target == "" || strings.Contains(target, "..") {
+		return false
+	}
+	slash := filepath.ToSlash(filepath.Clean(target))
+	if !strings.HasPrefix(slash, "shared/") && !strings.Contains(slash, "/shared/") {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.postLatchSharedWrites >= maxPostLatchSharedWrites {
+		return false
+	}
+	m.postLatchSharedWrites++
 	return true
 }
 
@@ -862,7 +942,10 @@ func tokenizeCleanupCurl(command string) ([]string, bool) {
 
 func (h stopLossHooks) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
 	if verdict := h.mon.Verdict(); verdict.Fired() {
-		if !isWriteBackTool(name) && !h.mon.allowPostLatchCleanup(name, input) {
+		if !isWriteBackTool(name) &&
+			name != "Read" &&
+			!h.mon.allowPostLatchSharedWrite(name, input) &&
+			!h.mon.allowPostLatchCleanup(name, input) {
 			return true, verdict.Message() + stopLossPostBlockWriteHint, nil
 		}
 	} else if !steerPending(h.inner) {
@@ -930,9 +1013,62 @@ func isLocalEditTool(name string) bool {
 	}
 }
 
+func isWaitOrPollTool(name string) bool {
+	switch name {
+	case "sleep", "Sleep", "Monitor", "TaskOutput":
+		return true
+	default:
+		return false
+	}
+}
+
+var reBashSleepSeconds = regexp.MustCompile(`(?i)(?:^|[;&|(\s])sleep\s+(\d+)\b`)
+
+func extractWaitSleepSeconds(name string, input []byte) int {
+	if len(input) == 0 {
+		return 0
+	}
+	switch name {
+	case "sleep", "Sleep":
+		var raw struct {
+			Seconds  float64 `json:"seconds"`
+			Duration float64 `json:"duration"`
+			MS       float64 `json:"ms"`
+		}
+		if json.Unmarshal(input, &raw) == nil {
+			if raw.Seconds > 0 {
+				return int(raw.Seconds)
+			}
+			if raw.Duration > 0 {
+				return int(raw.Duration)
+			}
+			if raw.MS > 0 {
+				return int(raw.MS / 1000)
+			}
+		}
+	case "Bash":
+		var raw struct {
+			Command string `json:"command"`
+		}
+		if json.Unmarshal(input, &raw) == nil && raw.Command != "" {
+			total := 0
+			for _, m := range reBashSleepSeconds.FindAllStringSubmatch(raw.Command, -1) {
+				if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+					total += n
+				}
+			}
+			return total
+		}
+	}
+	return 0
+}
+
 func isProbeTool(name string) bool {
 	if name == "" || IsGraphReadTool(name) || isWriteBackTool(name) {
 		return false
+	}
+	if isWaitOrPollTool(name) {
+		return true
 	}
 	switch name {
 	case "Bash", "WebFetch", "web_search", "Write", "Edit", "MultiEdit":
@@ -948,10 +1084,17 @@ func isProbeTool(name string) bool {
 // no_progress idle probe budget. Local workspace edits (Write/Edit/MultiEdit,
 // or local heredoc script writes via Bash) and provably local read-only Bash
 // inspections (e.g. cat/grep/ls on spill output) are preparation/parsing, not
-// target-facing probes.
+// target-facing probes; explicit long sleep (>=30s) or poll tools still count
+// toward idle stagnation so wall-clock wait loops cannot bypass stop-loss.
 func isCountableIdleProbe(name string, input []byte) bool {
+	if isWaitOrPollTool(name) {
+		return true
+	}
 	if !isProbeTool(name) || isLocalEditTool(name) {
 		return false
+	}
+	if name == "Bash" && extractWaitSleepSeconds(name, input) >= 30 {
+		return true
 	}
 	if name == "Bash" && len(input) > 0 {
 		var raw struct {
@@ -1161,6 +1304,9 @@ func commandFingerprint(name string, input []byte) (string, bool) {
 	}
 	s := strings.TrimSpace(string(input))
 	if s == "" {
+		if isWaitOrPollTool(name) {
+			return name, true
+		}
 		return "", false
 	}
 	var raw map[string]any
