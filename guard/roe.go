@@ -176,6 +176,33 @@ func (g *Guard) checkRoE(ctx context.Context, ev hook.Event, cmd string) (hook.R
 	if len(out) == 0 {
 		return hook.Result{}, false // In 或 Unknown → 放行
 	}
+	// warn-once 去重(strict 每次都拦,不走这里):同一 (taskID, host) 首次才写
+	// 日志与审计,后续静默放行。任务 Guard 每任务一个,但 chatGuard 进程级共享,
+	// 因此 key 仍带 taskID。warned 集合随 Guard 生命周期,不持久化;
+	// 设上限兜底,防止共享 chatGuard 无限增长(超限后该 host 重新告警一次,
+	// 语义上是「收敛」而非「只报一次」的硬保证,可接受)。
+	if mode != "strict" {
+		g.mu.Lock()
+		if g.roeWarned == nil {
+			g.roeWarned = map[roeWarnKey]bool{}
+		}
+		var fresh []string
+		for _, h := range out {
+			key := roeWarnKey{taskID: taskID, host: h}
+			if g.roeWarned[key] {
+				continue
+			}
+			if len(g.roeWarned) < 4096 {
+				g.roeWarned[key] = true
+			}
+			fresh = append(fresh, h)
+		}
+		g.mu.Unlock()
+		out = fresh
+		if len(out) == 0 {
+			return hook.Result{}, false // 全是重复越界目标:静默放行
+		}
+	}
 	if unknown {
 		// 部分目标出了已登记范围、部分无规则可依 —— 按 Out 处理已有的违规即可。
 		log.Printf("[guard][roe] task %d 部分目标无范围规则可依: %v", taskID, hosts)
