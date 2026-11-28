@@ -220,9 +220,24 @@ func (s *Server) roeCheckHost(ctx context.Context, host, kind string) (string, e
 	return warn, nil
 }
 
-// recordRoEWarn 沿用 recordProxyRoEWarn：先打结构化日志，任务句柄还在时再写
-// activity。没有句柄（或 Store 为空）时日志仍然留下，不改调用方拿到的 ⚠ 文案。
+// recordRoEWarn 沿用 recordProxyRoEWarn：按 (taskID, host) 做 warn-once 去重，
+// 首次才写结构化日志与 activity，避免批量会话/隧道操作刷爆活动流。
 func (s *Server) recordRoEWarn(taskID int64, host, msg string) {
+	if s != nil {
+		key := fmt.Sprintf("%d\x00%s", taskID, strings.ToLower(strings.TrimSpace(host)))
+		s.roeWarnMu.Lock()
+		if s.roeWarned == nil {
+			s.roeWarned = map[string]bool{}
+		}
+		if s.roeWarned[key] {
+			s.roeWarnMu.Unlock()
+			return
+		}
+		if len(s.roeWarned) < 4096 {
+			s.roeWarned[key] = true
+		}
+		s.roeWarnMu.Unlock()
+	}
 	log.Printf("[roe] task %d host %s: %s", taskID, host, msg)
 	if s == nil || s.m == nil {
 		return

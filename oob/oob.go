@@ -188,6 +188,16 @@ func (m *Manager) SetBaseURL(u string) {
 	m.mu.Unlock()
 }
 
+// BaseURL returns the configured external base URL for HTTP OOB endpoints.
+func (m *Manager) BaseURL() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.baseURL
+}
+
 func (m *Manager) httpURLForLocked(token string) string {
 	p := "/o/" + token
 	if m.baseURL == "" {

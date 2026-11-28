@@ -62,13 +62,20 @@ type roeSnap struct {
 	at    time.Time
 }
 
+type proxyRoEWarnKey struct {
+	taskID int64
+	host   string
+}
+
 // roeGateCache 按 taskID 缓存 enforcement mode 与官方范围，避免每个请求打库。
+// warned 做 warn-once 去重（每 (taskID, host) 首次才写日志与 activity，上限 4096）。
 type roeGateCache struct {
-	ttl   time.Duration
-	now   func() time.Time
-	deps  roeGateDeps
-	mu    sync.Mutex
-	snaps map[int64]roeSnap
+	ttl    time.Duration
+	now    func() time.Time
+	deps   roeGateDeps
+	mu     sync.Mutex
+	snaps  map[int64]roeSnap
+	warned map[proxyRoEWarnKey]bool
 }
 
 func (c *roeGateCache) clock() time.Time {
@@ -104,12 +111,36 @@ func (c *roeGateCache) get(taskID int64) (string, []guard.ScopeRule, error) {
 	return mode, rules, err
 }
 
+func (c *roeGateCache) shouldWarn(taskID int64, host string) bool {
+	if c == nil {
+		return true
+	}
+	key := proxyRoEWarnKey{taskID: taskID, host: strings.ToLower(strings.TrimSpace(host))}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.warned == nil {
+		c.warned = map[proxyRoEWarnKey]bool{}
+	}
+	if c.warned[key] {
+		return false
+	}
+	if len(c.warned) < 4096 {
+		c.warned[key] = true
+	}
+	return true
+}
+
 func (c *roeGateCache) invalidate(taskID int64) {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
 	delete(c.snaps, taskID)
+	for k := range c.warned {
+		if k.taskID == taskID {
+			delete(c.warned, k)
+		}
+	}
 	c.mu.Unlock()
 }
 
@@ -343,7 +374,9 @@ func (m *taskProxyManager) hostGate(taskID int64) func(string) error {
 			if mode == "strict" {
 				return fmt.Errorf("RoE 授权范围检查：主机 %s 的任务 %d 范围读取失败（不是未登记范围），strict 拒绝放行。可改用 roe_enforcement=warn/off 回退，或先确认数据库可用。", host, taskID)
 			}
-			m.noteRoEWarn(taskID, host, fmt.Sprintf("⚠ RoE 授权范围检查：主机 %s 的任务 %d 范围读取失败（不是未登记范围），warn 下已放行。", host, taskID))
+			if m.roe.shouldWarn(taskID, "__scope_read_err__") {
+				m.noteRoEWarn(taskID, host, fmt.Sprintf("⚠ RoE 授权范围检查：主机 %s 的任务 %d 范围读取失败（不是未登记范围），warn 下已放行。", host, taskID))
+			}
 			return nil
 		}
 		if guard.NewScopeMatcher(rules).Check(host) != guard.ScopeOut {
@@ -353,7 +386,9 @@ func (m *taskProxyManager) hostGate(taskID int64) func(string) error {
 		if mode == "strict" {
 			return fmt.Errorf("%s", msg)
 		}
-		m.noteRoEWarn(taskID, host, "⚠ "+msg)
+		if m.roe.shouldWarn(taskID, host) {
+			m.noteRoEWarn(taskID, host, "⚠ "+msg)
+		}
 		return nil
 	}
 }

@@ -61,7 +61,26 @@ func (s *Server) seedBriefScope(t *Task, seedText string) {
 	if err != nil || taskID <= 0 {
 		return
 	}
+	// 排除 LLM 网关、本机/VPN 接口与平台回调基础设施，严禁自动写进可信 seed scope。
+	excluded := map[string]bool{}
+	if gw := strings.ToLower(strings.TrimSpace(s.llmHost())); gw != "" {
+		excluded[gw] = true
+	}
+	for _, ex := range localRoEExemptHosts() {
+		if ex = strings.ToLower(strings.TrimSpace(ex)); ex != "" {
+			excluded[ex] = true
+		}
+	}
+	if s.oob != nil {
+		if h := strings.ToLower(strings.TrimSpace(hostFromURL(s.oob.BaseURL()))); h != "" {
+			excluded[h] = true
+		}
+	}
 	for _, h := range hosts {
+		if excluded[strings.ToLower(strings.TrimSpace(h))] {
+			log.Printf("[seed] task %s: 跳过基础设施/回连地址 %s，不登记为 task_scope", t.ID, h)
+			continue
+		}
 		kind := "subdomain"
 		if net.ParseIP(h) != nil {
 			kind = "ip"

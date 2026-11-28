@@ -68,6 +68,14 @@ func TestHostGateWarnAllowsAndNotifies(t *testing.T) {
 	if err := gate("  "); err != nil || len(notes) != 1 {
 		t.Fatalf("空 host 应放行: err=%v notes=%#v", err, notes)
 	}
+	// warn-once: 同一 (taskID, host) 再次访问不再刷重复告警，不同 host 正常告警一次。
+	if err := gate(host); err != nil || len(notes) != 1 {
+		t.Fatalf("同一越界 host 应去重只告警一次: err=%v notes=%#v", err, notes)
+	}
+	m.roe.invalidate(taskID)
+	if err := gate(host); err != nil || len(notes) != 2 {
+		t.Fatalf("invalidate 后应重新告警一次: err=%v notes=%#v", err, notes)
+	}
 }
 
 func TestHostGateOffSkipsScopeRead(t *testing.T) {

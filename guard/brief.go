@@ -27,6 +27,18 @@ var (
 	reBriefIP  = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b`)
 	// 访问类指令动词:同一分句内出现才接受裸 IP。中英文都覆盖。
 	reBriefDirective = regexp.MustCompile(`(?i)(访问|探测|检测|健康|检查|预检|连通|扫描|登[录陆]|连接|必须|\bget\b|\bpost\b|\bcurl\b|\bping\b|\bnmap\b|\bscan\b|\bprobe\b|\bcheck\b|\bfetch\b)`)
+	// 否定/排除语境词：分句内出现在 URL/IP 之前时视为显式禁区，严禁自动加入 seed scope。
+	briefNegationKeywords = []string{
+		"禁止", "严禁", "不要", "不得", "切勿", "请勿", "勿碰", "勿访", "勿扫", "排除",
+		"范围外", "不测", "不碰", "跳过", "忽略", "不在授权", "非授权",
+		"out of scope", "out-of-scope", "do not", "don't", "never ",
+		"exclude", "excluded", "forbidden", "prohibited", "off-limits", "avoid ",
+	}
+	// 操作员侧/回连基础设施词：出现在 URL/IP 邻近前文窗口时跳过，不视为目标。
+	briefCallbackKeywords = []string{
+		"本机", "攻击机", "回连", "回调", "监听", "外带",
+		"callback", "lhost", "reverse", "oob", "interactsh", "dnslog", "webhook",
+	}
 )
 
 // briefPlaceholderHost 判断是否是文档/示例占位符 host。
@@ -75,16 +87,28 @@ func briefUsableIP(ip net.IP) bool {
 	return true
 }
 
-// isCallbackContextIP 判断分句里位于 idx 处的 IP 是否落在「本机/攻击机/回连/
-// 监听」等说明词的邻近窗口内(向前 16 字节)——这类 IP 是操作员侧地址,不是任务目标。
-func isCallbackContextIP(sent string, idx int) bool {
-	lo := idx - 16
+// isCallbackContext 判断分句里位于 idx 处的 URL/IP 是否落在「本机/攻击机/回连/
+// 回调/监听/OOB」等说明词的邻近前文窗口内（向前 36 字节）——这类地址是操作员侧设施，不是任务目标。
+func isCallbackContext(sent string, idx int) bool {
+	lo := idx - 36
 	if lo < 0 {
 		lo = 0
 	}
 	win := strings.ToLower(sent[lo:idx])
-	for _, kw := range []string{"本机", "攻击机", "回连", "监听", "callback", "lhost", "reverse"} {
+	for _, kw := range briefCallbackKeywords {
 		if strings.Contains(win, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// isNegatedBriefContext 判断分句里位于 idx 处的 URL/IP 之前是否出现否定或排除指令
+// （如「禁止访问」「不要碰」「排除」「out of scope」）。命中一律拒收，避免把禁区写进 seed scope。
+func isNegatedBriefContext(sent string, idx int) bool {
+	prefix := strings.ToLower(sent[:idx])
+	for _, kw := range briefNegationKeywords {
+		if strings.Contains(prefix, kw) {
 			return true
 		}
 	}
@@ -110,42 +134,44 @@ func ExtractBriefHosts(text string) []string {
 		out = append(out, h)
 	}
 
-	// 1) 完整 http(s) URL 的 host:URL 字面值本身就是访问指令。
-	for _, m := range reBriefURL.FindAllString(text, -1) {
-		// 模板/变量残留({{x}}、${x})与粘连尾标点按 shell glue 拆开;
-		// 剥完如果 host 还含 {} 或 $ 说明 host 本身就是模板,放弃。
-		for _, piece := range splitShellGlue(m) {
-			// 任务书是中文文本,URL 尾部常粘着句读(。/、/))——剥离再解析。
-			piece = strings.TrimRight(piece, "。、，,.;:')]>")
-			u, err := url.Parse(piece)
-			if err != nil || u.Hostname() == "" {
-				continue
-			}
-			h := cleanExtractedHost(u.Hostname())
-			if h == "" || strings.ContainsAny(h, "{}$") {
-				continue
-			}
-			add(h)
-		}
-	}
-
-	// 2) 裸 IP 字面值:仅当同一分句(按换行/分号/中英文逗号与句读切)带访问类指令动词。
-	// 英文句号不在切分符内——IPv4 字面值本身由点组成,切开会把 10.0.0.x 拆烂。
-	// URL 里已收的 IP 靠 seen 去重。
-	for _, sent := range strings.FieldsFunc(text, func(r rune) bool {
+	// 按分句切分（英文句号不切，避免拆烂 IPv4/域名），每分句内同时做否定与回连上下文过滤。
+	clauses := strings.FieldsFunc(text, func(r rune) bool {
 		return r == '\n' || r == '\r' || r == ';' || r == '。' || r == '；' || r == '!' || r == '！' || r == '?' || r == '？' || r == '，' || r == ','
-	}) {
+	})
+
+	for _, sent := range clauses {
+		// 1) 完整 http(s) URL 的 host：URL 字面值本身就是访问指令，但仍须排除
+		//    否定/排除语境与操作员回调语境。
+		for _, idx := range reBriefURL.FindAllStringIndex(sent, -1) {
+			if isNegatedBriefContext(sent, idx[0]) || isCallbackContext(sent, idx[0]) {
+				continue
+			}
+			m := sent[idx[0]:idx[1]]
+			for _, piece := range splitShellGlue(m) {
+				piece = strings.TrimRight(piece, "。、，,.;:')]>")
+				u, err := url.Parse(piece)
+				if err != nil || u.Hostname() == "" {
+					continue
+				}
+				h := cleanExtractedHost(u.Hostname())
+				if h == "" || strings.ContainsAny(h, "{}$") {
+					continue
+				}
+				add(h)
+			}
+		}
+
+		// 2) 裸 IP 字面值：仅当同一分句带访问类指令动词，且不在否定/回连语境内。
 		if !reBriefDirective.MatchString(sent) {
 			continue
 		}
 		for _, idx := range reBriefIP.FindAllStringIndex(sent, -1) {
+			if isNegatedBriefContext(sent, idx[0]) || isCallbackContext(sent, idx[0]) {
+				continue
+			}
 			m := sent[idx[0]:idx[1]]
 			host := stripPortMaybe(stripShellGlueEdges(m))
 			host = strings.TrimSuffix(host, ".")
-			// 「本机/攻击机/回连地址 x.x.x.x」是操作员侧地址,不是目标。
-			if isCallbackContextIP(sent, idx[0]) {
-				continue
-			}
 			if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil && briefUsableIP(ip) {
 				add(host)
 			}

@@ -135,3 +135,54 @@ func TestCostQueriesIsolatedByTask(t *testing.T) {
 		t.Errorf("task a intents = %+v, want single 100-token intent", intents)
 	}
 }
+
+func TestPruneLLMRecords(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer d.Close()
+	if err := d.EnsureLLMRecordsTable(); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	tag := "prune-" + uuid.NewString()
+	t.Cleanup(func() {
+		_, _ = d.Exec(`DELETE FROM llm_records WHERE task_id=$1`, tag)
+	})
+	for i := 0; i < 4; i++ {
+		if err := d.InsertLLMRecord(&LLMRecord{Model: "m", SessionID: tag, TaskID: tag, Status: "ok"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Backdate the oldest of our 4 rows by 30 days to exercise age pruning.
+	if _, err := d.Exec(`UPDATE llm_records SET ts = now() - interval '30 days'
+		WHERE id = (SELECT MIN(id) FROM llm_records WHERE task_id=$1)`, tag); err != nil {
+		t.Fatal(err)
+	}
+	prunedAge, err := d.PruneLLMRecords(t.Context(), 0, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("PruneLLMRecords age: %v", err)
+	}
+	if prunedAge < 1 {
+		t.Fatalf("expected at least 1 expired row pruned, got %d", prunedAge)
+	}
+	var afterAge int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM llm_records WHERE task_id=$1`, tag).Scan(&afterAge); err != nil {
+		t.Fatal(err)
+	}
+	if afterAge != 3 {
+		t.Fatalf("expected 3 rows remaining after age prune, got %d", afterAge)
+	}
+
+	// Now prune by maxRows keeping only the 1 newest row globally (which is our newest row).
+	if _, err := d.PruneLLMRecords(t.Context(), 1, 0); err != nil {
+		t.Fatalf("PruneLLMRecords maxRows: %v", err)
+	}
+	var afterCap int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM llm_records WHERE task_id=$1`, tag).Scan(&afterCap); err != nil {
+		t.Fatal(err)
+	}
+	if afterCap != 1 {
+		t.Fatalf("expected 1 newest row remaining after maxRows prune, got %d", afterCap)
+	}
+}

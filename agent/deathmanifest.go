@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Autumn-27/norma/harness"
+	"github.com/Autumn-27/norma/llm"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -58,8 +60,35 @@ type deathLedger struct {
 
 func (l *deathLedger) add(r bgRecord) {
 	l.mu.Lock()
+	defer l.mu.Unlock()
+	if r.TaskID != "" {
+		for i := range l.records {
+			if l.records[i].TaskID == r.TaskID {
+				if l.records[i].OutputPath == "" && r.OutputPath != "" {
+					l.records[i].OutputPath = r.OutputPath
+				}
+				return
+			}
+		}
+	}
 	l.records = append(l.records, r)
-	l.mu.Unlock()
+}
+
+func (l *deathLedger) removeTask(taskID string) {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	kept := l.records[:0]
+	for _, r := range l.records {
+		if r.TaskID == taskID {
+			continue
+		}
+		kept = append(kept, r)
+	}
+	l.records = kept
 }
 
 func (l *deathLedger) snapshot() []bgRecord {
@@ -68,6 +97,44 @@ func (l *deathLedger) snapshot() []bgRecord {
 	out := make([]bgRecord, len(l.records))
 	copy(out, l.records)
 	return out
+}
+
+func (l *deathLedger) recordToolOutput(in json.RawMessage, text string, isErr bool) {
+	if l == nil {
+		return
+	}
+	var input struct {
+		Command         string `json:"command"`
+		RunInBackground bool   `json:"run_in_background"`
+	}
+	_ = json.Unmarshal(in, &input) // 解析失败仍尝试用结果文本识别
+	cmd := input.Command
+
+	// 结果文本里的出生公告最权威（含 task id 与输出路径）；一次调用最多一条。
+	if m := reBackgroundSpawned.FindStringSubmatch(text); m != nil {
+		l.add(bgRecord{
+			Command:    cmd,
+			TaskID:     m[1],
+			OutputPath: m[2],
+			Kind:       "managed",
+			SpawnedAt:  time.Now(),
+		})
+		return
+	}
+	if isErr {
+		return // 失败/被拦截的调用未成功启动后台任务
+	}
+	// 显式 run_in_background 但结果里没匹配到公告（任务秒完/输出被截断）：
+	// 照样记账，输出路径留空——进程确实可能活过本 run。
+	if input.RunInBackground {
+		l.add(bgRecord{Command: cmd, Kind: "managed", SpawnedAt: time.Now()})
+		return
+	}
+	// shell 内 & 起跳：不受任务管理器管辖，Close 杀不掉它但输出无处可读，
+	// 记账只为让接班者知道「可能有孤儿进程还在跑，勿重复起」。
+	if cmd != "" && shellBackgrounded(cmd) {
+		l.add(bgRecord{Command: cmd, Kind: "shell-bg", SpawnedAt: time.Now()})
+	}
 }
 
 // deathLedgerTool 包装 Bash（也兼容 Monitor）：调用结束后从结果文本里识别
@@ -85,71 +152,85 @@ func (t *deathLedgerTool) Call(ctx context.Context, in json.RawMessage, tc *acto
 }
 
 func (t *deathLedgerTool) record(in json.RawMessage, res actool.Result) {
-	if t.ledger == nil {
-		return
-	}
-	var input struct {
-		Command         string `json:"command"`
-		RunInBackground bool   `json:"run_in_background"`
-	}
-	_ = json.Unmarshal(in, &input) // 解析失败仍尝试用结果文本识别
-	cmd := input.Command
+	t.ledger.recordToolOutput(in, res.Flatten(), res.IsError)
+}
 
-	// 结果文本里的出生公告最权威（含 task id 与输出路径）；一次调用最多一条。
-	if m := reBackgroundSpawned.FindStringSubmatch(res.Flatten()); m != nil {
-		t.ledger.add(bgRecord{
-			Command:    cmd,
-			TaskID:     m[1],
-			OutputPath: m[2],
-			Kind:       "managed",
-			SpawnedAt:  time.Now(),
-		})
-		return
+// deathLedgerHooks 在 PostToolUse 侧统一记录 Bash 与 SDK 内部注入的 Monitor 后台任务，
+// 并在 TaskStop 成功停止后台任务时从台账摘除，避免已显式停止的任务产生误导清单。
+type deathLedgerHooks struct {
+	inner  harness.HookRunner
+	ledger *deathLedger
+}
+
+func wrapDeathLedgerHooks(inner harness.HookRunner, ledger *deathLedger) harness.HookRunner {
+	if ledger == nil {
+		return inner
 	}
-	// 显式 run_in_background 但结果里没匹配到公告（任务秒完/输出被截断）：
-	// 照样记账，输出路径留空——进程确实可能活过本 run。
-	if input.RunInBackground {
-		t.ledger.add(bgRecord{Command: cmd, Kind: "managed", SpawnedAt: time.Now()})
-		return
+	return deathLedgerHooks{inner: inner, ledger: ledger}
+}
+
+func (h deathLedgerHooks) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
+	if h.inner != nil {
+		return h.inner.PreToolUse(ctx, name, input)
 	}
-	// shell 内 & 起跳：不受任务管理器管辖，Close 杀不掉它但输出无处可读，
-	// 记账只为让接班者知道「可能有孤儿进程还在跑，勿重复起」。
-	if cmd != "" && shellBackgrounded(cmd) {
-		t.ledger.add(bgRecord{Command: cmd, Kind: "shell-bg", SpawnedAt: time.Now()})
+	return false, "", nil
+}
+
+func (h deathLedgerHooks) PostToolUse(ctx context.Context, name string, input, result []byte, isErr bool) {
+	if h.ledger != nil {
+		switch name {
+		case "Bash", "Monitor":
+			var text string
+			if json.Unmarshal(result, &text) != nil {
+				text = string(result)
+			}
+			h.ledger.recordToolOutput(input, text, isErr)
+		case "TaskStop":
+			if !isErr {
+				var stop struct {
+					TaskID string `json:"task_id"`
+					ID     string `json:"id"`
+				}
+				if json.Unmarshal(input, &stop) == nil {
+					id := strings.TrimSpace(stop.TaskID)
+					if id == "" {
+						id = strings.TrimSpace(stop.ID)
+					}
+					h.ledger.removeTask(id)
+				}
+			}
+		}
+	}
+	if h.inner != nil {
+		h.inner.PostToolUse(ctx, name, input, result, isErr)
 	}
 }
 
-// shellBackgrounded 判定命令是否以裸 `&` 结尾后台化（保守版：只认命令结尾的
-// 单个 &，排除 &&、|&、引号内内容；中间段的 & 不追，避免误判）。
+func (h deathLedgerHooks) Stop(ctx context.Context, messages []llm.Message) (bool, []string, string) {
+	if h.inner != nil {
+		return h.inner.Stop(ctx, messages)
+	}
+	return false, nil, ""
+}
+
+// shellBackgrounded 判定命令是否以引号外、未转义的裸 `&` 结尾后台化（保守版：
+// 只认命令结尾的单个 &，排除 &&、|&、\& 以及引号内内容）。
 func shellBackgrounded(cmd string) bool {
 	cmd = strings.TrimRight(cmd, " \t\r\n")
 	if !strings.HasSuffix(cmd, "&") || strings.HasSuffix(cmd, "&&") || strings.HasSuffix(cmd, "|&") {
 		return false
 	}
-	// 引号未成对收尾时放弃判定（引号里的 & 不是 shell 语法）。
+	// 单遍扫描引号与反斜杠转义：结尾的 & 必须在引号外且未被前导反斜杠转义。
 	var quote byte
-	for i := 0; i < len(cmd); i++ {
-		c := cmd[i]
-		if c == '\\' && quote != '\'' {
-			i++
-			continue
-		}
-		switch {
-		case quote == 0 && (c == '\'' || c == '"'):
-			quote = c
-		case c == quote:
-			quote = 0
-		}
-	}
-	if quote != 0 {
-		return false
-	}
-	// 结尾的 & 必须在引号外：重扫确认最后一个字符不在引号内。
-	quote = 0
+	escaped := false
 	for i := 0; i < len(cmd)-1; i++ {
 		c := cmd[i]
+		if escaped {
+			escaped = false
+			continue
+		}
 		if c == '\\' && quote != '\'' {
-			i++
+			escaped = true
 			continue
 		}
 		switch {
@@ -159,7 +240,7 @@ func shellBackgrounded(cmd string) bool {
 			quote = 0
 		}
 	}
-	return quote == 0
+	return quote == 0 && !escaped
 }
 
 // wrapBashDeathLedger 给工具集里的 Bash/Monitor 套上后台进程记账。
@@ -310,9 +391,10 @@ func sanitizeFilePart(s string) string {
 // 没有任何现场时返回空串，首条消息不受影响。
 func deathManifestBlock(runDir string, intentID int64) string {
 	type hit struct {
-		path string
-		mod  time.Time
-		m    deathManifest
+		path       string
+		pairedPath string
+		mod        time.Time
+		m          deathManifest
 	}
 	readOne := func(path string) (hit, bool) {
 		st, err := os.Stat(path)
@@ -333,17 +415,35 @@ func deathManifestBlock(runDir string, intentID int64) string {
 		return hit{path: path, mod: st.ModTime(), m: m}, true
 	}
 
+	sharedDir := sharedDirForRun(runDir)
+	taskDir := filepath.Dir(sharedDir)
 	var hits []hit
-	own := filepath.Join(runDir, fmt.Sprintf("death_manifest_i%d.json", intentID))
+	ownName := fmt.Sprintf("death_manifest_i%d.json", intentID)
+	own := filepath.Join(runDir, ownName)
 	if h, ok := readOne(own); ok {
+		sharedCopy := filepath.Join(sharedDir, ownName)
+		if sharedCopy != own {
+			if _, err := os.Stat(sharedCopy); err == nil {
+				h.pairedPath = sharedCopy
+			}
+		}
 		hits = append(hits, h)
-	} else if entries, err := os.ReadDir(sharedDirForRun(runDir)); err == nil {
+	} else if entries, err := os.ReadDir(sharedDir); err == nil {
 		var shared []hit
 		for _, e := range entries {
 			if e.IsDir() || !strings.HasPrefix(e.Name(), "death_manifest_") || !strings.HasSuffix(e.Name(), ".json") {
 				continue
 			}
-			if h, ok := readOne(filepath.Join(sharedDirForRun(runDir), e.Name())); ok {
+			p := filepath.Join(sharedDir, e.Name())
+			if h, ok := readOne(p); ok {
+				if h.m.IntentID > 0 {
+					runCopy := filepath.Join(taskDir, fmt.Sprintf("i%d", h.m.IntentID), e.Name())
+					if runCopy != p {
+						if _, err := os.Stat(runCopy); err == nil {
+							h.pairedPath = runCopy
+						}
+					}
+				}
 				shared = append(shared, h)
 			}
 		}
@@ -359,9 +459,14 @@ func deathManifestBlock(runDir string, intentID int64) string {
 
 	var sb strings.Builder
 	sb.WriteString("\n\n【撤退现场清单（前任单兵留下的后台进程依托）】\n")
-	sb.WriteString("以下后台进程已随前任单兵撤退被回收。先判断是否与本意图相关：相关则按命令与输出尾段重建（监听器重起、隧道重连）；重建完成或确认无关后，**删除对应清单文件**（这是 shared/ 只增不删约定的唯一例外），避免误导后续单兵。shell-bg 条目不受会话管理、可能仍在运行，重建前先核实（ps/端口检查）勿盲目重启。\n")
+	sb.WriteString("以下后台进程已随前任单兵撤退被回收。先判断是否与本意图相关：相关则按命令与输出尾段重建（监听器重起、隧道重连）；重建完成或确认无关后，**删除对应清单文件及其同步副本**（这是 shared/ 只增不删约定的唯一例外），避免误导后续单兵。shell-bg 条目不受会话管理、可能仍在运行，重建前先核实（ps/端口检查）勿盲目重启。\n")
 	for _, h := range hits {
-		fmt.Fprintf(&sb, "\n—— 清单 %s（意图 #%d，写于 %s）：\n", h.path, h.m.IntentID, h.m.WrittenAt.Format("15:04:05"))
+		if h.pairedPath != "" {
+			fmt.Fprintf(&sb, "\n—— 清单 %s（同步副本：%s，清理时一并删除；意图 #%d，写于 %s）：\n",
+				h.path, h.pairedPath, h.m.IntentID, h.m.WrittenAt.Format("15:04:05"))
+		} else {
+			fmt.Fprintf(&sb, "\n—— 清单 %s（意图 #%d，写于 %s）：\n", h.path, h.m.IntentID, h.m.WrittenAt.Format("15:04:05"))
+		}
 		for _, e := range h.m.Entries {
 			fmt.Fprintf(&sb, "- [%s] %s\n", e.Kind, e.Command)
 			// TailFile 已是绝对路径（写出时决定 shared 或 runDir），直接呈现。

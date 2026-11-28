@@ -1252,6 +1252,36 @@ func (s *ExplorationStore) FactsYielded(intentID int64) ([]int64, error) {
 	return ids, rows.Err()
 }
 
+// IntentYieldCount counts productive outputs produced by an intent: yielded
+// facts and findings (via RelYields) plus newly discovered assets anchored to
+// the intent that were not already in its input asset_ids.
+func (s *ExplorationStore) IntentYieldCount(intentID int64, inputAssetIDs []int64) (int, error) {
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(DISTINCT n.id)
+		FROM exploration_edges e
+		JOIN exploration_nodes n ON n.id=e.dst_id AND n.exploration_id=e.exploration_id
+		WHERE e.exploration_id=$1 AND e.src_id=$2 AND e.rel=$3 AND n.kind IN ($4, $5)`,
+		s.expID, intentID, RelYields, KindFact, KindFinding).Scan(&count); err != nil {
+		return 0, err
+	}
+	rows, err := s.db.Query(`SELECT asset_id FROM exploration_anchors WHERE node_id=$1`, intentID)
+	if err != nil {
+		return count, nil
+	}
+	defer rows.Close()
+	inputSet := make(map[int64]bool, len(inputAssetIDs))
+	for _, id := range inputAssetIDs {
+		inputSet[id] = true
+	}
+	for rows.Next() {
+		var aid int64
+		if err := rows.Scan(&aid); err == nil && !inputSet[aid] {
+			count++
+		}
+	}
+	return count, nil
+}
+
 // FindingLineage returns the sub-DAG that leads FROM the exploration root TO the
 // given node: the node itself plus all its ancestors (nodes reverse-reachable by
 // following edges backward), and every edge whose both endpoints are in that set.

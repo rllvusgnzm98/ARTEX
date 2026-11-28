@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/agent/chainskel"
 	"github.com/Autumn-27/artex/db"
 	toolenv "github.com/Autumn-27/artex/tools"
 	"github.com/Autumn-27/artex/traffic"
@@ -25,6 +26,40 @@ import (
 // filters them per-agent binding. Empty/nil → no host tools this run (capture off).
 func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.CoreTool, map[string][]string)) {
 	skills := &skillDirCache{}
+	chainskel.SkillCatalogResolver = func(agentKey string) (map[string]bool, map[string]string) {
+		a, err := pg.GetAgentByKey(agentKey)
+		if err != nil || a == nil {
+			return nil, nil
+		}
+		names, err := pg.AgentSkillNames(a.ID)
+		if err != nil {
+			return nil, nil
+		}
+		allowed := make(map[string]bool, len(names))
+		for _, n := range names {
+			allowed[n] = true
+		}
+		descs := make(map[string]string, len(names))
+		if allReg, err := skills.load(skillDir); err == nil && allReg != nil {
+			for _, sk := range allReg.List() {
+				dirName := ""
+				if sk.Dir != "" {
+					dirName = filepath.Base(sk.Dir)
+				}
+				if allowed[dirName] || allowed[sk.Name] {
+					if dirName != "" {
+						allowed[dirName] = true
+						descs[dirName] = sk.Description
+					}
+					if sk.Name != "" {
+						allowed[sk.Name] = true
+						descs[sk.Name] = sk.Description
+					}
+				}
+			}
+		}
+		return allowed, descs
+	}
 	agent.ToolAugment = func(ctx context.Context, agentKey string) ([]actool.CoreTool, agent.DeferredInfo, func()) {
 		a, err := pg.GetAgentByKey(agentKey)
 		if err != nil || a == nil {

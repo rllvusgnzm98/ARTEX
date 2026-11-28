@@ -1,14 +1,18 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Autumn-27/norma/llm"
 	actool "github.com/Autumn-27/norma/tool"
+	"github.com/Autumn-27/norma/transcript"
 )
 
 // shellBackgrounded 只认引号外结尾的裸 &；&&、|&、引号内的 & 都不是后台化。
@@ -22,6 +26,8 @@ func TestShellBackgrounded(t *testing.T) {
 		"echo 'x&' ":                      false, // 结尾无 &
 		"echo 'unclosed &":                false, // 引号未闭合，放弃判定
 		"echo \"end &\"":                  false, // & 在引号内
+		`echo foo \&`:                     false, // 反斜杠转义的 & 不是后台化
+		`echo foo \\&`:                    true,  // 双反斜杠转义了反斜杠自身，结尾 & 生效
 		"printf '%s' foo |& tee x":        false,
 		"nc -l 4444":                      false,
 		"":                                false,
@@ -207,5 +213,90 @@ func TestDeathManifestBlock(t *testing.T) {
 	}
 	if strings.Contains(block2, "nc -l 4444") {
 		t.Fatal("shared manifest must not duplicate-render when own exists")
+	}
+	// 若 shared/ 同时存在同意图副本，提示里必须列出同步副本路径避免删除后留幽灵副本。
+	if err := os.WriteFile(filepath.Join(shared, "death_manifest_i20.json"), ownData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	block3 := deathManifestBlock(runDir, 20)
+	if !strings.Contains(block3, filepath.Join(shared, "death_manifest_i20.json")) {
+		t.Fatalf("paired shared manifest path must be surfaced for cleanup, got %q", block3)
+	}
+}
+
+func TestDeathLedgerHooksTracksMonitorAndRemovesStoppedTask(t *testing.T) {
+	l := &deathLedger{}
+	h := wrapDeathLedgerHooks(nil, l)
+
+	// SDK 内部追加的 Monitor 工具通过 PostToolUse 进入台账。
+	resJSON, _ := json.Marshal("Started monitor mon-1. Output file: /tmp/norma/s1/tasks/mon-1.out")
+	h.PostToolUse(t.Context(), "Monitor", []byte(`{"command":"tail -f /tmp/oob.log"}`), resJSON, false)
+	if got := l.snapshot(); len(got) != 1 || got[0].TaskID != "mon-1" || got[0].OutputPath != "/tmp/norma/s1/tasks/mon-1.out" {
+		t.Fatalf("Monitor must be recorded via PostToolUse, got %+v", got)
+	}
+
+	// 同 task_id 重复上报去重。
+	h.PostToolUse(t.Context(), "Monitor", []byte(`{"command":"tail -f /tmp/oob.log"}`), resJSON, false)
+	if len(l.snapshot()) != 1 {
+		t.Fatalf("duplicate task_id must be deduplicated, got %d", len(l.snapshot()))
+	}
+
+	// 失败的 shell-bg 命令不得误记账。
+	h.PostToolUse(t.Context(), "Bash", []byte(`{"command":"badcmd &"}`), []byte(`"command not found"`), true)
+	if len(l.snapshot()) != 1 {
+		t.Fatalf("errored Bash call must not record shell-bg, got %+v", l.snapshot())
+	}
+
+	// TaskStop 成功停止后台任务后应从台账摘除，正常收队不再落误导清单。
+	h.PostToolUse(t.Context(), "TaskStop", []byte(`{"task_id":"mon-1"}`), []byte(`"stopped"`), false)
+	if len(l.snapshot()) != 0 {
+		t.Fatalf("TaskStop must remove stopped task from ledger, got %+v", l.snapshot())
+	}
+}
+
+func TestWorkerResumeInjectsDeathManifest(t *testing.T) {
+	_, store := retentionStore(t)
+	iid, err := store.AddIntent(map[string]any{"summary": "resume death manifest check"}, 0, nil, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := store.GetNode(iid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workDir := t.TempDir()
+	tx := transcript.NewStore(t.TempDir())
+	// 预先写入一条历史 transcript，触发带历史续跑分支 (len(s.Messages()) > 0)。
+	sid := WorkerSessionID(store.ID(), intent.ID)
+	if err := tx.Append(tx.MainPath(sid),
+		transcript.Record{UUID: "u1", SessionID: sid, Type: "message", Message: &llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{llm.TextBlock("previous run")}}},
+		transcript.Record{UUID: "a1", SessionID: sid, Type: "message", Message: &llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("started listener")}}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	// 在本意图 runDir 与 shared/ 写入撤退现场清单。
+	runDir := ensureRunDir(workDir, 42, intent.ID)
+	l := &deathLedger{}
+	l.add(bgRecord{Command: "nc -lvnp 4444", TaskID: "task-9", Kind: "managed", SpawnedAt: time.Now()})
+	writeDeathManifest(runDir, intent.ID, l)
+
+	var seenPrompt string
+	fake := budgetFakeProvider{complete: func(_ context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+		if len(req.Messages) > 0 {
+			seenPrompt = req.Messages[len(req.Messages)-1].Text()
+		}
+		return assistantText("resumed ok"), "end_turn", llm.Usage{}, nil
+	}}
+	w := NewWorker(fake, "fake", workDir, tx, 0, 1)
+	w.SetNonStreaming(func() bool { return true })
+	if _, _, err := w.Execute(t.Context(), "work#1", 42, nil, store, intent, nil, nil, nil, nil); err != nil {
+		t.Fatalf("Execute resume failed: %v", err)
+	}
+	if !strings.Contains(seenPrompt, "【撤退现场清单") || !strings.Contains(seenPrompt, "nc -lvnp 4444") {
+		t.Fatalf("resumed worker prompt dropped deathManifestBlock: %q", seenPrompt)
+	}
+	wantShared := filepath.Join(sharedDirForRun(runDir), fmt.Sprintf("death_manifest_i%d.json", intent.ID))
+	if !strings.Contains(seenPrompt, wantShared) {
+		t.Fatalf("resumed worker prompt missing paired shared manifest path %q: %q", wantShared, seenPrompt)
 	}
 }

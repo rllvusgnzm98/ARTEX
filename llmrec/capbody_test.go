@@ -1,6 +1,7 @@
 package llmrec
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -55,5 +56,27 @@ func TestCapBodyTruncatesAtRuneBoundary(t *testing.T) {
 	}
 	if len(got[:prefixEnd]) > maxBodyBytes {
 		t.Errorf("prefix len %d exceeds cap %d", len(got[:prefixEnd]), maxBodyBytes)
+	}
+}
+
+func TestCapJSONBodyPreservesValidJSON(t *testing.T) {
+	small := `{"ok":true}`
+	if got := capJSONBody(small); got != small {
+		t.Fatalf("small json mutated: %q", got)
+	}
+	big := `{"data":"` + strings.Repeat("中", maxBodyBytes/2) + `"}`
+	got := capJSONBody(big)
+	if !json.Valid([]byte(got)) {
+		t.Fatalf("capJSONBody produced invalid JSON (len=%d)", len(got))
+	}
+	var env map[string]any
+	if err := json.Unmarshal([]byte(got), &env); err != nil {
+		t.Fatalf("unmarshal truncated envelope: %v", err)
+	}
+	if trunc, _ := env["_truncated"].(bool); !trunc {
+		t.Fatalf("missing _truncated=true flag: %v", env)
+	}
+	if preview, _ := env["preview"].(string); !utf8.ValidString(preview) || preview == "" {
+		t.Fatalf("invalid preview in truncated JSON envelope")
 	}
 }

@@ -331,6 +331,35 @@ func (d *DB) DeleteLLMRecords(task string) (int64, error) {
 	return res.RowsAffected()
 }
 
+// PruneLLMRecords trims llm_records by age (maxAge > 0) and total row count
+// (maxRows > 0, keeping the newest maxRows rows by id). Zero or negative values
+// disable that dimension. Prevents unbounded DB growth when llm_record defaults on.
+func (d *DB) PruneLLMRecords(ctx context.Context, maxRows int, maxAge time.Duration) (int64, error) {
+	var total int64
+	if maxAge > 0 {
+		cutoff := time.Now().Add(-maxAge)
+		res, err := d.ExecContext(ctx, `DELETE FROM llm_records WHERE ts < $1`, cutoff)
+		if err != nil {
+			return total, err
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			total += n
+		}
+	}
+	if maxRows > 0 {
+		res, err := d.ExecContext(ctx, `
+DELETE FROM llm_records
+WHERE id < COALESCE((SELECT id FROM llm_records ORDER BY id DESC OFFSET $1 LIMIT 1), 0)`, maxRows-1)
+		if err != nil {
+			return total, err
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			total += n
+		}
+	}
+	return total, nil
+}
+
 // GetLLMRecord returns a single LLM record with full request/response bodies.
 func (d *DB) GetLLMRecord(id int64) (*LLMRecord, error) {
 	var r LLMRecord

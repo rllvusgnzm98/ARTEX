@@ -91,6 +91,8 @@ type Server struct {
 
 	pauseRetroMu   sync.Mutex
 	pauseRetroSeen map[string]string
+	roeWarnMu      sync.Mutex
+	roeWarned      map[string]bool
 
 	// triggerQ buffers P3 trigger fires PER AGENT. A per-agent "pump" launches runs up
 	// to a concurrency limit derived from the agent's策略: serial → limit 1 (+ optional
@@ -255,6 +257,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 			log.Printf("[retester] seed: %v", err)
 		}
 		go s.evidenceStore().RunGC(s.ctx)
+		go s.runLLMRecordsRetention(s.ctx)
 		s.seedPythonInterpreter()     // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
 		s.seedNodeInterpreter()       // Hackbots 的 node 脚本同样只在设置为空时写入
 		s.initEmp3r0r()               // emp3r0r cc sidecar 桥接（enabled 才装配）

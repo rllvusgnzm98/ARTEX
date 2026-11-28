@@ -2,7 +2,11 @@ package chainskel
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/Autumn-27/artex/config"
 	"github.com/Autumn-27/norma/skill"
@@ -90,56 +94,144 @@ var categorySkillHints = map[string]string{
 }
 
 // skillDescriptionTrunc 是注入提示里单条技能描述的长度上限（字符）：
-// 描述只为路由决策服务，截断防prompt膨胀；超长时按字符截断并补省略号。
-const skillDescriptionTrunc = 200
+// 描述只为路由决策服务，保持紧凑（80 字符内）防止首条消息膨胀。
+const skillDescriptionTrunc = 80
 
-// skillDescriptions 从技能目录读出每个技能的 frontmatter description，
-// 返回 name → 截断后的单行描述。目录缺失/文件损坏时静默降级为空表，
-// 渲染侧退化为只列技能名（同改动前行为）。
-func skillDescriptions() map[string]string {
-	reg, err := skill.LoadDir(config.SkillDir())
+// SkillCatalogResolver 由 server 层在启动时注入：复用 skillDirCache 并按 DB 的
+// agent_visibility 过滤出对指定 agentKey 可见的技能集合及其描述，避免每次派单扫盘，
+// 也避免向 worker 推荐已在 UI 关闭/解绑的技能。nil 时退化为只读本地缓存扫描。
+var SkillCatalogResolver func(agentKey string) (allowed map[string]bool, descs map[string]string)
+
+var fallbackSkillCache struct {
+	mu    sync.Mutex
+	dir   string
+	sig   string
+	descs map[string]string
+}
+
+func resolveReadOnlySkillDir() string {
+	if v := strings.TrimSpace(os.Getenv("ARTEX_SKILL_DIR")); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(config.Load().SkillDir); v != "" {
+		return v
+	}
+	return filepath.Join(config.BaseDir(), "skills")
+}
+
+func formatSkillDescription(raw string) string {
+	desc := strings.Join(strings.Fields(raw), " ")
+	if desc == "" {
+		return ""
+	}
+	runes := []rune(desc)
+	if len(runes) > skillDescriptionTrunc {
+		return string(runes[:skillDescriptionTrunc]) + "…"
+	}
+	return desc
+}
+
+func skillDirSig(dir string) (string, bool) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil
+		return "", false
+	}
+	var b strings.Builder
+	for _, e := range entries {
+		var p string
+		switch {
+		case e.IsDir():
+			p = filepath.Join(dir, e.Name(), "SKILL.md")
+		case strings.HasSuffix(e.Name(), ".md"):
+			p = filepath.Join(dir, e.Name())
+		default:
+			continue
+		}
+		fi, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		fmt.Fprintf(&b, "%s|%d|%d\n", p, fi.Size(), fi.ModTime().UnixNano())
+	}
+	return b.String(), true
+}
+
+// resolveWorkerSkillCatalog 返回对 worker 可见的技能集合（nil 表示不做可见性剔除）
+// 以及 name → 截断单行描述。
+func resolveWorkerSkillCatalog() (map[string]bool, map[string]string) {
+	if SkillCatalogResolver != nil {
+		allowed, rawDescs := SkillCatalogResolver("worker")
+		descs := make(map[string]string, len(rawDescs))
+		for k, v := range rawDescs {
+			if d := formatSkillDescription(v); d != "" {
+				descs[k] = d
+			}
+		}
+		return allowed, descs
+	}
+	dir := resolveReadOnlySkillDir()
+	sig, ok := skillDirSig(dir)
+	if !ok {
+		return nil, nil
+	}
+	fallbackSkillCache.mu.Lock()
+	defer fallbackSkillCache.mu.Unlock()
+	if fallbackSkillCache.dir == dir && fallbackSkillCache.sig == sig {
+		return nil, fallbackSkillCache.descs
+	}
+	reg, err := skill.LoadDir(dir)
+	if err != nil {
+		return nil, nil
 	}
 	out := make(map[string]string)
 	for _, sk := range reg.List() {
-		desc := strings.Join(strings.Fields(sk.Description), " ") // 折行/多余空白压平成单行
-		if desc == "" {
-			continue
+		if d := formatSkillDescription(sk.Description); d != "" {
+			out[sk.Name] = d
 		}
-		runes := []rune(desc)
-		if len(runes) > skillDescriptionTrunc {
-			desc = string(runes[:skillDescriptionTrunc]) + "…"
-		}
-		out[sk.Name] = desc
 	}
-	return out
+	fallbackSkillCache.dir, fallbackSkillCache.sig, fallbackSkillCache.descs = dir, sig, out
+	return nil, out
 }
 
-// withSkillDescriptions 把 "a / b / c（备注）" 形式的技能清单行改写成
-// "a — 描述； b — 描述； c — 描述（备注）"，让 worker 在选择是否加载前
-// 就能看到每个技能的触发场景；查不到描述的技能保留原名。
-func withSkillDescriptions(hint string, descs map[string]string) string {
-	if len(descs) == 0 {
-		return hint
-	}
+// withSkillDescriptions 把 "a / b / c（备注）" 形式的技能清单行按可见性过滤并改写成
+// "a — 描述； b — 描述； c — 描述（备注）"。allowed 非 nil 时仅保留对 worker 可见的技能；
+// 查不到描述的可见技能降级为裸名；全部被禁用时返回空串（若有尾注则仅保留尾注）。
+func withSkillDescriptions(hint string, allowed map[string]bool, descs map[string]string) string {
 	names := strings.Split(hint, " / ")
 	if len(names) == 0 {
 		return hint
 	}
 	var out []string
+	var pendingSuffix string
+	hasDesc := false
 	for _, raw := range names {
-		name, suffix := raw, ""
+		name, suffix := strings.TrimSpace(raw), ""
 		if i := strings.Index(raw, "（"); i >= 0 {
 			name, suffix = strings.TrimSpace(raw[:i]), raw[i:]
 		}
-		if d, ok := descs[strings.TrimSpace(name)]; ok {
+		if allowed != nil && !allowed[name] {
+			if suffix != "" {
+				pendingSuffix += suffix
+			}
+			continue
+		}
+		if d, ok := descs[name]; ok {
+			hasDesc = true
 			out = append(out, name+" — "+d+suffix)
 		} else {
-			out = append(out, raw)
+			out = append(out, name+suffix)
 		}
 	}
-	return strings.Join(out, "； ")
+	if len(out) == 0 {
+		return strings.TrimSpace(pendingSuffix)
+	}
+	if pendingSuffix != "" {
+		out[len(out)-1] += pendingSuffix
+	}
+	if hasDesc {
+		return strings.Join(out, "； ")
+	}
+	return strings.Join(out, " / ")
 }
 
 func RefsGuideForIntent(_ json.RawMessage) string { return "" }
@@ -171,7 +263,10 @@ func SkillGuideForIntent(payload json.RawMessage) string {
 	}
 	var lines []string
 	if hint, ok := categorySkillHints[cats[0]]; ok && hint != "" {
-		lines = append(lines, "["+cats[0]+"] 优先按需调 Skill 加载: "+withSkillDescriptions(hint, skillDescriptions()))
+		allowed, descs := resolveWorkerSkillCatalog()
+		if rendered := withSkillDescriptions(hint, allowed, descs); rendered != "" {
+			lines = append(lines, "["+cats[0]+"] 优先按需调 Skill 加载: "+rendered)
+		}
 	}
 	if len(lines) == 0 {
 		return ""

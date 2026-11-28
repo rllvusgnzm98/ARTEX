@@ -132,7 +132,7 @@ export default function LLMRecordsPage() {
 
   // Recording on/off toggle (settings.llm_record; default on). When off the
   // backend records nothing.
-  const [recEnabled, setRecEnabled] = React.useState(false);
+  const [recEnabled, setRecEnabled] = React.useState(true);
   const [recBusy, setRecBusy] = React.useState(false);
 
   // Inline detail panel (Burp-style split, not a dialog)

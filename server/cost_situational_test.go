@@ -106,6 +106,77 @@ func TestCostSituationalRendering(t *testing.T) {
 	}
 }
 
+func TestCostSituationalFindingYieldAndHighBurnZeroYield(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer m.Close()
+	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
+
+	task, err := m.CreateTask("cost-situational 高耗与发现测试", "测试发现计产和高耗零产", nil, 0, 0)
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = m.pg.Exec(`DELETE FROM llm_usage WHERE task_id=$1`, task.ID)
+		_, _ = m.DeleteTask(task.ID, DeleteTaskOptions{})
+	})
+	taskID, _ := strconv.ParseInt(task.ID, 10, 64)
+
+	addDone := func(summary string) int64 {
+		id, err := task.Store.AddIntent(map[string]any{"summary": summary}, 5, nil, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := task.Store.SetIntentState(id, "done"); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	findingOnlyID := addDone("直出漏洞验证")
+	normalID := addDone("常规侦察")
+	normal2ID := addDone("接口测试")
+	burnID := addDone("黑洞空转测试")
+
+	// findingOnlyID 只产出 Finding（未写 Fact），不应被标为低产。
+	fNodeID, err := task.Store.AddNode(db.KindFinding, map[string]any{"name": "RCE", "vulnclass": "rce"}, 0, "confirmed", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := task.Store.Link(findingOnlyID, db.RelYields, fNodeID); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int64{normalID, normal2ID} {
+		fid, err := task.Store.AddFactCtx(context.Background(), map[string]any{"text": "ok"}, "", nil, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = task.Store.Link(id, db.RelYields, fid)
+	}
+
+	ins := func(intentID int64, in, out int) {
+		if err := m.pg.InsertLLMUsage(&db.LLMUsage{
+			TaskID: task.ID, Worker: "worker", IntentID: intentID,
+			WorkerInstance: "work#1", InputTokens: in, OutputTokens: out, Status: "ok",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ins(findingOnlyID, 400, 100)  // 0.5K，很低但产出了 Finding → 不标低产
+	ins(normalID, 4500, 500)      // 5K
+	ins(normal2ID, 4500, 500)     // 5K
+	ins(burnID, 48000, 2000)      // 50K，均值=(0.5+5+5+50)/4=15.125K，50K >= 2*mean → 高耗零产
+
+	got := s.costSituational(taskID)
+	if !strings.Contains(got, "高耗零产") || !strings.Contains(got, fmt.Sprintf("#%d", burnID)) {
+		t.Fatalf("expected high-burn zero-yield intent #%d flagged, got: %s", burnID, got)
+	}
+	if strings.Contains(got, fmt.Sprintf("#%d", findingOnlyID)) {
+		t.Fatalf("finding-only intent #%d must not be flagged as low-yield, got: %s", findingOnlyID, got)
+	}
+}
+
 // compactTokens 单位压缩：与态势行展示的紧凑格式绑定。
 func TestCompactTokens(t *testing.T) {
 	cases := map[int]string{

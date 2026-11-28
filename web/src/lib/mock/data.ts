@@ -3326,7 +3326,7 @@ export const tools: Tool[] = [
 export const settings: Settings = {
   traffic_capture: true,
   agent_traffic_binding: false,
-  llm_record: false,
+  llm_record: true,
   web_search_enabled: true,
   web_search_backend: "ddgs",
   brave_key_set: false,

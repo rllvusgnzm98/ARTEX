@@ -86,6 +86,21 @@ func TestExtractBriefHosts(t *testing.T) {
 			`必须先访问 http://10.0.100.58。然后再行动。`,
 			[]string{"10.0.100.58"},
 		},
+		{
+			"negated chinese URL and bare IP excluded",
+			`目标 https://app.target-corp.cn/，严禁访问 https://prod.target-corp.cn/，不要扫描 10.0.0.66。`,
+			[]string{"app.target-corp.cn"},
+		},
+		{
+			"negated english out-of-scope URL excluded",
+			`Audit https://staging.acme.test/; out of scope: https://billing.acme.test/, do not probe 10.9.9.9.`,
+			[]string{"staging.acme.test"},
+		},
+		{
+			"callback and OOB URL excluded",
+			`攻击机回调地址 http://10.8.0.2:8787/o/test，OOB webhook https://oob.attacker.test/cb，请先访问 https://target.lab.local/。`,
+			[]string{"target.lab.local"},
+		},
 	}
 	for _, c := range cases {
 		got := ExtractBriefHosts(c.text)

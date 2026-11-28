@@ -649,3 +649,26 @@ func TestSkillGuideDegradesWithoutSkillDir(t *testing.T) {
 		t.Fatalf("empty skill dir must not render any description, got: %s", guide)
 	}
 }
+
+func TestSkillGuideHonorsVisibilityResolver(t *testing.T) {
+	prev := SkillCatalogResolver
+	t.Cleanup(func() { SkillCatalogResolver = prev })
+	SkillCatalogResolver = func(agentKey string) (map[string]bool, map[string]string) {
+		return map[string]bool{
+				"target-health-triage": true,
+			}, map[string]string{
+				"target-health-triage": "3 点对照快速分诊 502/503/WAF",
+				"playwright-cli":       "已禁用技能不应泄露",
+			}
+	}
+	guide := SkillGuideForIntent(payload(t, map[string]any{"summary": "x", "chain_tags": []string{"web"}}))
+	if !strings.Contains(guide, "target-health-triage — 3 点对照快速分诊") {
+		t.Fatalf("visible skill description missing: %s", guide)
+	}
+	if strings.Contains(guide, "playwright-cli") || strings.Contains(guide, "oss-cms-patch-audit") {
+		t.Fatalf("disabled/unbound skills must not be advertised: %s", guide)
+	}
+	if !strings.Contains(guide, "oob_allocate") {
+		t.Fatalf("managed OOB note must remain even when last skill is disabled: %s", guide)
+	}
+}

@@ -1,10 +1,14 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 )
@@ -103,14 +107,19 @@ func (s *Server) costSituational(taskID int64) string {
 			continue // open/running 意图还在花钱，不算「已完成」
 		}
 		summary := ""
-		var p map[string]any
+		var inputAssets []int64
+		var p struct {
+			Summary  string  `json:"summary"`
+			AssetIDs []int64 `json:"asset_ids"`
+		}
 		if json.Unmarshal(n.Payload, &p) == nil {
-			if v, _ := p["summary"].(string); v != "" {
-				summary = v
-			}
+			summary = p.Summary
+			inputAssets = p.AssetIDs
 		}
 		yields := 0
-		if ids, yerr := task.Store.FactsYielded(ic.IntentID); yerr == nil {
+		if cnt, yerr := task.Store.IntentYieldCount(ic.IntentID, inputAssets); yerr == nil {
+			yields = cnt
+		} else if ids, ferr := task.Store.FactsYielded(ic.IntentID); ferr == nil {
 			yields = len(ids)
 		}
 		done = append(done, doneCost{id: ic.IntentID, summary: summary, yields: yields, cost: ic.TotalTokens()})
@@ -124,24 +133,40 @@ func (s *Server) costSituational(taskID int64) string {
 	}
 	mean := total / len(done)
 	b.WriteString(fmt.Sprintf("，近%d个已完成意图均值 %s", len(done), compactTokens(mean)))
-	// 低产：已终态、零产出事实、且成本远低于均值（投入不足即收手，方向没挖动），
-	// planner 续派同类方向前应参考。
-	var low []string
+	// 两类零产出异常（已计入事实、发现与新发现资产）：
+	//  - 低产(早退零产)：成本 < 均值/2 且零产出（投入不足即收手，方向可能未挖动）
+	//  - 高耗零产：成本 >= 均值*2 且零产出（烧预算空转，续派前应反思换路）
+	var low, highBurn []string
+	formatItem := func(d doneCost) string {
+		if label := truncateRunes(d.summary, 12); label != "" {
+			return fmt.Sprintf("#%d %s %s", d.id, label, compactTokens(d.cost))
+		}
+		return fmt.Sprintf("#%d %s", d.id, compactTokens(d.cost))
+	}
 	for _, d := range done {
-		if d.yields == 0 && d.cost > 0 && d.cost < mean/2 {
-			if label := truncateRunes(d.summary, 12); label != "" {
-				low = append(low, fmt.Sprintf("#%d %s %s", d.id, label, compactTokens(d.cost)))
-			} else {
-				low = append(low, fmt.Sprintf("#%d %s", d.id, compactTokens(d.cost)))
-			}
+		if d.yields > 0 || d.cost <= 0 {
+			continue
+		}
+		switch {
+		case d.cost < mean/2:
+			low = append(low, formatItem(d))
+		case mean > 0 && d.cost >= mean*2:
+			highBurn = append(highBurn, formatItem(d))
 		}
 	}
 	if len(low) > 0 {
 		if len(low) > 4 {
 			low = low[:4]
 		}
-		b.WriteString("；低产(零产出事实)：")
+		b.WriteString("；低产(早退零产)：")
 		b.WriteString(strings.Join(low, "、"))
+	}
+	if len(highBurn) > 0 {
+		if len(highBurn) > 4 {
+			highBurn = highBurn[:4]
+		}
+		b.WriteString("；高耗零产：")
+		b.WriteString(strings.Join(highBurn, "、"))
 	}
 	return b.String()
 }
@@ -153,4 +178,69 @@ func truncateRunes(s string, n int) string {
 		return s
 	}
 	return string(r[:n]) + "…"
+}
+
+const (
+	defaultLLMRecordsMaxRows = 10000
+	defaultLLMRecordsTTLDays = 14
+)
+
+func envIntOrDefault(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v < 0 {
+		return fallback
+	}
+	return v
+}
+
+// runLLMRecordsRetention periodically trims llm_records when default-on recording
+// is active, bounding PostgreSQL storage by row count and age (0 disables either).
+func (s *Server) runLLMRecordsRetention(ctx context.Context) {
+	if s == nil || s.m == nil || s.m.pg == nil {
+		return
+	}
+	maxRows := envIntOrDefault("ARTEX_LLM_RECORDS_MAX_ROWS", defaultLLMRecordsMaxRows)
+	ttlDays := envIntOrDefault("ARTEX_LLM_RECORDS_TTL_DAYS", defaultLLMRecordsTTLDays)
+	if maxRows <= 0 && ttlDays <= 0 {
+		return
+	}
+	maxAge := time.Duration(ttlDays) * 24 * time.Hour
+	pruneOnce := func() {
+		pctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		n, err := s.m.pg.PruneLLMRecords(pctx, maxRows, maxAge)
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Printf("[llmrec] retention prune: %v", err)
+			}
+			return
+		}
+		if n > 0 {
+			log.Printf("[llmrec] retention pruned %d old rows (max_rows=%d ttl_days=%d)", n, maxRows, ttlDays)
+		}
+	}
+
+	initTimer := time.NewTimer(30 * time.Second)
+	defer initTimer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-initTimer.C:
+		pruneOnce()
+	}
+
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pruneOnce()
+		}
+	}
 }

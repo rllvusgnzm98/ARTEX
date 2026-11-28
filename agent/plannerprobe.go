@@ -104,12 +104,12 @@ func (h plannerProbeHooks) PreToolUse(ctx context.Context, name string, input []
 		// Boundary 1: workers have already produced facts — plan from the graph.
 		if h.facts != nil {
 			if n, ok := h.facts(); ok && n > 0 {
-				return true, fmt.Sprintf("%s图中已有 worker 产出的 %d 条事实，规划者不得再自行探测：一切判断基于已有事实（需要细节用 node_detail/list_facts 回查），想深挖某条线索请用 add_intent 派给 worker，别自己 curl。（查看任务目录或 shared/ 本地文件请直接用 Read / LS / Glob / Grep，切勿用 Bash）", PlannerProbeMessagePrefix, n), nil
+				return true, fmt.Sprintf("%s图中已有 worker 产出的 %d 条事实，规划者不得再自行探测：一切判断基于已有事实（需要细节用 node_detail/list_facts 回查），想深挖某条线索请用 add_intent 派给 worker，别自己 curl。（查看任务目录或 shared/ 本地文件可用 Read / LS / Glob / Grep 或本地只读 Bash，禁止触网或执行探测命令）", PlannerProbeMessagePrefix, n), nil
 			}
 		}
 		// Boundary 2: the opening allowance is finite.
 		if used, ok := h.state.take(h.limit); !ok {
-			return true, fmt.Sprintf("%s开局探测额度已用满（%d/%d 次，跨本任务所有规划轮共享）。探测的唯一合法产物是一句更精准的意图描述——现在就把已看到的写成 add_intent 派给 worker，枚举/验证/利用都是 worker 的活。（查看任务目录或 shared/ 本地文件请直接用 Read / LS / Glob / Grep，切勿用 Bash）", PlannerProbeMessagePrefix, used, h.limit), nil
+			return true, fmt.Sprintf("%s开局探测额度已用满（%d/%d 次，跨本任务所有规划轮共享）。探测的唯一合法产物是一句更精准的意图描述——现在就把已看到的写成 add_intent 派给 worker，枚举/验证/利用都是 worker 的活。（查看任务目录或 shared/ 本地文件可用 Read / LS / Glob / Grep 或本地只读 Bash，禁止触网或执行探测命令）", PlannerProbeMessagePrefix, used, h.limit), nil
 		}
 	}
 	if h.inner != nil {

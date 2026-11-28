@@ -720,11 +720,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	tools, def, cleanup := AugmentTools(ctx, "worker", base)
 	defer cleanup()
 	tools = wrapToolsWithWorkDeadline(tools)
-	// 后台进程台账：任何本次 run 里诞生的监听器/隧道/后台探测都记账，
-	// 收尾时写撤退现场清单（见 deathmanifest.go）——Session.Close 会杀掉
-	// 全部受管后台任务，跨意图依托只能靠这份清单让接班者重建。
+	// 后台进程台账：通过 PostToolUse hook 统一记录 Bash 与 SDK 内部注入的 Monitor
+	// 后台任务（并在 TaskStop 成功时摘除），收尾时在 Session.Close 之前写撤退现场清单。
 	ledger := &deathLedger{}
-	tools = wrapBashDeathLedger(tools, ledger)
 
 	// system prompt 保持任务级静态可缓存（角色正文 + 固定红线 + 任务级操作约束），
 	// 所有 per-intent 动态块（意图正文/骨架、目标资产、蜜罐提示、进场预塞、继承凭据、全局态势）
@@ -779,8 +777,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	seedBlock := RenderWorkerEntrySeed(entrySeed)
 	userLaunch.WriteString(seedBlock)
 	userLaunch.WriteString(w.credentialSeedBlock(ctx, taskID)) // 无继承凭据或查询失败时为空串
+	manifestBlock := deathManifestBlock(runDir, intent.ID) // 无撤退现场时为空串
 	userLaunch.WriteString(overview)
-	userLaunch.WriteString(deathManifestBlock(runDir, intent.ID)) // 无撤退现场时为空串
+	userLaunch.WriteString(manifestBlock)
 	userLaunch.WriteString("\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。")
 	launchInput := userLaunch.String()
 	log.Printf("[worker] intent #%d prompt chars: system=%d user=%d overview=%d entry_seed=%d",
@@ -860,6 +859,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
 		opts.Hooks = hooks
 	}
+	opts.Hooks = wrapDeathLedgerHooks(opts.Hooks, ledger)
 	if w.tx != nil { // persist raw LLM conversation; one file per worked intent
 		opts.Transcript = w.tx
 		opts.SessionID = WorkerSessionID(ts.ID(), intent.ID)
@@ -905,16 +905,16 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		alreadyRecorded = requestID != "" && hasWorkerChatMessage(s.Messages(), requestID)
 		if len(s.Messages()) > 0 && message == "" {
 			seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
-			input = "继续执行。"
+			input = "继续执行。" + manifestBlock
 		} else if len(s.Messages()) > 0 {
 			seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
 		}
 	}
 	if message != "" {
 		if alreadyRecorded {
-			input = "继续执行上一次人工对话输入的新意图。不要重复已经完成的动作。"
+			input = "继续执行上一次人工对话输入的新意图。不要重复已经完成的动作。" + manifestBlock
 		} else if len(s.Messages()) > 0 {
-			input = workerChatMarker(requestID) + "\n【人工对话输入的新意图】\n" + message +
+			input = workerChatMarker(requestID) + "\n【人工对话输入的新意图】\n" + message + manifestBlock +
 				"\n\n请立即按这条人工输入执行，完成后再根据上下文决定原任务是否需要继续。"
 		} else {
 			input += "\n\n" + workerChatMarker(requestID) + "\n【人工对话输入的新意图】\n" + message +
@@ -923,12 +923,12 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	}
 
 	reason, err := captureWorkerSession(ctx, s, resumeWarning+input, emitWrap)
+	// 撤退现场清单必须在 recoverSettlement 之前显式写：recoverSettlement 内部会调用
+	// previous.Close()，立即杀掉全部后台任务并删除其输出目录，此处是拷贝输出尾段的最后机会。
+	writeDeathManifest(runDir, intent.ID, ledger)
 	if recErr := w.recoverSettlement(ctx, s, opts, settle, err, tsx, emitWrap); recErr != nil && isTransientSettlementError(recErr) {
 		err = &SettlementTransientError{BudgetErr: err, RecoveryErr: recErr}
 	}
-	// 撤退现场清单必须在 return 前显式写：defer 的 s.Close() 随后就会杀掉
-	// 全部后台任务并删除其输出目录，此处是拷贝输出尾段的最后机会。
-	writeDeathManifest(runDir, intent.ID, ledger)
 	return reason, tsx.finishEvidenceWrites(), err
 }
 

@@ -38,6 +38,37 @@ func capBody(s string) string {
 	return s[:cut] + "\n…（正文已截断，原 " + strconv.Itoa(len(s)) + " 字节，上限 " + strconv.Itoa(maxBodyBytes) + "）"
 }
 
+// capJSONBody truncates oversized JSON payloads while keeping the persisted
+// column valid JSON (so UI tryFormatJSON and downstream JSON parsers keep working).
+func capJSONBody(s string) string {
+	if len(s) <= maxBodyBytes {
+		return s
+	}
+	// Reserve room for JSON envelope overhead and escaping.
+	previewCap := maxBodyBytes - 512
+	if previewCap < 1024 {
+		previewCap = 1024
+	}
+	cut := previewCap
+	if cut > len(s) {
+		cut = len(s)
+	}
+	for cut > 0 && (s[cut]&0xC0) == 0x80 {
+		cut--
+	}
+	env := map[string]any{
+		"_truncated":     true,
+		"original_bytes": len(s),
+		"limit_bytes":    maxBodyBytes,
+		"preview":        s[:cut],
+	}
+	b, err := json.Marshal(env)
+	if err != nil {
+		return capBody(s)
+	}
+	return string(b)
+}
+
 // WithTaskID attaches the owning task registry id to an LLM call. Session ids
 // are based on exploration ids, which are not interchangeable with task ids.
 func WithTaskID(ctx context.Context, taskID string) context.Context {
@@ -365,12 +396,12 @@ func (r *Recorder) record(ctx context.Context, req llm.CompletionRequest, sessio
 		CacheWrite:   usage.CacheWriteTokens,
 		Status:       status,
 		Error:        errMsg,
-		RequestBody:  capBody(reqBody),
-		ResponseBody: capBody(string(respBody)),
+		RequestBody:  capJSONBody(reqBody),
+		ResponseBody: capJSONBody(string(respBody)),
 		// Raw wire bodies; empty when the transport did not fill the Capture
 		// (e.g. a provider dialing through a client without the capture hook, or
 		// a call that failed before any HTTP request went out).
-		RawRequest:  capBody(capt.RawRequest()),
+		RawRequest:  capJSONBody(capt.RawRequest()),
 		RawResponse: capBody(capt.RawResponse()),
 	}
 
