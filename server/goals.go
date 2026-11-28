@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/guard"
 )
 
 type goalSpec struct {
@@ -30,6 +32,7 @@ func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) {
 		return
 	}
 	s.seed(t, seedText)
+	s.seedBriefScope(t, seedText)
 	if seedFirstIntent {
 		s.seedFirstIntent(t)
 	}
@@ -37,6 +40,38 @@ func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) {
 	if _, err := s.admitTask(t, "bootstrap"); err != nil {
 		log.Printf("[concurrency] task %s 启动失败: %v", t.ID, err)
 	}
+}
+
+// seedBriefScope 把任务书里**显式指令包含的地址**(完整 http(s) URL 的 host、
+// 带访问类指令动词的裸 IP)登记进 task_scope。挂载点选在这里而不是 RoE 检查
+// 时的豁免集:seed 路径本来就是任务启动时从任务书初始化资产/范围的既有机制,
+// upsertTaskScope 幂等,重复登记无副作用。source='seed'(操作员任务书是可信
+// 边界,与 round-0 拆解同级,strict 模式下也信任),reason 标注来源便于审计。
+// 提取本身保守(见 guard.ExtractBriefHosts):占位符/模板变量/本机回连地址不收。
+func (s *Server) seedBriefScope(t *Task, seedText string) {
+	hosts := guard.ExtractBriefHosts(seedText)
+	if len(hosts) == 0 {
+		return
+	}
+	as := s.m.Assets()
+	if as == nil {
+		return
+	}
+	taskID, err := strconv.ParseInt(t.ID, 10, 64)
+	if err != nil || taskID <= 0 {
+		return
+	}
+	for _, h := range hosts {
+		kind := "subdomain"
+		if net.ParseIP(h) != nil {
+			kind = "ip"
+		}
+		if _, err := as.AddAgentScope(taskID, kind, h, "任务书显式指令地址自动登记", "seed"); err != nil {
+			log.Printf("[seed] task %s: 任务书地址 %s 登记 scope 失败: %v", t.ID, h, err)
+			continue
+		}
+	}
+	s.m.InvalidateProxyRoE(taskID)
 }
 
 func (s *Server) startTaskEngine(t *Task) {

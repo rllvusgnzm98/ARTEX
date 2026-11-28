@@ -39,7 +39,15 @@ type Guard struct {
 	egress      *EgressGuard           // optional; 出口敏感指纹拦截,nil 关闭
 	tarpit      *tarpitState           // optional; tarpit 熔断,nil 关闭
 	roe         RoEConfig              // optional; 零值 / Scope=nil 关闭
+	roeWarned   map[roeWarnKey]bool    // warn 模式 (taskID,host) 首次告警去重;随 Guard 生命周期,不持久化
 	honeypot    HoneypotConfig         // optional; Check==nil 关闭
+}
+
+// roeWarnKey 是 warn-once 去重键:任务 Guard 每任务一个,但 chatGuard 进程级
+// 共享,所以 key 必须带 taskID 而不能只按 host。
+type roeWarnKey struct {
+	taskID int64
+	host   string
 }
 
 // New creates a Guard without user-configured intercept rules (used for pentest

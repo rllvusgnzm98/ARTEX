@@ -419,6 +419,16 @@ func workerArtifactSpec(runDir string) string {
 		"\n后续单兵还要用的制品（SSH 私钥、路由表、字典、凭据文件）写到跨单兵共享目录 **" + shared + "**（只增不删），并在 record_fact 的 artifact_paths 里记下这些绝对路径。共享文件只放这个目录。"
 }
 
+// workerEvidenceRules 是证据纪律的代码固定尾(不可被 DB 变体正文覆盖)：
+// 复盘实证——worker 曾因一条未经同等验证的情报推翻已实证结论而漂移，
+// 也曾在没摸清判卷/防护机制时蛮力试探烧掉大半预算。两条都属执行纪律,
+// 必须始终在场,故不走可编辑的 workerDefaultTmpl 正文。
+const workerEvidenceRules = `
+
+**证据与环境规则(不可编辑)**：
+1) **推翻已验证结论需要同级证据**：已被你亲手以源码级/实证级验证过的结论（请求-响应实锤、命令输出、源码比对），不得因一条未经同等验证的情报（单一报错、孤证状态码、第三方传言式描述、又一次失败尝试）而改道。改道前必须二选一：证伪原结论（复现原验证步骤并得到相反结果），或取得与原结论同级的反方证据。否则照原结论继续推进，把矛盾情报用 record_fact(confidence=inferred) 记下交规划者统筹。
+2) **先吃透环境规则再动手**：对目标环境发起大规模动作（爆破、批量探测、长时间 fuzz）之前，先用最少代价逆向摸清该环境的评分/判卷/防护/限速/监控机制——读目标返回的规则文本、错误页、响应头、暴露的脚本与配置。机制不明时的蛮力试探是最贵路径；摸机制本身只允许只读、低噪声动作。`
+
 // sharedDirForRun returns <taskDir>/shared for either the task root
 // (.../tasks/<id>, planner and main agent) or an intent run dir
 // (.../tasks/<id>/i<intentID>, worker).
@@ -480,7 +490,7 @@ func workerSystem(proxyAddr, caCert, dataDir, runDir string, intranet bool, fp F
 	// the traffic_* tools are registered — so it gates the traffic-tool note.
 	// Optional finding guidance is added for every role after tool resolution.
 	// CLI 优先固定尾与工人红线始终追加，使 system prompt 跨意图保持静态可缓存。
-	return body + workerTrafficBlock(caCert != "") + workerArtifactSpecStatic(runDir) + tail + workerShellCLIRules + untrustedDataRule + workerAntiTrapRules + workerFootprintRulesFor(fp) + chainskel.WorkerMetaRules
+	return body + workerTrafficBlock(caCert != "") + workerArtifactSpecStatic(runDir) + tail + workerShellCLIRules + workerEvidenceRules + untrustedDataRule + workerAntiTrapRules + workerFootprintRulesFor(fp) + chainskel.WorkerMetaRules
 }
 
 // renderIntentTask formats the claimed intent for the worker's launch USER message:
@@ -710,6 +720,11 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	tools, def, cleanup := AugmentTools(ctx, "worker", base)
 	defer cleanup()
 	tools = wrapToolsWithWorkDeadline(tools)
+	// 后台进程台账：任何本次 run 里诞生的监听器/隧道/后台探测都记账，
+	// 收尾时写撤退现场清单（见 deathmanifest.go）——Session.Close 会杀掉
+	// 全部受管后台任务，跨意图依托只能靠这份清单让接班者重建。
+	ledger := &deathLedger{}
+	tools = wrapBashDeathLedger(tools, ledger)
 
 	// system prompt 保持任务级静态可缓存（角色正文 + 固定红线 + 任务级操作约束），
 	// 所有 per-intent 动态块（意图正文/骨架、目标资产、蜜罐提示、进场预塞、继承凭据、全局态势）
@@ -765,6 +780,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	userLaunch.WriteString(seedBlock)
 	userLaunch.WriteString(w.credentialSeedBlock(ctx, taskID)) // 无继承凭据或查询失败时为空串
 	userLaunch.WriteString(overview)
+	userLaunch.WriteString(deathManifestBlock(runDir, intent.ID)) // 无撤退现场时为空串
 	userLaunch.WriteString("\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。")
 	launchInput := userLaunch.String()
 	log.Printf("[worker] intent #%d prompt chars: system=%d user=%d overview=%d entry_seed=%d",
@@ -910,6 +926,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if recErr := w.recoverSettlement(ctx, s, opts, settle, err, tsx, emitWrap); recErr != nil && isTransientSettlementError(recErr) {
 		err = &SettlementTransientError{BudgetErr: err, RecoveryErr: recErr}
 	}
+	// 撤退现场清单必须在 return 前显式写：defer 的 s.Close() 随后就会杀掉
+	// 全部后台任务并删除其输出目录，此处是拷贝输出尾段的最后机会。
+	writeDeathManifest(runDir, intent.ID, ledger)
 	return reason, tsx.finishEvidenceWrites(), err
 }
 

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -32,14 +33,27 @@ const PlannerProbeLimit = 3
 // model (and tests) can tell it apart from a stop-loss or permission refusal.
 const PlannerProbeMessagePrefix = "【规划者探测边界】"
 
-// plannerProbeTools are the planner's target-facing execution tools (shell,
-// HTTP fetch, and external MCP tools). Local read-only inspection
-// (Read/LS/Glob/Grep) and artifact writing are untouched: the boundaries are
-// about probing the target, not about touching files.
-func isPlannerProbeTool(name string) bool {
+// plannerProbeTools are the planner's target-facing execution tools (HTTP fetch
+// and external MCP tools, plus shell commands that actually touch the target).
+// Local read-only inspection (Read/LS/Glob/Grep) and artifact writing are
+// untouched: the boundaries are about probing the target, not about touching
+// files. Bash is therefore NOT gated by tool name — a Bash call is a probe only
+// when its command is not a provably read-only local inspection
+// (isLocalReadOnlyBash, the same classifier the concurrency wrapper uses).
+// Gating by tool name blocked `cat shared/challenges.json`-style local reads
+// and contradicted this boundary's own contract.
+func isPlannerProbeTool(name string, input []byte) bool {
 	switch name {
-	case "Bash", "WebFetch":
+	case "WebFetch":
 		return true
+	case "Bash":
+		var in struct {
+			Command string `json:"command"`
+		}
+		if err := json.Unmarshal(input, &in); err != nil || strings.TrimSpace(in.Command) == "" {
+			return true // 解析失败按触网处理（fail closed），与并发包装的保守取向一致
+		}
+		return !isLocalReadOnlyBash(in.Command)
 	}
 	return strings.HasPrefix(name, "mcp__")
 }
@@ -86,7 +100,7 @@ func WrapPlannerProbe(inner harness.HookRunner, state *plannerProbeState, limit 
 }
 
 func (h plannerProbeHooks) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
-	if isPlannerProbeTool(name) {
+	if isPlannerProbeTool(name, input) {
 		// Boundary 1: workers have already produced facts — plan from the graph.
 		if h.facts != nil {
 			if n, ok := h.facts(); ok && n > 0 {

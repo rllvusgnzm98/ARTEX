@@ -753,6 +753,9 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 		}
 		return nil
 	})
+	// 成本态势注入：planner 每轮 user input 拼一行 token 成本摘要(见 cost_situational.go)。
+	// 数据源是常驻账本 llm_usage，录制开关不影响；无数据/查询失败返回 "" 静默不注入。
+	pl.SetSituationalExtra(s.costSituational)
 	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	pl.SetUAResolver(s.uaForTask) // WebFetch 与 worker 共用按任务稳定 UA
 	pl.SetWebSearch(s.webSearchFor("planner"))

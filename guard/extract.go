@@ -98,6 +98,31 @@ var xmlSchemaHosts = map[string]bool{
 	"www.springframework.org": true,
 }
 
+// shellGlueRunes 是 shell 语法/分隔符字符:命令行里它们从不属于 host,属于
+// 粘连的语法残留(如 `curl http://a;,`、子shell `)`、命令替换边界)。
+// 注意保守:
+//   - 冒号不在内(端口与 IPv6 语义,端口由 stripPortMaybe 处理);
+//   - `{}` 不在内:`${var}`/`{{template}}` 可能出现在 URL userinfo/路径里,
+//     拆开会丢 host;变量残留由 stripShellVarSuffix 的既有语义处理;
+//   - `<>&|` 不在内:重定向/管道已由 reSegmentSplit 与 redirect 跳过逻辑处理,
+//     且 reScheme 本身不匹配它们。
+//
+// 逗号恒拆:host:port 列表(ffuf -u a.com,b.com)正是要拆的场景;合法 host 不含逗号。
+const shellGlueRunes = ";,()"
+
+// splitShellGlue 把粘连了 shell 语法字符的串按 glue 边界拆开,丢弃空段。
+func splitShellGlue(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool {
+		return strings.ContainsRune(shellGlueRunes, r)
+	})
+}
+
+// stripShellGlueEdges 剥掉 host 首尾粘连的 shell 语法字符(trailing `;`/`)`/`,`
+// 与 leading `(` 等)。IP/主机名匹配之前先剥,否则 `10.0.100.58;,` 整串永远不命中。
+func stripShellGlueEdges(s string) string {
+	return strings.Trim(s, shellGlueRunes)
+}
+
 func isXMLNamespaceContext(prefix string) bool {
 	return reXMLNSAttrPrefix.MatchString(prefix)
 }
@@ -128,12 +153,17 @@ func ExtractHosts(command string) []string {
 	}
 
 	// Pass 1: URLs anywhere in the command (skipping XML/SOAP xmlns namespace URIs).
+	// 先按 shell glue(`;,()` 等)拆开粘连串:reScheme 不把这些字符排除在外,
+	// 像 `curl http://a;,` 或 `http://a,http://b` 会整体被 URL 正则吞掉,
+	// 导致 Hostname() 带出尾标点、scope 永不命中。
 	for _, idx := range reScheme.FindAllStringIndex(command, -1) {
 		if isXMLNamespaceContext(command[:idx[0]]) {
 			continue
 		}
-		if h := extractURLHost(command[idx[0]:idx[1]]); h != "" {
-			add(h)
+		for _, piece := range splitShellGlue(command[idx[0]:idx[1]]) {
+			if h := extractURLHost(piece); h != "" {
+				add(h)
+			}
 		}
 	}
 
@@ -289,6 +319,9 @@ func isNonNetworkScheme(raw string) bool {
 
 func cleanExtractedHost(rawHost string) string {
 	h := strings.Trim(stripShellVarSuffix(rawHost), "[]")
+	// URL 的 Hostname() 是宽松解析:`http://10.0.100.58;,` 会带出 `;,`。
+	// 剥掉首尾 shell glue,scope 匹配才能命中已登记的 host。
+	h = stripShellGlueEdges(h)
 	if h == "" || h == "." || h == ".." {
 		return ""
 	}
@@ -322,6 +355,8 @@ func extractURLHost(raw string) string {
 // filtering netmask/broadcast/unspecified addresses (255.*.*.*, 0.0.0.0, ::).
 func parseBareIP(tok string) string {
 	tok = stripShellVarSuffix(tok)
+	// 独立 IP 路径不经过 addHostCandidate,`echo 10.0.0.58),` 这类粘连要在这里剥。
+	tok = stripShellGlueEdges(tok)
 	if tok == "" {
 		return ""
 	}
@@ -357,6 +392,18 @@ func stripPortMaybe(tok string) string {
 // 既有语义一致)。返回值表示该 token 是否匹配到了目标(含 CIDR)，用于单目标工具重置上下文。
 func addHostCandidate(add func(string), tok string) bool {
 	tok = strings.Trim(tok, `"'`)
+	// 粘连串按 shell glue 拆开逐个收:`nmap 10.0.0.1,10.0.0.2`、
+	// 命令替换/子shell 残留的 `(10.0.0.1)`、host 列表 `a.com,b.com`。
+	// 任一片段变化才递归,避免无限下降。
+	if strings.IndexAny(tok, shellGlueRunes) >= 0 {
+		matched := false
+		for _, frag := range splitShellGlue(tok) {
+			if frag != tok && addHostCandidate(add, frag) {
+				matched = true
+			}
+		}
+		return matched
+	}
 	if tok == "" || isXMLNamespaceToken(tok) {
 		return false
 	}

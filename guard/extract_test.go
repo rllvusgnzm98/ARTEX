@@ -245,3 +245,40 @@ func TestExtractHostsRoEFalsePositiveCleanup(t *testing.T) {
 		}
 	}
 }
+
+func TestExtractHostsShellGlueSplitting(t *testing.T) {
+	cases := []struct {
+		name string
+		cmd  string
+		want []string
+	}{
+		// 实证 bug:`10.0.100.58;,` 这类粘连串被整串当 host,scope 永不命中。
+		{"URL trailing semicolon", `curl http://10.0.100.58/`, []string{"10.0.100.58"}},
+		{"URL trailing semicolon glue", `curl http://10.0.100.58;`, []string{"10.0.100.58"}},
+		{"URL semicolon comma glue", `curl "http://10.0.100.58;,"`, []string{"10.0.100.58"}},
+		{"URL paren glue", `curl http://10.0.100.58)`, []string{"10.0.100.58"}},
+		{"bare IP trailing paren comma", `ncat 10.0.100.58), 80`, []string{"10.0.100.58"}},
+		{"bare IP standalone glue edges", `echo 10.0.100.58),`, []string{"10.0.100.58"}},
+		// 一条命令里多个 URL 粘连(逗号/分号分隔)各自拆分。
+		{"two URLs comma glued", `curl http://10.0.0.1/,http://10.0.0.2/`, []string{"10.0.0.1", "10.0.0.2"}},
+		{"two URLs separate args", `curl http://one.example.com http://two.example.com`, []string{"one.example.com", "two.example.com"}},
+		{"host list comma", `ffuf -u scan.example.com,other.example.com`, []string{"scan.example.com", "other.example.com"}},
+		{"IP list comma", `nmap 10.0.0.1,10.0.0.2`, []string{"10.0.0.1", "10.0.0.2"}},
+		{"paren wrapped ip", `ping (10.0.0.9)`, []string{"10.0.0.9"}},
+		// 保守:不能拆坏合法语法。
+		{"IPv6 URL intact", `curl "http://[2001:db8::1]:8080/x"`, []string{"2001:db8::1"}},
+		{"host port colon intact", `ncat example.com:8443 x`, []string{"example.com"}},
+		{"userinfo URL host intact", `curl http://user:pass@10.0.0.7/`, []string{"10.0.0.7"}},
+		{"shell var suffix still stripped", `curl "http://evil.com${path}"`, []string{"evil.com"}},
+		{"pure template url still empty", `curl "http://{{HOST}}/api"`, nil},
+	}
+	for _, c := range cases {
+		got := ExtractHosts(c.cmd)
+		if len(got) == 0 {
+			got = nil
+		}
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: ExtractHosts(%q) = %v, want %v", c.name, c.cmd, got, c.want)
+		}
+	}
+}

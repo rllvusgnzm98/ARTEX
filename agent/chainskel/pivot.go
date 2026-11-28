@@ -3,6 +3,9 @@ package chainskel
 import (
 	"encoding/json"
 	"strings"
+
+	"github.com/Autumn-27/artex/config"
+	"github.com/Autumn-27/norma/skill"
 )
 
 // pivotMarker 是骨架行里"转向"条目的字段标记(9 类骨架统一为
@@ -86,6 +89,59 @@ var categorySkillHints = map[string]string{
 	"priv":     "web-rce-gadget-playbook / windows-ad-postex / cross-os-payload-encoding",
 }
 
+// skillDescriptionTrunc 是注入提示里单条技能描述的长度上限（字符）：
+// 描述只为路由决策服务，截断防prompt膨胀；超长时按字符截断并补省略号。
+const skillDescriptionTrunc = 200
+
+// skillDescriptions 从技能目录读出每个技能的 frontmatter description，
+// 返回 name → 截断后的单行描述。目录缺失/文件损坏时静默降级为空表，
+// 渲染侧退化为只列技能名（同改动前行为）。
+func skillDescriptions() map[string]string {
+	reg, err := skill.LoadDir(config.SkillDir())
+	if err != nil {
+		return nil
+	}
+	out := make(map[string]string)
+	for _, sk := range reg.List() {
+		desc := strings.Join(strings.Fields(sk.Description), " ") // 折行/多余空白压平成单行
+		if desc == "" {
+			continue
+		}
+		runes := []rune(desc)
+		if len(runes) > skillDescriptionTrunc {
+			desc = string(runes[:skillDescriptionTrunc]) + "…"
+		}
+		out[sk.Name] = desc
+	}
+	return out
+}
+
+// withSkillDescriptions 把 "a / b / c（备注）" 形式的技能清单行改写成
+// "a — 描述； b — 描述； c — 描述（备注）"，让 worker 在选择是否加载前
+// 就能看到每个技能的触发场景；查不到描述的技能保留原名。
+func withSkillDescriptions(hint string, descs map[string]string) string {
+	if len(descs) == 0 {
+		return hint
+	}
+	names := strings.Split(hint, " / ")
+	if len(names) == 0 {
+		return hint
+	}
+	var out []string
+	for _, raw := range names {
+		name, suffix := raw, ""
+		if i := strings.Index(raw, "（"); i >= 0 {
+			name, suffix = strings.TrimSpace(raw[:i]), raw[i:]
+		}
+		if d, ok := descs[strings.TrimSpace(name)]; ok {
+			out = append(out, name+" — "+d+suffix)
+		} else {
+			out = append(out, raw)
+		}
+	}
+	return strings.Join(out, "； ")
+}
+
 func RefsGuideForIntent(_ json.RawMessage) string { return "" }
 
 // SkillGuideForIntent emits a concise skill & managed-OOB routing hint keyed off
@@ -115,7 +171,7 @@ func SkillGuideForIntent(payload json.RawMessage) string {
 	}
 	var lines []string
 	if hint, ok := categorySkillHints[cats[0]]; ok && hint != "" {
-		lines = append(lines, "["+cats[0]+"] 优先按需调 Skill 加载: "+hint)
+		lines = append(lines, "["+cats[0]+"] 优先按需调 Skill 加载: "+withSkillDescriptions(hint, skillDescriptions()))
 	}
 	if len(lines) == 0 {
 		return ""

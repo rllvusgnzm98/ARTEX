@@ -79,6 +79,77 @@ func TestPlannerProbeCapPersistsAcrossRounds(t *testing.T) {
 	}
 }
 
+// Bash 分流：对本地只读探查命令（cat/ls/grep/find 等）一律放行——即使 worker
+// 已产出事实、即使额度已满——因为边界只管「探测目标」，不管「触摸本地文件」。
+// 触网命令（curl 打目标）继续按两条边界拦截。
+func TestPlannerProbeBashSemanticSplit(t *testing.T) {
+	_, hooks := plannerProbeHooksFor(func() (int, bool) { return 7, true })
+
+	// worker 已有 7 条事实：本地读仍须放行，触网 curl 仍被 boundary 1 拦截。
+	for _, cmd := range []string{
+		`{"command":"cat shared/challenges.json"}`,
+		`{"command":"ls -la i12/"}`,
+		`{"command":"grep -r 'flag' shared/ | head -5"}`,
+		`{"command":"wc -l notes.txt"}`,
+		`{"command":"echo done"}`,
+	} {
+		if block, msg, _ := hooks.PreToolUse(context.Background(), "Bash", []byte(cmd)); block {
+			t.Fatalf("local read-only bash must never be blocked: %s, msg=%q", cmd, msg)
+		}
+	}
+	if block, msg, _ := hooks.PreToolUse(context.Background(), "Bash", []byte(`{"command":"curl http://10.0.0.9/"}`)); !block {
+		t.Fatalf("target-facing curl must still hit boundary 1, msg=%q", msg)
+	}
+
+	// 开局无事实时：本地读不消耗探测额度——连续多次本地读后，三次触网额度仍完整。
+	_, opening := plannerProbeHooksFor(noFacts)
+	for i := 0; i < PlannerProbeLimit+3; i++ {
+		if block, msg, _ := opening.PreToolUse(context.Background(), "Bash", []byte(`{"command":"cat /tmp/ledger.json"}`)); block {
+			t.Fatalf("local read %d must be allowed and must not consume probe allowance, msg=%q", i+1, msg)
+		}
+	}
+	curl := []byte(`{"command":"curl https://t.example.test/"}`)
+	for i := 0; i < PlannerProbeLimit-1; i++ {
+		if block, msg, _ := opening.PreToolUse(context.Background(), "Bash", curl); block {
+			t.Fatalf("probe %d/%d must be allowed (local reads must not consume it), msg=%q", i+1, PlannerProbeLimit, msg)
+		}
+	}
+
+	// 意图不纯的混合命令（本地读拼接触网）仍按探测计——这是第 3 次，仍在额度内。
+	mixed := []byte(`{"command":"cat shared/x.json && curl https://t.example.test/"}`)
+	if block, _, _ := opening.PreToolUse(context.Background(), "Bash", mixed); block {
+		t.Fatal("mixed command at opening: probe boundary passes it within allowance")
+	}
+	// 额度已用尽（2 curl + 1 mixed = 3），再调必被 boundary 2 拦截。
+	if block, msg, _ := opening.PreToolUse(context.Background(), "Bash", curl); !block {
+		t.Fatalf("probe allowance must be exhausted after mixed command, msg=%q", msg)
+	}
+
+	// 入参解析失败 fail closed（按触网处理）。
+	if block, _, _ := opening.PreToolUse(context.Background(), "Bash", []byte(`not-json`)); block {
+		// 此时额度已尽，必拦；该路径的语义正确性由 isPlannerProbeTool 的单测保证。
+	}
+}
+
+func TestIsPlannerProbeToolBashParsing(t *testing.T) {
+	// 畸形/空输入按触网 fail closed，不让未分类命令绕过边界。
+	for name, input := range map[string][]byte{
+		"not-json":     []byte(`not-json`),
+		"no command":   []byte(`{}`),
+		"empty cmd":    []byte(`{"command":"  "}`),
+	} {
+		if !isPlannerProbeTool("Bash", input) {
+			t.Fatalf("%s must fail closed as a probe", name)
+		}
+	}
+	if isPlannerProbeTool("Bash", []byte(`{"command":"cat notes.txt"}`)) {
+		t.Fatal("local cat must not classify as a probe")
+	}
+	if !isPlannerProbeTool("Bash", []byte(`{"command":"curl http://t/"}`)) {
+		t.Fatal("curl to a target must classify as a probe")
+	}
+}
+
 // Planning, graph reads and intent generation are never touched by the boundary.
 func TestPlannerProbeLeavesPlanningToolsAlone(t *testing.T) {
 	_, hooks := plannerProbeHooksFor(func() (int, bool) { return 99, true })

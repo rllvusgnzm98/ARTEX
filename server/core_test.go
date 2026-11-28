@@ -152,8 +152,10 @@ func TestCoreTaskLifecyclePG(t *testing.T) {
 	if deleted, _ := out["findings_deleted"].(float64); deleted != 1 {
 		t.Fatalf("expected one deleted finding, got %v", out)
 	}
-	if deleted, _ := out["llm_records_deleted"].(float64); deleted != 1 {
-		t.Fatalf("expected one deleted LLM record, got %v", out)
+	// 手动插入的 1 条必须删除；录制默认开启后，任务建/拆过程中的真实 LLM 调用
+	// （若环境配置了 LLM）也会落 llm_records，这些行同样应被级联删除，故断言是 ≥1。
+	if deleted, _ := out["llm_records_deleted"].(float64); deleted < 1 {
+		t.Fatalf("expected at least one deleted LLM record, got %v", out)
 	}
 	if _, err := os.Stat(taskDir); !os.IsNotExist(err) {
 		t.Fatalf("task directory should be deleted, stat err=%v", err)

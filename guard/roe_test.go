@@ -316,3 +316,105 @@ func TestRoELocalInterfaceAndCallbackAutoExemption(t *testing.T) {
 		t.Error("explicit exclude_ip must override local NIC auto-exemption")
 	}
 }
+
+func TestRoEWarnOnceDedup(t *testing.T) {
+	// warn 模式同一 (taskID, host) 只在首次写审计与日志,后续静默放行。
+	g := roeGuard("warn", []ScopeRule{{Kind: "cidr", Value: "10.0.0.0/8"}})
+	cmd := `nmap 172.16.0.5`
+	for i := 0; i < 3; i++ {
+		if blocked, _ := bashBlocked(t, g, cmd); blocked {
+			t.Fatal("warn 模式应放行")
+		}
+	}
+	var roeAllows int
+	for _, e := range g.Audit() {
+		if e.Action == "allow" && strings.Contains(e.Reason, "RoE") {
+			roeAllows++
+		}
+	}
+	if roeAllows != 1 {
+		t.Errorf("同一 host 重复越界应只写一次 RoE 审计, got %d: %+v", roeAllows, g.Audit())
+	}
+
+	// 不同 host 各自首次仍要告警。
+	if blocked, _ := bashBlocked(t, g, `nmap 172.16.0.6`); blocked {
+		t.Fatal("warn 模式应放行")
+	}
+	roeAllows = 0
+	for _, e := range g.Audit() {
+		if e.Action == "allow" && strings.Contains(e.Reason, "RoE") {
+			roeAllows++
+		}
+	}
+	if roeAllows != 2 {
+		t.Errorf("不同 host 的首次越界应各自告警, got %d: %+v", roeAllows, g.Audit())
+	}
+}
+
+func TestRoEWarnOnceKeyedByTask(t *testing.T) {
+	// 共享 Guard(chatGuard 场景):同一 host 在不同 taskID 下各自告警一次。
+	g := New()
+	var taskID int64 = 42
+	g.SetRoE(RoEConfig{
+		Mode:     func() string { return "warn" },
+		Scope:    func(int64) ([]ScopeRule, error) { return []ScopeRule{{Kind: "cidr", Value: "10.0.0.0/8"}}, nil },
+		TaskIDOf: func(context.Context) int64 { return taskID },
+	})
+	cmd := `nmap 172.16.0.5`
+	for _, id := range []int64{42, 42, 77} {
+		taskID = id
+		if blocked, _ := bashBlocked(t, g, cmd); blocked {
+			t.Fatal("warn 模式应放行")
+		}
+	}
+	var roeAllows int
+	for _, e := range g.Audit() {
+		if e.Action == "allow" && strings.Contains(e.Reason, "RoE") {
+			roeAllows++
+		}
+	}
+	if roeAllows != 2 {
+		t.Errorf("跨 taskID 的 (task,host) 应各自告警一次, got %d: %+v", roeAllows, g.Audit())
+	}
+}
+
+func TestRoEStrictBlocksEveryTime(t *testing.T) {
+	// strict 行为不变:每次都拦,不受 warn-once 去重影响。
+	g := roeGuard("strict", []ScopeRule{{Kind: "cidr", Value: "10.0.0.0/8"}})
+	for i := 0; i < 3; i++ {
+		if blocked, _ := bashBlocked(t, g, `nmap 172.16.0.5`); !blocked {
+			t.Fatalf("strict 第 %d 次仍应拦截", i+1)
+		}
+	}
+	var blocks int
+	for _, e := range g.Audit() {
+		if e.Action == "block" {
+			blocks++
+		}
+	}
+	if blocks != 3 {
+		t.Errorf("strict 每次都应拦并记 block, got %d", blocks)
+	}
+}
+
+func TestRoEGluedTargetMatchesScope(t *testing.T) {
+	// 实证 bug 回归:粘连串 `10.0.100.58;,` / `10.0.100.58)` 必须命中已登记 scope,
+	// 而不是整串当 host 永不命中。
+	for _, mode := range []string{"warn", "strict"} {
+		g := roeGuard(mode, []ScopeRule{{Kind: "ip", Value: "10.0.100.58"}})
+		for _, cmd := range []string{
+			`curl http://10.0.100.58/`,
+			`curl http://10.0.100.58;`,
+			`ncat 10.0.100.58), 80`,
+		} {
+			if blocked, _ := bashBlocked(t, g, cmd); blocked {
+				t.Errorf("mode %s: 已登记目标 %q 不应拦截", mode, cmd)
+			}
+		}
+		for _, e := range g.Audit() {
+			if strings.Contains(e.Reason, "RoE") && strings.Contains(e.Reason, "10.0.100.58") {
+				t.Errorf("mode %s: 已登记目标不应触发 RoE 告警: %+v", mode, e)
+			}
+		}
+	}
+}

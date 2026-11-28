@@ -2,6 +2,7 @@ package chainskel
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -593,5 +594,58 @@ func TestSkillGuideForIntentAndExpandedWebKeywords(t *testing.T) {
 	// Irrelevant summary stays silent.
 	if empty := SkillGuideForIntent(payload(t, map[string]any{"summary": "常规巡检,无明确攻击面"})); empty != "" {
 		t.Fatalf("expected empty SkillGuideForIntent for unmatched summary, got: %s", empty)
+	}
+}
+
+// 技能提示必须携带 frontmatter description（路由决策依据），而非裸名字。
+// 回归依据：复盘里 worker 面对 target-health-triage / blind-oracle-extractor
+// 这类名字无法判断何时该加载，提示只给一行技能名等于没给。
+func TestSkillGuideCarriesDescriptions(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("ARTEX_SKILL_DIR", dir)
+	writeTestSkill := func(name, desc string) {
+		sub := dir + "/" + name
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		body := "---\nname: " + name + "\ndescription: " + desc + "\n---\n正文\n"
+		if err := os.WriteFile(sub+"/SKILL.md", []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeTestSkill("target-health-triage", "目标 502/503/全站拦截或限速时的健康分诊与降级路线技能。")
+
+	guide := SkillGuideForIntent(payload(t, map[string]any{"summary": "x", "chain_tags": []string{"web"}}))
+	if !strings.Contains(guide, "target-health-triage — 目标 502/503") {
+		t.Fatalf("guide must carry the skill description inline, got: %s", guide)
+	}
+	// 目录里没有的技能名降级为裸名、不消失。
+	if !strings.Contains(guide, "oss-cms-patch-audit") {
+		t.Fatalf("skills without on-disk description must still be listed by name, got: %s", guide)
+	}
+
+	// 超长描述按字符截断并带省略号，防止 prompt 膨胀。
+	long := strings.Repeat("长", skillDescriptionTrunc+50)
+	writeTestSkill("oss-cms-patch-audit", long)
+	guide2 := SkillGuideForIntent(payload(t, map[string]any{"summary": "x", "chain_tags": []string{"web"}}))
+	if strings.Contains(guide2, long) {
+		t.Fatalf("description must be truncated at %d runes", skillDescriptionTrunc)
+	}
+	if !strings.Contains(guide2, "…") {
+		t.Fatalf("truncated description must carry ellipsis, got: %s", guide2)
+	}
+}
+
+// 技能目录缺失/不可读时静默降级为裸名清单（同改动前），绝不阻断意图渲染。
+func TestSkillGuideDegradesWithoutSkillDir(t *testing.T) {
+	t.Setenv("ARTEX_SKILL_DIR", t.TempDir()+"/does-not-exist")
+	// config.SkillDir 会创建缺失目录，所以这里目录会被建出来但为空：
+	// 空目录 = 没有技能 = 全裸名，同样验证降级路径。
+	guide := SkillGuideForIntent(payload(t, map[string]any{"summary": "x", "chain_tags": []string{"web"}}))
+	if !strings.Contains(guide, "target-health-triage") {
+		t.Fatalf("bare-name fallback must still list skills, got: %s", guide)
+	}
+	if strings.Contains(guide, " — ") {
+		t.Fatalf("empty skill dir must not render any description, got: %s", guide)
 	}
 }

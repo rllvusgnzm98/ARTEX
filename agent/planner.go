@@ -43,6 +43,7 @@ type Planner struct {
 	compactor         *Compactor                             // cold-node compaction (§7); nil = disabled
 	uaFn              func(taskID int64) string              // 按任务稳定 UA → WebFetch 请求头；nil = 官方默认
 	guardFn           func(taskID int64) harness.HookRunner  // 任务级 Guard hooks（用于规划者开局探测经由范围/拦截规则检查）
+	situationalExtraFn func(taskID int64) string              // 引擎侧横切态势注入（token 成本等），拼进每轮 user input；nil = 无
 
 	// todos keeps ONE plan-scratchpad per task (keyed by exploration id) so the
 	// planner's multi-step plan survives across wake-ups — each Plan() is a fresh
@@ -116,6 +117,12 @@ func (p *Planner) uaForTask(taskID int64) string {
 // SetGuardResolver wires a per-task Guard hook resolver so the planner's
 // opening probes still pass through task scope, RoE, and intercept guards.
 func (p *Planner) SetGuardResolver(fn func(taskID int64) harness.HookRunner) { p.guardFn = fn }
+
+// SetSituationalExtra wires a per-task situational injector: anything it
+// returns is appended to this round's user input after triggers+overview.
+// 用于引擎侧注入规划者可观测但图谱不承载的横切态势（如 token 成本台账），
+// 避免 server 侧伪造 trigger 语义或污染 graph_overview。nil/unset = 无注入。
+func (p *Planner) SetSituationalExtra(fn func(taskID int64) string) { p.situationalExtraFn = fn }
 
 // SetWebSearch selects the web_search backend for the planner (off by default).
 func (p *Planner) SetWebSearch(o WebSearchOpts) { p.webSearch = o }
@@ -375,6 +382,7 @@ const plannerDefaultTmpl = `你是授权安全测试与红队行动的"红队队
      1) **广度侦察哨**：针对未测绘域名/资产面做存活识别、前端 JS 路由/API 与鉴权机制提取，写回 assets/fact 即停，不混装漏洞利用；
      2) **定点破袭单**：必须锁定**唯一具体目标（站点/服务/端点簇）+ 明确攻击假设**往深打穿。**严禁下发"让 worker 自己拉目标列表挑一个打、打完再换下一个补位"的自调度总包单**（会导致火力撞车、配额/WAF 踩踏与单兵上下文腐化）；
      3) **内网纵深单**：依托已登记立足点会话或隧道向高价值内网靶标横向推进。
+   - **看门哨意图（低频长间隔，不占满配火力）**：当事实表明目标/资源暂时不可用（如 scope_limit 类熔断记录）但值得回捡时，**严禁立刻原样重派满配破袭单烧预算在等待上**。改为派一张『看门哨单』：summary 明确写「看门哨：轻探 X 是否恢复，最多 1-2 次轻量探测即收」，worker 侧一次只做极少探测、失败即 record_fact(scope_limit) 收队、探测到恢复信号立即升级为正式破袭单接力。同一目标的看门哨间隔随失败次数拉长（首次 ~10 分钟级、连续失败退避），把等待成本压在最低档，而把预算留给可推进方向。
    - **比对历史状态去重**：
      · done：看 yields 事实决定是否需要基于【实质性新机理】追加新方向，禁止换措辞重试。
      · exhausted / blocked：先看 get_worker_trace / get_worker_output：接近突破被掐断的汇总已得路径/凭据/断点续派；gateway_waf_blocked 时严禁原样重派，要求改用本地编码脚本直接发包靶机且只打精简结果（连续被拦 ≥3 次则换高价值面）。
@@ -439,6 +447,11 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	tc := taskClockFrom(ctx)
 	if tc.Final {
 		situational += "\n\n【任务终局收尾（本轮特殊指令，覆盖上面的常规规划流程）】：" + resolveTaskTimeoutWrapup("planner")
+	}
+	if p.situationalExtraFn != nil {
+		if extra := strings.TrimSpace(p.situationalExtraFn(taskID)); extra != "" {
+			situational += "\n\n" + extra
+		}
 	}
 	// 本任务的工作目录 <workDir>/tasks/<taskID>，先建好。
 	// shared/ 给跨单兵制品（密钥、路由表、字典）；worker 私有文件在 i<意图id>/。

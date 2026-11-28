@@ -358,3 +358,95 @@ func ParseExpID(s string) int64 {
 	}
 	return n
 }
+
+// LaneCost is one agent lane's total token spend for a task — lane is the
+// worker_instance attribution ("work#N" / "planner" / "mainagent" / 其他 lane 名)，
+// 空 lane 归并到 '(unknown)'。
+type LaneCost struct {
+	Lane             string `json:"lane"`
+	Calls            int    `json:"calls"`
+	InputTokens      int    `json:"input_tokens"`
+	OutputTokens     int    `json:"output_tokens"`
+	CacheReadTokens  int    `json:"cache_read_tokens"`
+	CacheWriteTokens int    `json:"cache_write_tokens"`
+}
+
+// CostByLane aggregates one task's LLM token spend grouped by agent lane
+// (worker_instance), most expensive first. 用 worker_instance 而非 worker 是因为
+// 后者只有角色(worker/planner)，区分不了并行 worker 各自的 lane。
+func (d *DB) CostByLane(taskID string) ([]LaneCost, error) {
+	rows, err := d.Query(`
+SELECT COALESCE(NULLIF(worker_instance,''), NULLIF(worker,''), '(unknown)') AS lane,
+       COUNT(*) AS calls,
+       COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+       COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_write),0)
+FROM llm_usage
+WHERE COALESCE(task_id,'') = $1
+GROUP BY lane
+ORDER BY SUM(input_tokens) + SUM(output_tokens) + SUM(cache_read) + SUM(cache_write) DESC, lane`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []LaneCost{}
+	for rows.Next() {
+		var c LaneCost
+		if err := rows.Scan(&c.Lane, &c.Calls, &c.InputTokens, &c.OutputTokens,
+			&c.CacheReadTokens, &c.CacheWriteTokens); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// IntentCost is one intent's total token spend, last_call_at 是该意图最后一次
+// LLM 调用时间(用于按完成先后排序)。
+type IntentCost struct {
+	IntentID         int64     `json:"intent_id"`
+	Calls            int       `json:"calls"`
+	InputTokens      int       `json:"input_tokens"`
+	OutputTokens     int       `json:"output_tokens"`
+	CacheReadTokens  int       `json:"cache_read_tokens"`
+	CacheWriteTokens int       `json:"cache_write_tokens"`
+	LastCallAt       time.Time `json:"last_call_at"`
+}
+
+// CostByIntent aggregates one task's LLM token spend grouped by intent
+// (llm_usage.intent_id，由 session_id/attribution 解析写入)，按最近调用时间倒序。
+// 行数按 intent 数计算，无任务级 LIMIT——调用方自行截窗口。
+func (d *DB) CostByIntent(taskID string) ([]IntentCost, error) {
+	rows, err := d.Query(`
+SELECT intent_id, COUNT(*) AS calls,
+       COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+       COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_write),0),
+       MAX(ts) AS last_call_at
+FROM llm_usage
+WHERE COALESCE(task_id,'') = $1 AND intent_id IS NOT NULL
+GROUP BY intent_id
+ORDER BY MAX(ts) DESC`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []IntentCost{}
+	for rows.Next() {
+		var c IntentCost
+		if err := rows.Scan(&c.IntentID, &c.Calls, &c.InputTokens, &c.OutputTokens,
+			&c.CacheReadTokens, &c.CacheWriteTokens, &c.LastCallAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// TotalTokens 返回总 token 量(input+output+cache_read+cache_write)，紧凑展示用。
+func (c LaneCost) TotalTokens() int {
+	return c.InputTokens + c.OutputTokens + c.CacheReadTokens + c.CacheWriteTokens
+}
+
+// TotalTokens 返回总 token 量(input+output+cache_read+cache_write)，紧凑展示用。
+func (c IntentCost) TotalTokens() int {
+	return c.InputTokens + c.OutputTokens + c.CacheReadTokens + c.CacheWriteTokens
+}

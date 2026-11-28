@@ -9,6 +9,7 @@ import (
 	"github.com/Autumn-27/artex/config"
 	"iter"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +20,23 @@ import (
 
 type taskIDContextKey struct{}
 type workerContextKey struct{}
+
+// maxBodyBytes 单条落库正文(request/response/raw)上限：超出截断并追加标记。
+// 大上下文任务一次请求原文常达数百 KB，不封顶会把 llm_records 表撑爆。
+const maxBodyBytes = 256 * 1024
+
+// capBody truncates s at maxBodyBytes (rune-boundary safe) and appends a
+// truncation marker carrying the original size. 小于上限原样返回。
+func capBody(s string) string {
+	if len(s) <= maxBodyBytes {
+		return s
+	}
+	cut := maxBodyBytes
+	for cut > 0 && (s[cut]&0xC0) == 0x80 {
+		cut-- // 回退到完整 rune 边界（UTF-8 后续字节 10xxxxxx）
+	}
+	return s[:cut] + "\n…（正文已截断，原 " + strconv.Itoa(len(s)) + " 字节，上限 " + strconv.Itoa(maxBodyBytes) + "）"
+}
 
 // WithTaskID attaches the owning task registry id to an LLM call. Session ids
 // are based on exploration ids, which are not interchangeable with task ids.
@@ -347,13 +365,13 @@ func (r *Recorder) record(ctx context.Context, req llm.CompletionRequest, sessio
 		CacheWrite:   usage.CacheWriteTokens,
 		Status:       status,
 		Error:        errMsg,
-		RequestBody:  reqBody,
-		ResponseBody: string(respBody),
+		RequestBody:  capBody(reqBody),
+		ResponseBody: capBody(string(respBody)),
 		// Raw wire bodies; empty when the transport did not fill the Capture
 		// (e.g. a provider dialing through a client without the capture hook, or
 		// a call that failed before any HTTP request went out).
-		RawRequest:  capt.RawRequest(),
-		RawResponse: capt.RawResponse(),
+		RawRequest:  capBody(capt.RawRequest()),
+		RawResponse: capBody(capt.RawResponse()),
 	}
 
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
