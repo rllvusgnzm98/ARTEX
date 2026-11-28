@@ -18,7 +18,7 @@ func TestAgentSettleSecondsPG(t *testing.T) {
 	}
 	t.Cleanup(func() { _, _ = pg.Exec(`DELETE FROM agents WHERE key=$1`, key) })
 	s := &Server{m: &Manager{pg: pg}}
-	if a.SettleSecs != 120 || s.agentSettleSeconds(key) != 120 || s.agentSettleSeconds("missing-settlement-fixture") != 120 {
+	if a.SettleSecs != 180 || s.agentSettleSeconds(key) != 180 || s.agentSettleSeconds("missing-settlement-fixture") != 180 {
 		t.Fatalf("default=%d", a.SettleSecs)
 	}
 	for _, tc := range []struct {

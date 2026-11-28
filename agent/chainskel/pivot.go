@@ -83,7 +83,7 @@ func PivotHintsForIntent(payload json.RawMessage, max int) string {
 }
 
 var categorySkillHints = map[string]string{
-	"web":      "target-health-triage / oss-cms-patch-audit / async-client-oob-chain / blind-oracle-extractor / web-rce-gadget-playbook / js-api-recon / tbhm-app-analysis / playwright-cli（带外回连用 oob_allocate/oob_poll）",
+	"web":      "target-health-triage / oss-cms-patch-audit / async-client-oob-chain / blind-oracle-extractor / web-rce-gadget-playbook / weblogic-java-rce / js-api-recon / tbhm-app-analysis / playwright-cli（带外回连用 oob_allocate/oob_poll）",
 	"audit":    "oss-cms-patch-audit / web-rce-gadget-playbook / js-api-recon",
 	"patch":    "oss-cms-patch-audit",
 	"identity": "async-client-oob-chain / web-rce-gadget-playbook / playwright-cli",
@@ -91,6 +91,69 @@ var categorySkillHints = map[string]string{
 	"ad":       "windows-ad-postex / ad-exchange-relay / cross-os-payload-encoding",
 	"pivot":    "multi-hop-pivoting / cross-os-payload-encoding",
 	"priv":     "web-rce-gadget-playbook / windows-ad-postex / cross-os-payload-encoding",
+}
+
+const internalReconSkillHint = "windows-ad-postex / multi-hop-pivoting / cross-os-payload-encoding"
+
+// isInternalHostRecon detects LAN / single-IP / Windows / AD host-recon intents
+// where external enterprise domain/ASN/SPA recon skills (tbhm-recon, js-api-recon)
+// would be irrelevant noise.
+func isInternalHostRecon(summary string) bool {
+	lower := strings.ToLower(summary)
+	for _, ext := range []string{"子域", "subdomain", "dmarc", "asn", "webpack", "vite", "spa", "前端", "js 路由", "企业资产"} {
+		if strings.Contains(lower, ext) {
+			return false
+		}
+	}
+	for _, lan := range []string{"192.168.", "10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.30.", "172.31."} {
+		if strings.Contains(lower, lan) {
+			return true
+		}
+	}
+	for _, hostKw := range []string{"全端口", "smb", "winrm", "rdp", "netbios", "内网", "跳板", "域控", "域成员", "windows server"} {
+		if strings.Contains(lower, hostKw) {
+			return true
+		}
+	}
+	return false
+}
+
+// prioritySkillsForSummary returns high-confidence skill names directly anchored
+// by concrete tech/protocol/scenario keywords in the intent summary.
+func prioritySkillsForSummary(summary string) []string {
+	lower := strings.ToLower(summary)
+	var out []string
+	seen := map[string]bool{}
+	add := func(name string) {
+		if !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	hasAny := func(kws ...string) bool {
+		for _, kw := range kws {
+			if strings.Contains(lower, kw) {
+				return true
+			}
+		}
+		return false
+	}
+	if hasAny("weblogic", "wls-wsat", "xmldecoder", "cve-2017-10271", ":7001", "iiop", "serializedsystemini") {
+		add("weblogic-java-rce")
+	}
+	if hasAny("portproxy", "socks", "chisel", "rcsocks", "跳板", "多跳", "隧道", "内网横向", "双网卡") {
+		add("multi-hop-pivoting")
+	}
+	if hasAny("zerologon", "dcsync", "kerberos", "printnightmare", "spoolss", "ms17-010", "eternalblue", "wmiexec", "secretsdump", "域控", "域渗透", "域成员") {
+		add("windows-ad-postex")
+	}
+	if hasAny("exchange", "owa", "petitpotam", "coercer", "ntlm relay", "efsrpc", "强制认证") {
+		add("ad-exchange-relay")
+	}
+	if hasAny("powershell", "gbk", "utf-16", "magic_quotes", "escapeshellcmd", "cmd /c", "base64") {
+		add("cross-os-payload-encoding")
+	}
+	return out
 }
 
 // skillDescriptionTrunc 是注入提示里单条技能描述的长度上限（字符）：
@@ -237,7 +300,8 @@ func withSkillDescriptions(hint string, allowed map[string]bool, descs map[strin
 func RefsGuideForIntent(_ json.RawMessage) string { return "" }
 
 // SkillGuideForIntent emits a concise skill & managed-OOB routing hint keyed off
-// the intent's chain_tags (or summary fallback). Returns "" when no category matches.
+// the intent's chain_tags (or summary fallback) plus high-confidence keyword matches.
+// Returns "" when neither category nor keyword matches.
 func SkillGuideForIntent(payload json.RawMessage) string {
 	var p struct {
 		Summary   string   `json:"summary"`
@@ -258,14 +322,27 @@ func SkillGuideForIntent(payload json.RawMessage) string {
 	if len(cats) == 0 {
 		cats = Match(p.Summary)
 	}
-	if len(cats) == 0 {
+	priority := prioritySkillsForSummary(p.Summary)
+	if len(cats) == 0 && len(priority) == 0 {
 		return ""
 	}
+	allowed, descs := resolveWorkerSkillCatalog()
 	var lines []string
-	if hint, ok := categorySkillHints[cats[0]]; ok && hint != "" {
-		allowed, descs := resolveWorkerSkillCatalog()
+	if len(priority) > 0 {
+		if rendered := withSkillDescriptions(strings.Join(priority, " / "), allowed, descs); rendered != "" {
+			lines = append(lines, "[高匹配] 动手前先调 Skill 加载: "+rendered)
+		}
+	}
+	for _, cat := range cats {
+		hint, ok := categorySkillHints[cat]
+		if !ok || hint == "" {
+			continue
+		}
+		if cat == "recon" && isInternalHostRecon(p.Summary) {
+			hint = internalReconSkillHint
+		}
 		if rendered := withSkillDescriptions(hint, allowed, descs); rendered != "" {
-			lines = append(lines, "["+cats[0]+"] 优先按需调 Skill 加载: "+rendered)
+			lines = append(lines, "["+cat+"] 优先按需调 Skill 加载: "+rendered)
 		}
 	}
 	if len(lines) == 0 {

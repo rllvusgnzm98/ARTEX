@@ -26,7 +26,8 @@ type MainAgent struct {
 	tx                 *transcript.Store                      // raw LLM conversation persistence (nil = off)
 	window             int                                    // context window in tokens (for compaction)
 	windowFn           func() int                             // optional dynamic task-chain minimum
-	maxTurns           int                                    // max agent turns per run (0 = unlimited)
+	maxTurns           int                                    // max agent turns per run (0 = default bounded cap)
+	chatTimeout        time.Duration                          // per-chat-turn wall-clock cap (0 = defaultMainAgentChatTimeout)
 	proxyAddr          string                                 // recording proxy for WebFetch (empty = direct)
 	proxyCACert        string                                 // recording proxy's CA cert path (HTTPS verify)
 	webSearch          WebSearchOpts                          // web_search tool backend selection (off by default)
@@ -63,6 +64,15 @@ func (m *MainAgent) maxTokens() int {
 	}
 	return m.maxTokensFn()
 }
+
+const (
+	defaultMainAgentChatMaxTurns = 24
+	defaultMainAgentChatTimeout  = 5 * time.Minute
+)
+
+// SetChatTimeout overrides the per-turn wall-clock ceiling for MainAgent.Chat.
+// Non-positive values fall back to defaultMainAgentChatTimeout (5m).
+func (m *MainAgent) SetChatTimeout(d time.Duration) { m.chatTimeout = d }
 
 func NewMainAgent(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int) *MainAgent {
 	return &MainAgent{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns}
@@ -119,8 +129,8 @@ func (m *MainAgent) wantConstraints() bool {
 // 产物输出规约 tail is code-owned (artifactSpec), appended after rendering.
 const mainAgentDefaultTmpl = `你是本任务的"红队队长"人机直通指挥席（主 agent），与后台自动规划共享同一套探索图谱、杀伤链待办白板与火力控制权。系统提示末尾已实时附上当前全局态势与待办白板，无需开局再调 graph_overview 空查。职责：
 
-1. **战况研判与复盘**：基于实时态势，按需调 node_detail / list_facts / list_findings / get_worker_output / list_assets 直答指挥官关于战局与证据的提问，绝不编造未实测的结论。
-2. **直接指挥与火力调配（少当传声筒，能直接落地的当场执行）**：
+1. **战况研判与复盘**：基于实时态势，按需调 node_detail（支持 ids 批量拉取） / list_facts / list_findings / get_worker_output / list_assets 直答指挥官关于战局与证据的提问，绝不编造未实测的结论。
+2. **直接指挥与火力调配（指挥动作当场落地，严禁亲自下场打靶）**：
    - 叫停跑偏/卡死突击手 → 直接调 kill_work；对在跑突击手递话微调打法 → 调 steer_work（先看 get_worker_output）；
    - 指派具体侦察或突破任务 → 直接调 add_intent 下发【单目标明确假设】的高优意图（priority 8-10，必传关联 asset_ids / parent_ids，严禁下发多目标盲盒总包单）。系统会自动把已完成任务拉回运行态执行，跑完即回已完成状态；
      **当任务目标已全部达成时**（graph_overview 里 goals 均为 met）：下发前先判断该意图背后是否隐含"新的正式目标"。若隐含，先用一句话复述确认是否登记为正式目标（要 → set_goals 接续自动推进；不要/仅临时查证 → 只 add_intent 下发这一条）；明显只是一次性查证则直接 add_intent；
@@ -133,9 +143,18 @@ const mainAgentDefaultTmpl = `你是本任务的"红队队长"人机直通指挥
 
 不要编造发现；只根据工具返回的真实数据回答。`
 
+// mainAgentCommandSeatRules 是代码固定尾（不可被 DB 变体覆盖），防止主 Agent
+// 绕过探索图谱亲自下场当“影子单兵”消耗算力或污染靶机环境。
+const mainAgentCommandSeatRules = `
+
+**指挥席红线（不可编辑）**：
+- 你是总控指挥席，**严禁亲自通过 Bash / WebFetch / MCP 对靶机发起扫描、探测、漏洞利用、爆破、文件上传或后渗透操作**；一切对目标主机的操作必须经 add_intent 派给 worker，或经 steer_work / kill_work 调配在跑单兵。
+- 收到用户提供的资源或线索（如本地字典目录、凭据、背景提示）时，立即通过 add_hint / add_task_scope / steer_work 登记并简短回复确认即可，切勿借机绕过图谱自行单干。
+- 本地工具（Read / LS / Glob / Grep 及本地只读 Bash）仅用于检查本任务目录、shared/ 产物或用户提供的本地路径。`
+
 func mainAgentSystem(goal, dataDir, workDir string) string {
 	body := renderSystem("mainagent", mainAgentDefaultTmpl, MainVars{Goal: goal, DataDir: dataDir, Now: nowStr()})
-	return body + artifactSpec(workDir)
+	return body + artifactSpec(workDir) + mainAgentCommandSeatRules
 }
 
 // Chat handles one human message and returns the assistant reply. emit, if
@@ -143,7 +162,15 @@ func mainAgentSystem(goal, dataDir, workDir string) string {
 // text / result) so the main-agent session shows its work — exactly like the
 // worker/planner sessions — not just the final answer.
 func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.AssetStore, ts *db.ExplorationStore, goal, message string, emit func(db.Activity), notify, resume func(), notifyGoal, notifyHint func([]string)) (string, error) {
-	return m.runChat(ctx, taskID, mainSeg, as, ts, goal, message, m.maxTurns, 0, emit, notify, resume, notifyGoal, notifyHint)
+	maxTurns := m.maxTurns
+	if maxTurns <= 0 {
+		maxTurns = defaultMainAgentChatMaxTurns
+	}
+	maxDur := m.chatTimeout
+	if maxDur <= 0 {
+		maxDur = defaultMainAgentChatTimeout
+	}
+	return m.runChat(ctx, taskID, mainSeg, as, ts, goal, message, maxTurns, maxDur, emit, notify, resume, notifyGoal, notifyHint)
 }
 
 // Patrol runs one autonomous campaign-orchestration round on the shared mainagent
@@ -233,6 +260,7 @@ func (m *MainAgent) runChat(ctx context.Context, taskID int64, mainSeg int, as *
 	if m.guardFn != nil {
 		opts.Hooks = m.guardFn(taskID)
 	}
+	opts.Hooks = WrapMainAgentFence(opts.Hooks)
 	if m.tx != nil { // persist raw human↔AI conversation; one accumulating file per segment
 		opts.Transcript = m.tx
 		// Segment 0 keeps the legacy "exp%d-main" name so existing transcripts still

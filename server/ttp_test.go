@@ -3,10 +3,14 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"iter"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/norma/llm"
@@ -95,5 +99,90 @@ func TestTriggerTaskRetroAndDedup(t *testing.T) {
 	if fakeProv.calls != prevCalls+1 {
 		t.Fatalf("expected maybeRunPauseRetro to skip duplicate milestone, calls=%d", fakeProv.calls)
 	}
-	_ = context.Background()
+}
+
+type retroFallbackProvider struct {
+	calls     int
+	prompts   []string
+	failFirst error
+	reply     string
+}
+
+func (p *retroFallbackProvider) Complete(context.Context, llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	return llm.Message{}, "", llm.Usage{}, nil
+}
+
+func (p *retroFallbackProvider) Stream(_ context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+	p.calls++
+	if len(req.Messages) > 0 {
+		p.prompts = append(p.prompts, req.Messages[0].Text())
+	}
+	attempt := p.calls
+	return func(yield func(llm.StreamEvent, error) bool) {
+		if attempt == 1 && p.failFirst != nil {
+			yield(llm.StreamEvent{}, p.failFirst)
+			return
+		}
+		if !yield(llm.StreamEvent{Type: llm.SEMessageStart}, nil) {
+			return
+		}
+		if !yield(llm.StreamEvent{Type: llm.SETextDelta, Text: p.reply}, nil) {
+			return
+		}
+		yield(llm.StreamEvent{Type: llm.SEMessageStop}, nil)
+	}
+}
+
+func TestRetroTimeoutFallsBackToCompactInput(t *testing.T) {
+	pg := openTestPG(t)
+	row, err := pg.CreateTask("retro timeout fallback fixture", "test compact fallback", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pg.DeleteTask(row.ID) })
+	store := pg.Exploration(row.ExplorationID)
+	if _, err := store.AddNode(db.KindFinding, map[string]any{"name": "WebLogic CVE-2017-10271", "vulnclass": "rce", "severity": "critical"}, 0, "confirmed", "worker", nil); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 40; i++ {
+		if _, err := store.AddNode(db.KindFact, map[string]any{"summary": "中文长事实段落" + strings.Repeat("内网横向记录", 40)}, 0, "confirmed", "worker", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	prevPrimary, prevCompact := retroCallTimeout, retroCompactCallTimeout
+	retroCallTimeout = 2 * time.Second
+	retroCompactCallTimeout = 2 * time.Second
+	t.Cleanup(func() {
+		retroCallTimeout = prevPrimary
+		retroCompactCallTimeout = prevCompact
+	})
+
+	taskID := strconv.FormatInt(row.ID, 10)
+	prov := &retroFallbackProvider{
+		failFirst: context.DeadlineExceeded,
+		reply:     `[{"category":"pivot","scene":"多跳跳板超时前发射慢利用","criteria":"撤退清单留有后台尾日志","pivot":"接班单先读尾日志再复验避免重发"}]`,
+	}
+	s := &Server{
+		m: &Manager{
+			pg:    pg,
+			tasks: map[string]*Task{taskID: {ID: taskID, ExpID: row.ExplorationID, Store: store, Goal: "拿域控 flag"}},
+		},
+		ctx:     t.Context(),
+		llmProv: prov,
+	}
+
+	n, err := s.runRetroWithResult(t.Context(), taskID)
+	if err != nil {
+		t.Fatalf("runRetroWithResult fallback failed: %v", err)
+	}
+	if n != 1 || prov.calls != 2 {
+		t.Fatalf("expected 1 entry across 2 attempts (primary timeout + compact retry), got n=%d calls=%d", n, prov.calls)
+	}
+	if len(prov.prompts[1]) >= len(prov.prompts[0]) || len(prov.prompts[1]) > 8064 {
+		t.Fatalf("compact retry prompt must be strictly smaller and bounded: full=%d compact=%d", len(prov.prompts[0]), len(prov.prompts[1]))
+	}
+	if !utf8.ValidString(prov.prompts[0]) || !utf8.ValidString(prov.prompts[1]) {
+		t.Fatal("retro prompts must remain valid UTF-8 after byte budgeting")
+	}
 }

@@ -21,31 +21,43 @@ import (
 type taskIDContextKey struct{}
 type workerContextKey struct{}
 
-// maxBodyBytes 单条落库正文(request/response/raw)上限：超出截断并追加标记。
-// 大上下文任务一次请求原文常达数百 KB，不封顶会把 llm_records 表撑爆。
-const maxBodyBytes = 256 * 1024
+// maxBodyBytes 单条落库正文(request_body/response_body)上限：超出截断并追加标记。
+// maxRawBodyBytes 原始 HTTP 报文(raw_request/raw_response)上限：raw 报文与归一化正文
+// 高度重复且包含完整工具 schema，用更紧上限避免单任务把 llm_records 表撑到数百 MB。
+const (
+	maxBodyBytes    = 256 * 1024
+	maxRawBodyBytes = 64 * 1024
+)
 
 // capBody truncates s at maxBodyBytes (rune-boundary safe) and appends a
 // truncation marker carrying the original size. 小于上限原样返回。
 func capBody(s string) string {
-	if len(s) <= maxBodyBytes {
+	return capBodyLimit(s, maxBodyBytes)
+}
+
+func capBodyLimit(s string, limit int) string {
+	if limit <= 0 || len(s) <= limit {
 		return s
 	}
-	cut := maxBodyBytes
+	cut := limit
 	for cut > 0 && (s[cut]&0xC0) == 0x80 {
 		cut-- // 回退到完整 rune 边界（UTF-8 后续字节 10xxxxxx）
 	}
-	return s[:cut] + "\n…（正文已截断，原 " + strconv.Itoa(len(s)) + " 字节，上限 " + strconv.Itoa(maxBodyBytes) + "）"
+	return s[:cut] + "\n…（正文已截断，原 " + strconv.Itoa(len(s)) + " 字节，上限 " + strconv.Itoa(limit) + "）"
 }
 
 // capJSONBody truncates oversized JSON payloads while keeping the persisted
 // column valid JSON (so UI tryFormatJSON and downstream JSON parsers keep working).
 func capJSONBody(s string) string {
-	if len(s) <= maxBodyBytes {
+	return capJSONBodyLimit(s, maxBodyBytes)
+}
+
+func capJSONBodyLimit(s string, limit int) string {
+	if limit <= 0 || len(s) <= limit {
 		return s
 	}
 	// Reserve room for JSON envelope overhead and escaping.
-	previewCap := maxBodyBytes - 512
+	previewCap := limit - 512
 	if previewCap < 1024 {
 		previewCap = 1024
 	}
@@ -59,12 +71,12 @@ func capJSONBody(s string) string {
 	env := map[string]any{
 		"_truncated":     true,
 		"original_bytes": len(s),
-		"limit_bytes":    maxBodyBytes,
+		"limit_bytes":    limit,
 		"preview":        s[:cut],
 	}
 	b, err := json.Marshal(env)
 	if err != nil {
-		return capBody(s)
+		return capBodyLimit(s, limit)
 	}
 	return string(b)
 }
@@ -401,8 +413,8 @@ func (r *Recorder) record(ctx context.Context, req llm.CompletionRequest, sessio
 		// Raw wire bodies; empty when the transport did not fill the Capture
 		// (e.g. a provider dialing through a client without the capture hook, or
 		// a call that failed before any HTTP request went out).
-		RawRequest:  capJSONBody(capt.RawRequest()),
-		RawResponse: capBody(capt.RawResponse()),
+		RawRequest:  capJSONBodyLimit(capt.RawRequest(), maxRawBodyBytes),
+		RawResponse: capBodyLimit(capt.RawResponse(), maxRawBodyBytes),
 	}
 
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)

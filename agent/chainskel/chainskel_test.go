@@ -672,3 +672,58 @@ func TestSkillGuideHonorsVisibilityResolver(t *testing.T) {
 		t.Fatalf("managed OOB note must remain even when last skill is disabled: %s", guide)
 	}
 }
+
+func TestSkillGuideWebLogicInternalReconAndMultiTag(t *testing.T) {
+	// 1. WebLogic intent surfaces weblogic-java-rce both via priority keyword & web category.
+	wl := SkillGuideForIntent(payload(t, map[string]any{
+		"summary":    "经跳板破袭 192.168.3.34:7001 WebLogic wls-wsat CVE-2017-10271",
+		"chain_tags": []string{"web"},
+	}))
+	if !strings.Contains(wl, "weblogic-java-rce") || !strings.Contains(wl, "[高匹配]") {
+		t.Fatalf("WebLogic intent must highlight weblogic-java-rce: %s", wl)
+	}
+
+	// 2. Internal single-IP host recon must NOT advertise external enterprise domain/SPA skills.
+	lanRecon := SkillGuideForIntent(payload(t, map[string]any{
+		"summary":    "广度侦察哨：对唯一目标 192.168.111.79 做 TCP 全端口、SMB/WinRM/RDP 识别",
+		"chain_tags": []string{"recon"},
+	}))
+	if strings.Contains(lanRecon, "tbhm-recon") || strings.Contains(lanRecon, "js-api-recon") {
+		t.Fatalf("LAN single-IP recon must not recommend external domain/SPA skills: %s", lanRecon)
+	}
+	if !strings.Contains(lanRecon, "windows-ad-postex") {
+		t.Fatalf("LAN host recon should recommend internal skills: %s", lanRecon)
+	}
+
+	// 3. External enterprise recon still recommends tbhm-recon / js-api-recon.
+	extRecon := SkillGuideForIntent(payload(t, map[string]any{
+		"summary":    "对目标企业做子域收集、ASN 发现与前端 SPA JS 路由测绘",
+		"chain_tags": []string{"recon"},
+	}))
+	if !strings.Contains(extRecon, "tbhm-recon") || !strings.Contains(extRecon, "js-api-recon") {
+		t.Fatalf("external recon must keep tbhm-recon/js-api-recon: %s", extRecon)
+	}
+
+	// 4. Multi-tag ["ad","pivot"] renders hints for BOTH categories, not only cats[0].
+	multi := SkillGuideForIntent(payload(t, map[string]any{
+		"summary":    "经 SOCKS5 隧道打 XDORG 域控 Zerologon",
+		"chain_tags": []string{"ad", "pivot"},
+	}))
+	if !strings.Contains(multi, "[ad]") || !strings.Contains(multi, "[pivot]") || !strings.Contains(multi, "multi-hop-pivoting") || !strings.Contains(multi, "windows-ad-postex") {
+		t.Fatalf("multi-tag intent must surface both ad and pivot skills: %s", multi)
+	}
+
+	// 5. Priority skills still honor visibility resolver.
+	prev := SkillCatalogResolver
+	t.Cleanup(func() { SkillCatalogResolver = prev })
+	SkillCatalogResolver = func(string) (map[string]bool, map[string]string) {
+		return map[string]bool{"multi-hop-pivoting": true}, map[string]string{"multi-hop-pivoting": "多跳代理"}
+	}
+	filtered := SkillGuideForIntent(payload(t, map[string]any{
+		"summary":    "经 SOCKS5 跳板打 WebLogic 7001",
+		"chain_tags": []string{"pivot"},
+	}))
+	if strings.Contains(filtered, "weblogic-java-rce") || !strings.Contains(filtered, "multi-hop-pivoting") {
+		t.Fatalf("visibility resolver must filter disabled priority skills: %s", filtered)
+	}
+}

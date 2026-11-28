@@ -33,6 +33,9 @@ const PlannerProbeLimit = 3
 // model (and tests) can tell it apart from a stop-loss or permission refusal.
 const PlannerProbeMessagePrefix = "【规划者探测边界】"
 
+// MainAgentFenceMessagePrefix marks a block from the MainAgent command-seat fence.
+const MainAgentFenceMessagePrefix = "【指挥席边界】"
+
 // plannerProbeTools are the planner's target-facing execution tools (HTTP fetch
 // and external MCP tools, plus shell commands that actually touch the target).
 // Local read-only inspection (Read/LS/Glob/Grep) and artifact writing are
@@ -125,6 +128,42 @@ func (h plannerProbeHooks) PostToolUse(ctx context.Context, name string, input, 
 }
 
 func (h plannerProbeHooks) Stop(ctx context.Context, messages []llm.Message) (bool, []string, string) {
+	if h.inner != nil {
+		return h.inner.Stop(ctx, messages)
+	}
+	return false, nil, ""
+}
+
+// mainAgentFenceHooks keeps MainAgent on the command seat: it may inspect local
+// task/shared/wordlist artifacts via Read/LS/Glob/Grep or provably read-only
+// local Bash, and dispatch/steer/kill workers via graph tools, but is blocked
+// from running target-facing probes, exploits, uploads, or mutating shell commands.
+type mainAgentFenceHooks struct {
+	inner harness.HookRunner
+}
+
+// WrapMainAgentFence installs the command-seat execution boundary in front of inner.
+func WrapMainAgentFence(inner harness.HookRunner) harness.HookRunner {
+	return mainAgentFenceHooks{inner: inner}
+}
+
+func (h mainAgentFenceHooks) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
+	if isPlannerProbeTool(name, input) {
+		return true, MainAgentFenceMessagePrefix + "主 Agent 是总控指挥席，禁止亲自执行触网探测、漏洞利用、上传文件或修改环境的命令。请用 add_intent 下发单目标意图给 worker 执行，用 steer_work / kill_work 调配在跑单兵，或用 add_hint / add_task_scope 登记资源与线索。（查看本任务目录、shared/ 产物或用户提供的字典/附件目录可用 Read / LS / Glob / Grep 或本地只读 Bash）", nil
+	}
+	if h.inner != nil {
+		return h.inner.PreToolUse(ctx, name, input)
+	}
+	return false, "", nil
+}
+
+func (h mainAgentFenceHooks) PostToolUse(ctx context.Context, name string, input, result []byte, isErr bool) {
+	if h.inner != nil {
+		h.inner.PostToolUse(ctx, name, input, result, isErr)
+	}
+}
+
+func (h mainAgentFenceHooks) Stop(ctx context.Context, messages []llm.Message) (bool, []string, string) {
 	if h.inner != nil {
 		return h.inner.Stop(ctx, messages)
 	}

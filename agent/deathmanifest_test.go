@@ -300,3 +300,66 @@ func TestWorkerResumeInjectsDeathManifest(t *testing.T) {
 		t.Fatalf("resumed worker prompt missing paired shared manifest path %q: %q", wantShared, seenPrompt)
 	}
 }
+
+func TestDeathManifestBlockForScopeFiltersUnrelatedAndStaleShared(t *testing.T) {
+	root := t.TempDir()
+	runDir := filepath.Join(root, "tasks", "9", "i10832")
+	shared := filepath.Join(root, "tasks", "9", "shared")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(shared, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	writeManifest := func(id int64, assetIDs []int64, hosts []string, cmd string, age time.Duration) {
+		m := deathManifest{
+			WrittenAt: time.Now().Add(-age),
+			IntentID:  id,
+			AssetIDs:  assetIDs,
+			Hosts:     hosts,
+			Note:      "n",
+			Entries:   []deathManifestEntry{{Command: cmd, Kind: "managed", TaskID: "t1", SpawnedAt: time.Now().Add(-age)}},
+		}
+		data, _ := json.Marshal(m)
+		p := filepath.Join(shared, fmt.Sprintf("death_manifest_i%d.json", id))
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mt := time.Now().Add(-age)
+		if err := os.Chtimes(p, mt, mt); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Same-target relay (10.10) vs unrelated sibling host (10.12) vs expired (>45m) same-host manifest.
+	writeManifest(10815, []int64{1695}, []string{"192.168.10.10"}, "python3 zl_run.py DC 192.168.10.10", 5*time.Minute)
+	writeManifest(10818, []int64{1700}, []string{"192.168.10.12"}, "python3 eb_run.py 192.168.10.12", 2*time.Minute)
+	writeManifest(10700, []int64{1695}, []string{"192.168.10.10"}, "python3 old_probe.py 192.168.10.10", 2*time.Hour)
+
+	block := deathManifestBlockForScope(runDir, 10832, deathManifestScope{
+		AssetIDs:         []int64{1695},
+		Hosts:            []string{"192.168.10.10"},
+		Summary:          "续打 DC 192.168.10.10",
+		EnforceSharedTTL: true,
+	})
+	if !strings.Contains(block, "zl_run.py") {
+		t.Fatalf("same-target recent manifest must be injected, got: %q", block)
+	}
+	if strings.Contains(block, "eb_run.py") {
+		t.Fatalf("unrelated host manifest must not pollute sibling intent, got: %q", block)
+	}
+	if strings.Contains(block, "old_probe.py") {
+		t.Fatalf("stale (>45m) unreferenced shared manifest must expire, got: %q", block)
+	}
+
+	// Explicit #10700 reference in summary still pulls the older (<24h) manifest intentionally.
+	blockRef := deathManifestBlockForScope(runDir, 10832, deathManifestScope{
+		Hosts:            []string{"192.168.99.99"},
+		Summary:          "接力上单 #10700 的后台结果",
+		EnforceSharedTTL: true,
+	})
+	if !strings.Contains(blockRef, "old_probe.py") {
+		t.Fatalf("explicitly referenced #10700 manifest must be injected, got: %q", blockRef)
+	}
+}

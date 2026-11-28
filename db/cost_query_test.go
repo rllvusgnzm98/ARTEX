@@ -1,6 +1,9 @@
 package db
 
 import (
+	"database/sql"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -136,19 +139,50 @@ func TestCostQueriesIsolatedByTask(t *testing.T) {
 	}
 }
 
-func TestPruneLLMRecords(t *testing.T) {
-	d, err := Open(testDSN(t))
+// openIsolatedLLMRecordsDB creates an ephemeral PostgreSQL schema with its own
+// llm_records table so global prune/compaction tests never touch live public rows.
+func openIsolatedLLMRecordsDB(t *testing.T) *DB {
+	t.Helper()
+	dsn := testDSN(t)
+	base, err := sql.Open("pgx", dsn)
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	defer d.Close()
-	if err := d.EnsureLLMRecordsTable(); err != nil {
-		t.Fatalf("ensure: %v", err)
+	if err := base.Ping(); err != nil {
+		base.Close()
+		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
-	tag := "prune-" + uuid.NewString()
+	schema := "test_llmrec_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:16]
+	if _, err := base.Exec(`CREATE SCHEMA ` + schema); err != nil {
+		base.Close()
+		t.Fatalf("create schema %s: %v", schema, err)
+	}
 	t.Cleanup(func() {
-		_, _ = d.Exec(`DELETE FROM llm_records WHERE task_id=$1`, tag)
+		_, _ = base.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+		base.Close()
 	})
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse dsn: %v", err)
+	}
+	q := u.Query()
+	q.Set("search_path", schema)
+	u.RawQuery = q.Encode()
+	iso, err := sql.Open("pgx", u.String())
+	if err != nil {
+		t.Fatalf("open isolated pg: %v", err)
+	}
+	t.Cleanup(func() { iso.Close() })
+	d := &DB{DB: iso}
+	if err := d.EnsureLLMRecordsTable(); err != nil {
+		t.Fatalf("ensure isolated llm_records: %v", err)
+	}
+	return d
+}
+
+func TestPruneLLMRecords(t *testing.T) {
+	d := openIsolatedLLMRecordsDB(t)
+	tag := "prune-" + uuid.NewString()
 	for i := 0; i < 4; i++ {
 		if err := d.InsertLLMRecord(&LLMRecord{Model: "m", SessionID: tag, TaskID: tag, Status: "ok"}); err != nil {
 			t.Fatal(err)
@@ -163,8 +197,8 @@ func TestPruneLLMRecords(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PruneLLMRecords age: %v", err)
 	}
-	if prunedAge < 1 {
-		t.Fatalf("expected at least 1 expired row pruned, got %d", prunedAge)
+	if prunedAge != 1 {
+		t.Fatalf("expected 1 expired row pruned, got %d", prunedAge)
 	}
 	var afterAge int
 	if err := d.QueryRow(`SELECT COUNT(*) FROM llm_records WHERE task_id=$1`, tag).Scan(&afterAge); err != nil {
@@ -174,7 +208,7 @@ func TestPruneLLMRecords(t *testing.T) {
 		t.Fatalf("expected 3 rows remaining after age prune, got %d", afterAge)
 	}
 
-	// Now prune by maxRows keeping only the 1 newest row globally (which is our newest row).
+	// Now prune by maxRows keeping only the 1 newest row in this isolated schema.
 	if _, err := d.PruneLLMRecords(t.Context(), 1, 0); err != nil {
 		t.Fatalf("PruneLLMRecords maxRows: %v", err)
 	}
@@ -184,5 +218,37 @@ func TestPruneLLMRecords(t *testing.T) {
 	}
 	if afterCap != 1 {
 		t.Fatalf("expected 1 newest row remaining after maxRows prune, got %d", afterCap)
+	}
+}
+
+func TestCompactLLMRecordRawBodies(t *testing.T) {
+	d := openIsolatedLLMRecordsDB(t)
+	tag := "compact-raw-" + uuid.NewString()
+	for i := 0; i < 3; i++ {
+		if err := d.InsertLLMRecord(&LLMRecord{
+			Model: "m", SessionID: tag, TaskID: tag, Status: "ok",
+			RequestBody: `{"ok":true}`, ResponseBody: `{"text":"hi"}`,
+			RawRequest: `{"wire":"req"}`, RawResponse: `data: ok`,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	compacted, err := d.CompactLLMRecordRawBodies(t.Context(), 1)
+	if err != nil {
+		t.Fatalf("CompactLLMRecordRawBodies: %v", err)
+	}
+	if compacted != 2 {
+		t.Fatalf("expected 2 older rows compacted, got %d", compacted)
+	}
+	var keptRaw, clearedRaw, keptNorm int
+	if err := d.QueryRow(`SELECT
+		COUNT(*) FILTER (WHERE raw_request IS NOT NULL),
+		COUNT(*) FILTER (WHERE raw_request IS NULL AND raw_response IS NULL),
+		COUNT(*) FILTER (WHERE request_body IS NOT NULL AND response_body IS NOT NULL)
+		FROM llm_records WHERE task_id=$1`, tag).Scan(&keptRaw, &clearedRaw, &keptNorm); err != nil {
+		t.Fatal(err)
+	}
+	if keptRaw != 1 || clearedRaw != 2 || keptNorm != 3 {
+		t.Fatalf("unexpected compaction state: keptRaw=%d clearedRaw=%d keptNorm=%d", keptRaw, clearedRaw, keptNorm)
 	}
 }

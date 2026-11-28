@@ -377,7 +377,7 @@ func (s *Server) agentSettleSeconds(key string) int {
 			return a.SettleSecs
 		}
 	}
-	return 120
+	return 180
 }
 
 // loadLLMConfig reads the active LLM profile from PG (llm_profiles).

@@ -277,12 +277,18 @@ func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
 		return // this batch has no ≥2 connected/shared-parent block — nothing to fold (§7)
 	}
 	var compressionFailed, compressedOK bool
-	for _, b := range blocks {
+	for i, b := range blocks {
+		if i > 0 && ctx.Err() != nil {
+			break
+		}
 		switch c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, nil)) {
 		case foldEmptyExhausted, foldProviderFailed:
 			compressionFailed = true
 		case foldOK:
 			compressedOK = true
+		}
+		if ctx.Err() != nil {
+			break
 		}
 	}
 	if err := syncGraphIncompleteSignal(ts, compressionFailed, compressedOK); err != nil {
@@ -290,9 +296,11 @@ func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
 	}
 	// A minor may have pushed the segment count over M → merge in the same run
 	// only when there is actual mergeable work (avoiding churn on independent blocks).
-	if ad, e := ts.ActiveDigests(); e == nil && len(ad) >= c.m {
-		if freshCovered, ce := ts.CoveredMembers(); ce == nil && hasMergeableMajorWork(g, elig, ad, freshCovered, c.params, c.maxGen) {
-			c.majorWithFailure(ctx, ts, compressionFailed)
+	if ctx.Err() == nil {
+		if ad, e := ts.ActiveDigests(); e == nil && len(ad) >= c.m {
+			if freshCovered, ce := ts.CoveredMembers(); ce == nil && hasMergeableMajorWork(g, elig, ad, freshCovered, c.params, c.maxGen) {
+				c.majorWithFailure(ctx, ts, compressionFailed)
+			}
 		}
 	}
 }
@@ -397,12 +405,18 @@ func (c *Compactor) majorWithFailure(ctx context.Context, ts *db.ExplorationStor
 		log.Printf("[compaction] supersede exp=%d: %v", ts.ID(), err)
 	}
 	var compressedOK bool
-	for _, b := range toCreate {
+	for i, b := range toCreate {
+		if i > 0 && ctx.Err() != nil {
+			break
+		}
 		switch c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, active)) {
 		case foldEmptyExhausted, foldProviderFailed:
 			compressionFailed = true
 		case foldOK:
 			compressedOK = true
+		}
+		if ctx.Err() != nil {
+			break
 		}
 	}
 	if err := syncGraphIncompleteSignal(ts, compressionFailed, compressedOK); err != nil {

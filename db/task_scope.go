@@ -128,10 +128,22 @@ func autoScopeCandidate(taskID int64, assetType, domain, rawURL, ip string) Task
 	switch assetType {
 	case "root_domain":
 		if d := DomainKey(domain); d != "" {
+			if net.ParseIP(d) != nil {
+				if c := ipToHostCIDR(d); c != "" {
+					return TaskScope{TaskID: taskID, Kind: "ip", Net: c, Source: "auto"}
+				}
+				return TaskScope{}
+			}
 			return TaskScope{TaskID: taskID, Kind: "root_domain", Domain: d, Source: "auto"}
 		}
 	case "subdomain":
 		if d := DomainKey(domain); d != "" {
+			if net.ParseIP(d) != nil {
+				if c := ipToHostCIDR(d); c != "" {
+					return TaskScope{TaskID: taskID, Kind: "ip", Net: c, Source: "auto"}
+				}
+				return TaskScope{}
+			}
 			return TaskScope{TaskID: taskID, Kind: "subdomain", Domain: d, Source: "auto"}
 		}
 	case "service", "endpoint":
@@ -466,12 +478,17 @@ func (s *AssetStore) AddAgentScopeCtx(ctx context.Context, taskID int64, kind, v
 		ts.CompanyID = &comp.ID
 	case "root_domain":
 		d := DomainKey(stripHostPort(value))
+		if d == "" {
+			return ts, fmt.Errorf("无效根域: %s", value)
+		}
+		if net.ParseIP(d) != nil {
+			ts.Kind = "ip"
+			ts.Net = ipToHostCIDR(d)
+			break
+		}
 		root, _ := RootDomain(d)
 		if root == "" {
 			root = d
-		}
-		if root == "" {
-			return ts, fmt.Errorf("无效根域: %s", value)
 		}
 		ts.Domain = root
 	case "exclude_root_domain":
@@ -479,11 +496,25 @@ func (s *AssetStore) AddAgentScopeCtx(ctx context.Context, taskID int64, kind, v
 		if d == "" {
 			return ts, fmt.Errorf("无效排除根域: %s", value)
 		}
+		if net.ParseIP(d) != nil {
+			ts.Kind = "exclude_ip"
+			ts.Net = ipToHostCIDR(d)
+			break
+		}
 		ts.Domain = d
 	case "subdomain", "exclude_subdomain":
 		d := DomainKey(stripHostPort(value))
 		if d == "" {
 			return ts, fmt.Errorf("无效子域: %s", value)
+		}
+		if net.ParseIP(d) != nil {
+			if kind == "exclude_subdomain" {
+				ts.Kind = "exclude_ip"
+			} else {
+				ts.Kind = "ip"
+			}
+			ts.Net = ipToHostCIDR(d)
+			break
 		}
 		ts.Domain = d
 	case "ip", "cidr", "exclude_ip", "exclude_cidr":

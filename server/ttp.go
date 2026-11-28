@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -14,7 +15,9 @@ import (
 
 	"github.com/Autumn-27/artex/agent/chainskel"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/norma/transcript"
 )
 
 // 结构化复盘与 TTP 沉淀 (PR2). 任务收官(最后一个 goal 被 prove_goal 标 met)自动触发
@@ -147,6 +150,13 @@ func (s *Server) runRetro(taskID string) {
 var (
 	errRetroNoTask     = fmt.Errorf("task not found")
 	errRetroNoProvider = fmt.Errorf("无可用模型,无法执行复盘")
+
+	// Package-level timeouts (overridable in unit tests). Slow reasoning models on
+	// multi-hour explorations regularly exceed 2m on full retro prompts; 5m primary
+	// + 3m compact fallback keeps long tasks from silently dropping all TTP lessons.
+	retroCallTimeout        = 5 * time.Minute
+	retroCompactCallTimeout = 3 * time.Minute
+	writeupCallTimeout      = 5 * time.Minute
 )
 
 func (s *Server) runRetroWithResult(ctx context.Context, taskID string) (int, error) {
@@ -166,9 +176,26 @@ func (s *Server) runRetroWithResult(ctx context.Context, taskID string) (int, er
 	if strings.TrimSpace(input) == "" {
 		return 0, nil
 	}
-	callCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
+	baseCtx := llmrec.WithWorker(llmrec.WithTaskID(ctx, taskID), "retro")
+	if t.ExpID > 0 {
+		baseCtx = transcript.WithSessionID(baseCtx, fmt.Sprintf("exp%d-retro", t.ExpID))
+	}
+	start := time.Now()
+	log.Printf("[retro] task %s 开始蒸馏 (input=%d bytes, timeout=%s)", taskID, len(input), retroCallTimeout)
+	callCtx, cancel := context.WithTimeout(baseCtx, retroCallTimeout)
 	text, err := collectText(callCtx, prov, retroSystemPrompt, input, 4096)
+	timedOut := err != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(callCtx.Err(), context.DeadlineExceeded))
+	cancel()
+	if timedOut && ctx.Err() == nil {
+		compact := s.gatherCompactRetroInput(t)
+		if strings.TrimSpace(compact) != "" {
+			log.Printf("[retro] task %s 首轮蒸馏超时(%s)，降级精简摘要重试 (compact=%d bytes, timeout=%s)",
+				taskID, time.Since(start).Round(time.Millisecond), len(compact), retroCompactCallTimeout)
+			retryCtx, retryCancel := context.WithTimeout(baseCtx, retroCompactCallTimeout)
+			text, err = collectText(retryCtx, prov, retroSystemPrompt, compact, 4096)
+			retryCancel()
+		}
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -196,7 +223,7 @@ func (s *Server) runRetroWithResult(ctx context.Context, taskID string) (int, er
 			n++
 		}
 	}
-	log.Printf("[retro] task %s 复盘蒸馏出 %d 条待审 TTP", taskID, n)
+	log.Printf("[retro] task %s 复盘蒸馏出 %d 条待审 TTP (耗时 %s)", taskID, n, time.Since(start).Round(time.Millisecond))
 	return n, nil
 }
 
@@ -275,32 +302,64 @@ func normCategory(c string) string {
 	return "meta"
 }
 
+func truncateUTF8Bytes(s string, maxBytes int) string {
+	if maxBytes <= 0 || len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && (s[cut]&0xC0) == 0x80 {
+		cut--
+	}
+	return s[:cut] + "\n…(截断)"
+}
+
+func appendBudgetedSection(b *strings.Builder, header string, lines []string, maxBytes int) {
+	if len(lines) == 0 || maxBytes <= 0 {
+		return
+	}
+	var sec strings.Builder
+	sec.WriteString(header)
+	for _, line := range lines {
+		if sec.Len()+len(line)+1 > maxBytes {
+			sec.WriteString("…(本节截断)\n")
+			break
+		}
+		sec.WriteString(line)
+		sec.WriteByte('\n')
+	}
+	b.WriteString(sec.String())
+}
+
 // gatherRetroInput assembles findings, key facts, intents and the worker trace of a
-// task into a compact distillation prompt (bounded).
+// task into a section-budgeted distillation prompt so high-volume facts/traces
+// never crowd out findings or intent outcomes.
 func (s *Server) gatherRetroInput(t *Task) string {
 	st := t.Store
 	var b strings.Builder
-	fmt.Fprintf(&b, "任务目标: %s\n任务描述: %s\n", t.Goal, t.Description)
+	fmt.Fprintf(&b, "任务目标: %s\n任务描述: %s\n", truncateUTF8Bytes(t.Goal, 512), truncateUTF8Bytes(t.Description, 1024))
 	if fs, _ := st.ListByKind(db.KindFinding, 200); len(fs) > 0 {
-		b.WriteString("\n## 发现(findings)\n")
+		lines := make([]string, 0, len(fs))
 		for _, n := range fs {
-			b.WriteString("- " + nodeBrief(n) + "\n")
+			lines = append(lines, "- "+nodeBrief(n))
 		}
+		appendBudgetedSection(&b, "\n## 发现(findings)\n", lines, 7000)
 	}
 	if facts, _ := st.ListByKind(db.KindFact, 200); len(facts) > 0 {
-		b.WriteString("\n## 关键事实(facts)\n")
+		lines := make([]string, 0, len(facts))
 		for _, n := range facts {
-			b.WriteString("- " + nodeBrief(n) + "\n")
+			lines = append(lines, "- "+truncateUTF8Bytes(nodeBrief(n), 320))
 		}
+		appendBudgetedSection(&b, "\n## 关键事实(facts)\n", lines, 9000)
 	}
 	if ints, _ := st.ListByKind(db.KindIntent, 200); len(ints) > 0 {
-		b.WriteString("\n## 探索方向(intents)\n")
+		lines := make([]string, 0, len(ints))
 		for _, n := range ints {
-			b.WriteString("- [" + n.State + "] " + nodeBrief(n) + "\n")
+			lines = append(lines, "- ["+n.State+"] "+truncateUTF8Bytes(nodeBrief(n), 280))
 		}
+		appendBudgetedSection(&b, "\n## 探索方向(intents)\n", lines, 5000)
 	}
 	if acts, _, err := st.ActivityList(nil, 0, 150); err == nil && len(acts) > 0 {
-		b.WriteString("\n## worker 轨迹(trace,节选)\n")
+		lines := make([]string, 0, len(acts))
 		for _, a := range acts {
 			if strings.TrimSpace(a.Summary) == "" {
 				continue
@@ -309,15 +368,41 @@ func (s *Server) gatherRetroInput(t *Task) string {
 			if tool == "" {
 				tool = a.Kind
 			}
-			b.WriteString("- " + tool + ": " + a.Summary + "\n")
+			lines = append(lines, "- "+tool+": "+truncateUTF8Bytes(a.Summary, 200))
 		}
+		appendBudgetedSection(&b, "\n## worker 轨迹(trace,节选)\n", lines, 3000)
 	}
-	out := b.String()
-	const cap = 24000
-	if len(out) > cap {
-		out = out[:cap] + "\n…(截断)"
+	return truncateUTF8Bytes(b.String(), 24000)
+}
+
+// gatherCompactRetroInput builds a <=8KB condensed summary (findings + concise
+// facts + intent states, omitting raw trace) for timeout-fallback distillation.
+func (s *Server) gatherCompactRetroInput(t *Task) string {
+	st := t.Store
+	var b strings.Builder
+	fmt.Fprintf(&b, "任务目标: %s\n", truncateUTF8Bytes(t.Goal, 400))
+	if fs, _ := st.ListByKind(db.KindFinding, 100); len(fs) > 0 {
+		lines := make([]string, 0, len(fs))
+		for _, n := range fs {
+			lines = append(lines, "- "+truncateUTF8Bytes(nodeBrief(n), 240))
+		}
+		appendBudgetedSection(&b, "\n## 发现(findings)\n", lines, 3800)
 	}
-	return out
+	if facts, _ := st.ListByKind(db.KindFact, 60); len(facts) > 0 {
+		lines := make([]string, 0, len(facts))
+		for _, n := range facts {
+			lines = append(lines, "- "+truncateUTF8Bytes(nodeBrief(n), 160))
+		}
+		appendBudgetedSection(&b, "\n## 关键事实(facts,精简)\n", lines, 2600)
+	}
+	if ints, _ := st.ListByKind(db.KindIntent, 40); len(ints) > 0 {
+		lines := make([]string, 0, len(ints))
+		for _, n := range ints {
+			lines = append(lines, "- ["+n.State+"] "+truncateUTF8Bytes(nodeBrief(n), 140))
+		}
+		appendBudgetedSection(&b, "\n## 探索方向(intents,精简)\n", lines, 1400)
+	}
+	return truncateUTF8Bytes(b.String(), 8000)
 }
 
 func nodeBrief(n *db.Node) string {
@@ -434,7 +519,7 @@ func (s *Server) importWriteup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, "无可用模型,无法解析 writeup")
 		return
 	}
-	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
+	ctx, cancel := context.WithTimeout(s.ctx, writeupCallTimeout)
 	defer cancel()
 	text, err := collectText(ctx, prov, writeupSystemPrompt, body.Text, 4096)
 	if err != nil {

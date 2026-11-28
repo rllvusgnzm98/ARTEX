@@ -361,6 +361,17 @@ ON CONFLICT (agent_id, var_name) DO UPDATE
 		}
 		_ = d.SetSetting("interactive_shell_default_v1", "true")
 	}
+	// Bump untouched default settle_seconds from 120s to 180s ONCE so slow reasoning
+	// models have headroom to batch-write findings & facts during run-budget wrap-up.
+	if v, _, _ := d.GetSetting("settle_seconds_default_180_v1"); v != "true" {
+		if _, err := d.Exec(`ALTER TABLE agents ALTER COLUMN settle_seconds SET DEFAULT 180`); err != nil {
+			return fmt.Errorf("alter settle_seconds default: %w", err)
+		}
+		if _, err := d.Exec(`UPDATE agents SET settle_seconds=180 WHERE settle_seconds=120`); err != nil {
+			return fmt.Errorf("bump settle_seconds defaults: %w", err)
+		}
+		_ = d.SetSetting("settle_seconds_default_180_v1", "true")
+	}
 	// Seed the built-in browser (Playwright) MCP once — DISABLED by default (用户
 	// 需要时自行启用), no proxy by default. The traffic-capture toggle injects/strips
 	// the recording proxy + CA at runtime (server.Manager.syncBrowserMCPProxy).

@@ -360,6 +360,25 @@ WHERE id < COALESCE((SELECT id FROM llm_records ORDER BY id DESC OFFSET $1 LIMIT
 	return total, nil
 }
 
+// CompactLLMRecordRawBodies clears redundant raw HTTP wire dumps (raw_request and
+// raw_response) on rows older than the newest keepFullRows records while keeping
+// normalized request_body, response_body, token counts, latency, and errors intact.
+func (d *DB) CompactLLMRecordRawBodies(ctx context.Context, keepFullRows int) (int64, error) {
+	if keepFullRows <= 0 {
+		return 0, nil
+	}
+	res, err := d.ExecContext(ctx, `
+UPDATE llm_records
+SET raw_request = NULL, raw_response = NULL
+WHERE (raw_request IS NOT NULL OR raw_response IS NOT NULL)
+  AND id < COALESCE((SELECT id FROM llm_records ORDER BY id DESC OFFSET $1 LIMIT 1), 0)`, keepFullRows-1)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // GetLLMRecord returns a single LLM record with full request/response bodies.
 func (d *DB) GetLLMRecord(id int64) (*LLMRecord, error) {
 	var r LLMRecord

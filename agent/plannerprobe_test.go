@@ -85,20 +85,31 @@ func TestPlannerProbeCapPersistsAcrossRounds(t *testing.T) {
 func TestPlannerProbeBashSemanticSplit(t *testing.T) {
 	_, hooks := plannerProbeHooksFor(func() (int, bool) { return 7, true })
 
-	// worker 已有 7 条事实：本地读仍须放行，触网 curl 仍被 boundary 1 拦截。
 	for _, cmd := range []string{
 		`{"command":"cat shared/challenges.json"}`,
 		`{"command":"ls -la i12/"}`,
 		`{"command":"grep -r 'flag' shared/ | head -5"}`,
 		`{"command":"wc -l notes.txt"}`,
 		`{"command":"echo done"}`,
+		`{"command":"cat shared/death_manifest_i10815.json 2>/dev/null; echo \"---TAIL---\"; cat shared/bg_i10815_0_task_25_tail.txt 2>/dev/null"}`,
+		`{"command":"cd shared && sed -n '/^==B64==$/,/^==========*$/p' i10798_loot_txt_decoded.txt | grep -v '^==' | tr -d '[:space:]' | base64 -D 2>/dev/null | iconv -f GB18030 -t UTF-8 2>/dev/null | tail -80"}`,
+		`{"command":"cd shared && python3 -c \"data = open('i10798_loot_txt_decoded.txt','rb').read(); print('10.10.20.12' in data.decode('utf-8','ignore'))\""}`,
 	} {
 		if block, msg, _ := hooks.PreToolUse(context.Background(), "Bash", []byte(cmd)); block {
 			t.Fatalf("local read-only bash must never be blocked: %s, msg=%q", cmd, msg)
 		}
 	}
-	if block, msg, _ := hooks.PreToolUse(context.Background(), "Bash", []byte(`{"command":"curl http://10.0.0.9/"}`)); !block {
-		t.Fatalf("target-facing curl must still hit boundary 1, msg=%q", msg)
+	for _, blocked := range []string{
+		`{"command":"curl http://10.0.0.9/"}`,
+		`{"command":"base64 -o /tmp/out.bin shared/loot.txt"}`,
+		`{"command":"iconv -f UTF-8 -t GBK -o /tmp/out.txt shared/loot.txt"}`,
+		`{"command":"sed -n '1,5w /tmp/leak.txt' shared/loot.txt"}`,
+		`{"command":"sed -n '1w /tmp/leak.txt' 1p"}`,
+		`{"command":"python3 -c \"__import__('os').system('id')\""}`,
+	} {
+		if block, msg, _ := hooks.PreToolUse(context.Background(), "Bash", []byte(blocked)); !block {
+			t.Fatalf("non-read-only bash must still hit boundary 1: %s, msg=%q", blocked, msg)
+		}
 	}
 
 	// 开局无事实时：本地读不消耗探测额度——连续多次本地读后，三次触网额度仍完整。

@@ -80,3 +80,23 @@ func TestCapJSONBodyPreservesValidJSON(t *testing.T) {
 		t.Fatalf("invalid preview in truncated JSON envelope")
 	}
 }
+
+func TestCapRawBodyLimitBoundsWirePayloads(t *testing.T) {
+	wire := `{"messages":"` + strings.Repeat("a", maxRawBodyBytes+4096) + `"}`
+	got := capJSONBodyLimit(wire, maxRawBodyBytes)
+	if !json.Valid([]byte(got)) {
+		t.Fatalf("capJSONBodyLimit produced invalid JSON")
+	}
+	var env map[string]any
+	if err := json.Unmarshal([]byte(got), &env); err != nil {
+		t.Fatal(err)
+	}
+	if lim, _ := env["limit_bytes"].(float64); int(lim) != maxRawBodyBytes {
+		t.Fatalf("limit_bytes=%v want %d", lim, maxRawBodyBytes)
+	}
+	rawSSE := strings.Repeat("d", maxRawBodyBytes+1024)
+	gotSSE := capBodyLimit(rawSSE, maxRawBodyBytes)
+	if len(gotSSE) >= len(rawSSE) || !strings.Contains(gotSSE, "已截断") {
+		t.Fatalf("capBodyLimit did not trim raw SSE payload: len=%d", len(gotSSE))
+	}
+}

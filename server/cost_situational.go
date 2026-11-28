@@ -181,8 +181,9 @@ func truncateRunes(s string, n int) string {
 }
 
 const (
-	defaultLLMRecordsMaxRows = 10000
-	defaultLLMRecordsTTLDays = 14
+	defaultLLMRecordsMaxRows     = 10000
+	defaultLLMRecordsTTLDays     = 14
+	defaultLLMRecordsFullRawRows = 500
 )
 
 func envIntOrDefault(key string, fallback int) int {
@@ -198,29 +199,41 @@ func envIntOrDefault(key string, fallback int) int {
 }
 
 // runLLMRecordsRetention periodically trims llm_records when default-on recording
-// is active, bounding PostgreSQL storage by row count and age (0 disables either).
+// is active, bounding PostgreSQL storage by row count, age, and raw wire-body
+// retention (0 disables any dimension).
 func (s *Server) runLLMRecordsRetention(ctx context.Context) {
 	if s == nil || s.m == nil || s.m.pg == nil {
 		return
 	}
 	maxRows := envIntOrDefault("ARTEX_LLM_RECORDS_MAX_ROWS", defaultLLMRecordsMaxRows)
 	ttlDays := envIntOrDefault("ARTEX_LLM_RECORDS_TTL_DAYS", defaultLLMRecordsTTLDays)
-	if maxRows <= 0 && ttlDays <= 0 {
+	fullRawRows := envIntOrDefault("ARTEX_LLM_RECORDS_FULL_RAW_ROWS", defaultLLMRecordsFullRawRows)
+	if maxRows <= 0 && ttlDays <= 0 && fullRawRows <= 0 {
 		return
 	}
 	maxAge := time.Duration(ttlDays) * 24 * time.Hour
 	pruneOnce := func() {
 		pctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		defer cancel()
-		n, err := s.m.pg.PruneLLMRecords(pctx, maxRows, maxAge)
-		if err != nil {
-			if ctx.Err() == nil {
-				log.Printf("[llmrec] retention prune: %v", err)
+		if maxRows > 0 || ttlDays > 0 {
+			n, err := s.m.pg.PruneLLMRecords(pctx, maxRows, maxAge)
+			if err != nil {
+				if ctx.Err() == nil {
+					log.Printf("[llmrec] retention prune: %v", err)
+				}
+			} else if n > 0 {
+				log.Printf("[llmrec] retention pruned %d old rows (max_rows=%d ttl_days=%d)", n, maxRows, ttlDays)
 			}
-			return
 		}
-		if n > 0 {
-			log.Printf("[llmrec] retention pruned %d old rows (max_rows=%d ttl_days=%d)", n, maxRows, ttlDays)
+		if fullRawRows > 0 && pctx.Err() == nil {
+			c, err := s.m.pg.CompactLLMRecordRawBodies(pctx, fullRawRows)
+			if err != nil {
+				if ctx.Err() == nil {
+					log.Printf("[llmrec] raw body compact: %v", err)
+				}
+			} else if c > 0 {
+				log.Printf("[llmrec] compacted raw wire bodies on %d older rows (keep_full_raw=%d)", c, fullRawRows)
+			}
 		}
 	}
 

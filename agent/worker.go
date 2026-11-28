@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -226,7 +227,7 @@ func (w *Worker) SetSettleTimeout(reserve time.Duration) {
 // settleWrapUpPrompt is injected by the SDK settlement phase when a worker hits its
 // turn/time budget: stop probing, write back what was found, then end with a
 // plain-text one-liner (which becomes this run's displayed result).
-const settleWrapUpPrompt = "当前为纯写库结算轮，Bash 已卸载，请直接调 record_fact / report_finding / insert_assets，不要再调用 Bash。你即将因预算耗尽被终止。不要再运行任何命令/探测。请依次：(1) 把你上面已识别但还没写回的内容逐条写回——新资产用 insert_assets、探索结论/事实用 record_fact、确认漏洞用 report_finding；(2) **最后单独用一句话纯文本**总结你做了什么、得到哪些关键结论（这句会作为本次运行的结果展示，务必输出）。"
+const settleWrapUpPrompt = "当前为纯写库结算轮，Bash 已卸载，请直接并行批量调 report_finding / record_fact / insert_assets，不要再调用 Bash。你即将因预算耗尽被终止，请务必在【第 1 轮】就把最关键的实锤成果（flag、高危漏洞、核心凭据、新发现路径与待续接断点）一次性并行落库——确认漏洞用 report_finding、探索结论/事实用 record_fact、新资产用 insert_assets，切勿分多轮慢写或先写长篇思考；全部落库后，**最后单独用一句话纯文本**总结你做了什么、得到哪些关键结论（这句会作为本次运行的结果展示，务必输出）。"
 
 func NewWorker(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int, extra ...actool.CoreTool) *Worker {
 	return &Worker{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns, extraTools: extra}
@@ -405,7 +406,7 @@ func workerTrafficBlock(recording bool) string {
 func artifactSpec(dir string) string {
 	shared := sharedDirForRun(dir)
 	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等本角色自己的中间产物，**一律写到工作目录 " + dir + "**（相对路径即写在这里，也可用该绝对路径）——**不要写 /tmp、不要用其它绝对路径**。" +
-		"\n**跨单兵共享制品**（SSH 私钥、提取好的 API 路由表、字典、凭据文件等后续意图还要用的文件）只增写入 **" + shared + "**。意图正文和命令里引用这些文件时写该目录下的绝对路径。" +
+		"\n**跨单兵共享制品**（SSH 私钥、提取好的 API 路由表、字典、凭据文件等后续意图还要用的文件）只增写入 **" + shared + "**；跨意图可复用的通道/隧道/利用执行器脚本统一放到 **" + filepath.Join(shared, "tools") + "**，避免下游单兵重复复制重建。意图正文和命令里引用这些文件时写该目录下的绝对路径。" +
 		"每个 worker 的私有目录是同级的 `i<意图id>/`，任务根目录里没有它们的产物；密钥路径以 shared 目录为准，并要求产出方用 record_fact 的 artifact_paths 记下绝对路径。"
 }
 
@@ -416,7 +417,7 @@ func artifactSpec(dir string) string {
 func workerArtifactSpec(runDir string) string {
 	shared := sharedDirForRun(runDir)
 	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等本次意图的私有中间产物，**一律写到本次意图的专属工作目录 " + runDir + "**（已自动建好，直接用相对路径写在这里即可，无需再手动建目录）——**不要写 /tmp、不要用其它绝对路径**。" +
-		"\n后续单兵还要用的制品（SSH 私钥、路由表、字典、凭据文件）写到跨单兵共享目录 **" + shared + "**（只增不删），并在 record_fact 的 artifact_paths 里记下这些绝对路径。共享文件只放这个目录。"
+		"\n后续单兵还要用的制品（SSH 私钥、路由表、字典、凭据文件）写到跨单兵共享目录 **" + shared + "**（只增不删），可复用的通道/代理/利用执行器脚本统一放入 **" + filepath.Join(shared, "tools") + "** 供接班单兵直接调用，并在 record_fact 的 artifact_paths 里记下这些绝对路径。共享文件只放这个目录。"
 }
 
 // workerEvidenceRules 是证据纪律的代码固定尾(不可被 DB 变体正文覆盖)：
@@ -748,12 +749,31 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// Per-intent dynamic blocks go into the first User message so SystemPrompt stays
 	// static and KV-cacheable across intents within the same task.
 	var userLaunch strings.Builder
-	userLaunch.WriteString(strings.TrimSpace(renderIntentTask(intent)))
+	intentTaskText := strings.TrimSpace(renderIntentTask(intent))
+	userLaunch.WriteString(intentTaskText)
 	userLaunch.WriteString("\n\n【本次意图专属工作目录（当前 CWD）】：")
 	userLaunch.WriteString(runDir)
+	manifestAssetIDs := intentAssetIDs(intent)
+	manifestHostSet := map[string]bool{}
+	addManifestHost := func(h string) {
+		h = strings.ToLower(strings.TrimSpace(h))
+		if h != "" {
+			manifestHostSet[h] = true
+		}
+	}
+	for _, h := range guard.ExtractBriefHosts(intentTaskText) {
+		addManifestHost(h)
+	}
 	if as != nil {
-		if ids := intentAssetIDs(intent); len(ids) > 0 {
-			if assets, err := as.GetByIDs(ids); err == nil && len(assets) > 0 {
+		if len(manifestAssetIDs) > 0 {
+			if assets, err := as.GetByIDs(manifestAssetIDs); err == nil && len(assets) > 0 {
+				for _, a := range assets {
+					addManifestHost(a.IP)
+					addManifestHost(a.Domain)
+					for _, h := range guard.ExtractBriefHosts(a.URL) {
+						addManifestHost(h)
+					}
+				}
 				if b, err := json.Marshal(assets); err == nil {
 					userLaunch.WriteString("\n\n本意图 asset_ids 对应的目标资产：\n" + WrapUntrustedData("target-assets", string(b)))
 				}
@@ -771,13 +791,23 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 			}
 		}
 	}
+	manifestHosts := make([]string, 0, len(manifestHostSet))
+	for h := range manifestHostSet {
+		manifestHosts = append(manifestHosts, h)
+	}
+	sort.Strings(manifestHosts)
 	userLaunch.WriteString(honeypotBlock(tsx, as, intent.ID)) // 无蜜罐资产时为空串
 	// 进场预塞：与本意图相关的已确认事实 + 已确认可达但未兑现的下一跳。
 	// 压缩/预取失败只打「图谱不完整」标记，fail-soft，不阻断进场、不写目标失败。
 	seedBlock := RenderWorkerEntrySeed(entrySeed)
 	userLaunch.WriteString(seedBlock)
 	userLaunch.WriteString(w.credentialSeedBlock(ctx, taskID)) // 无继承凭据或查询失败时为空串
-	manifestBlock := deathManifestBlock(runDir, intent.ID) // 无撤退现场时为空串
+	manifestBlock := deathManifestBlockForScope(runDir, intent.ID, deathManifestScope{
+		AssetIDs:         manifestAssetIDs,
+		Hosts:            manifestHosts,
+		Summary:          intentTaskText,
+		EnforceSharedTTL: true,
+	}) // 无相关撤退现场时为空串
 	userLaunch.WriteString(overview)
 	userLaunch.WriteString(manifestBlock)
 	userLaunch.WriteString("\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。")
@@ -788,7 +818,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// 任务级 deadline(经 ctx 注入)夹逼本 run 的墙钟预算 + 决定收尾词(见 taskclock.go)。
 	tc := taskClockFrom(ctx)
 	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, w.runTimeout)
-	reserve := 120 * time.Second
+	reserve := 180 * time.Second
 	if w.settleTimeout != nil {
 		reserve = *w.settleTimeout
 	}
@@ -925,7 +955,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	reason, err := captureWorkerSession(ctx, s, resumeWarning+input, emitWrap)
 	// 撤退现场清单必须在 recoverSettlement 之前显式写：recoverSettlement 内部会调用
 	// previous.Close()，立即杀掉全部后台任务并删除其输出目录，此处是拷贝输出尾段的最后机会。
-	writeDeathManifest(runDir, intent.ID, ledger)
+	writeDeathManifestWithMeta(runDir, intent.ID, ledger, manifestAssetIDs, manifestHosts)
 	if recErr := w.recoverSettlement(ctx, s, opts, settle, err, tsx, emitWrap); recErr != nil && isTransientSettlementError(recErr) {
 		err = &SettlementTransientError{BudgetErr: err, RecoveryErr: recErr}
 	}

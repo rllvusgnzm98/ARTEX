@@ -976,7 +976,7 @@ RETURNING id`,
 // root_domain and (when it's a real subdomain, not the apex or an IP) subdomain
 // asset — so those asset types stay populated and can anchor task scope. Best-effort.
 func (s *AssetStore) linkHostAssets(domain, rootDomain string, taskID int64) {
-	if rootDomain != "" {
+	if rootDomain != "" && net.ParseIP(rootDomain) == nil {
 		_, _ = s.UpsertRootDomain(UpsertRootDomainReq{Domain: rootDomain, TaskID: taskID})
 	}
 	if domain != "" && domain != rootDomain && net.ParseIP(domain) == nil {

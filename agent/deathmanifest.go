@@ -33,9 +33,12 @@ import (
 // 「进程死前推进到哪」，全量无意义且可能很大。
 const deathManifestMaxOutputBytes = 8 * 1024
 
-// deathManifestMaxAge 是清单的保鲜期：跨太久的现场（监听器面向的目标可能已
-// 轮换）不再注入，避免给新意图喂过期情报。
+// deathManifestMaxAge 是本意图续跑清单的保鲜期：跨太久的现场不再注入。
 const deathManifestMaxAge = 24 * time.Hour
+
+// deathManifestSharedMaxAge 是跨意图 shared/ 撤退清单的默认保鲜期：避免未删
+// 清单在长任务里跨小时持续污染后续无关单兵（被新意图摘要点名引用的清单仍沿用 24h）。
+const deathManifestSharedMaxAge = 45 * time.Minute
 
 // reBackgroundSpawned 匹配 norma 后台任务的两种出生公告：
 //   - "Running in background as <id>. Output file: <path>"（run_in_background=true）
@@ -274,15 +277,29 @@ type deathManifestEntry struct {
 type deathManifest struct {
 	WrittenAt time.Time            `json:"written_at"`
 	IntentID  int64                `json:"intent_id"`
+	AssetIDs  []int64              `json:"asset_ids,omitempty"`
+	Hosts     []string             `json:"hosts,omitempty"`
 	Note      string               `json:"note"`
 	Entries   []deathManifestEntry `json:"entries"`
 }
 
-// writeDeathManifest 在 worker run 收尾时落撤退现场清单。ledger 为空直接返回
-// （正常收队且无后台残留是常态，不落空清单）。输出尾段拷到 shared/（跨意图
-// 唯一可靠位置，清单里记绝对路径）；写清单失败只记日志——保现场是
-// best-effort，绝不允许反过来弄砸收尾。
+// deathManifestScope narrows cross-intent shared/ manifest injection to relays
+// that actually target the same assets/hosts or explicitly reference the prior intent.
+type deathManifestScope struct {
+	AssetIDs         []int64
+	Hosts            []string
+	Summary          string
+	EnforceSharedTTL bool
+}
+
+// writeDeathManifest 在 worker run 收尾时落撤退现场清单（无资产/主机元数据的兼容入口）。
 func writeDeathManifest(runDir string, intentID int64, ledger *deathLedger) {
+	writeDeathManifestWithMeta(runDir, intentID, ledger, nil, nil)
+}
+
+// writeDeathManifestWithMeta 在 worker run 收尾时落撤退现场清单并附上目标资产与主机
+// 元数据，使后续跨意图接力可以按目标相关性精准注入，避免污染无关单兵。
+func writeDeathManifestWithMeta(runDir string, intentID int64, ledger *deathLedger, assetIDs []int64, hosts []string) {
 	if ledger == nil {
 		return
 	}
@@ -295,6 +312,8 @@ func writeDeathManifest(runDir string, intentID int64, ledger *deathLedger) {
 	m := deathManifest{
 		WrittenAt: time.Now(),
 		IntentID:  intentID,
+		AssetIDs:  assetIDs,
+		Hosts:     hosts,
 		Note:      "本 worker 撤退（取消/超时/收队）时这些后台进程随会话被回收。若现场有价值（监听器、隧道、OOB 依托），请按需重建；重建后或确认无价值时删除本清单文件，避免误导后续单兵。shell-bg 条目不受会话管理，可能仍在运行——接手前先核实，勿盲目重启。",
 	}
 	for i, r := range records {
@@ -386,22 +405,83 @@ func sanitizeFilePart(s string) string {
 	return b.String()
 }
 
-// deathManifestBlock 渲染进场注入段：优先读本 runDir 的清单（同意图续跑），
-// 否则扫 shared/ 里非陈旧的清单（跨意图接力，按修改时间倒序至多 2 份）。
-// 没有任何现场时返回空串，首条消息不受影响。
+// deathManifestBlock 渲染进场注入段（兼容入口，无跨意图范围过滤）。
 func deathManifestBlock(runDir string, intentID int64) string {
+	return deathManifestBlockForScope(runDir, intentID, deathManifestScope{})
+}
+
+func manifestReferencedInSummary(summary string, intentID int64) bool {
+	if summary == "" || intentID <= 0 {
+		return false
+	}
+	idStr := fmt.Sprintf("%d", intentID)
+	for _, needle := range []string{"#" + idStr, "i" + idStr} {
+		idx := 0
+		for {
+			pos := strings.Index(summary[idx:], needle)
+			if pos < 0 {
+				break
+			}
+			end := idx + pos + len(needle)
+			if end >= len(summary) || summary[end] < '0' || summary[end] > '9' {
+				return true
+			}
+			idx = end
+		}
+	}
+	return false
+}
+
+func manifestMatchesScope(m deathManifest, scope deathManifestScope) (matched bool, explicitRef bool) {
+	if manifestReferencedInSummary(scope.Summary, m.IntentID) {
+		return true, true
+	}
+	hasScopeMeta := len(scope.AssetIDs) > 0 || len(scope.Hosts) > 0
+	hasManifestMeta := len(m.AssetIDs) > 0 || len(m.Hosts) > 0
+	if !hasScopeMeta || !hasManifestMeta {
+		// Backward-compatible fallback when either side carries no target metadata.
+		return true, false
+	}
+	if len(scope.AssetIDs) > 0 && len(m.AssetIDs) > 0 {
+		set := make(map[int64]bool, len(scope.AssetIDs))
+		for _, id := range scope.AssetIDs {
+			set[id] = true
+		}
+		for _, id := range m.AssetIDs {
+			if set[id] {
+				return true, false
+			}
+		}
+	}
+	if len(scope.Hosts) > 0 && len(m.Hosts) > 0 {
+		set := make(map[string]bool, len(scope.Hosts))
+		for _, h := range scope.Hosts {
+			set[strings.ToLower(strings.TrimSpace(h))] = true
+		}
+		for _, h := range m.Hosts {
+			if set[strings.ToLower(strings.TrimSpace(h))] {
+				return true, false
+			}
+		}
+	}
+	return false, false
+}
+
+// deathManifestBlockForScope 渲染进场注入段：优先读本 runDir 的清单（同意图续跑），
+// 否则扫 shared/ 里与本意图目标相关且未过期的清单（按修改时间倒序至多 2 份）。
+func deathManifestBlockForScope(runDir string, intentID int64, scope deathManifestScope) string {
 	type hit struct {
 		path       string
 		pairedPath string
 		mod        time.Time
 		m          deathManifest
 	}
-	readOne := func(path string) (hit, bool) {
+	readOne := func(path string, maxAge time.Duration) (hit, bool) {
 		st, err := os.Stat(path)
 		if err != nil {
 			return hit{}, false
 		}
-		if time.Since(st.ModTime()) > deathManifestMaxAge {
+		if maxAge > 0 && time.Since(st.ModTime()) > maxAge {
 			return hit{}, false // 陈旧现场不注入
 		}
 		data, err := os.ReadFile(path)
@@ -420,7 +500,7 @@ func deathManifestBlock(runDir string, intentID int64) string {
 	var hits []hit
 	ownName := fmt.Sprintf("death_manifest_i%d.json", intentID)
 	own := filepath.Join(runDir, ownName)
-	if h, ok := readOne(own); ok {
+	if h, ok := readOne(own, deathManifestMaxAge); ok {
 		sharedCopy := filepath.Join(sharedDir, ownName)
 		if sharedCopy != own {
 			if _, err := os.Stat(sharedCopy); err == nil {
@@ -435,17 +515,26 @@ func deathManifestBlock(runDir string, intentID int64) string {
 				continue
 			}
 			p := filepath.Join(sharedDir, e.Name())
-			if h, ok := readOne(p); ok {
-				if h.m.IntentID > 0 {
-					runCopy := filepath.Join(taskDir, fmt.Sprintf("i%d", h.m.IntentID), e.Name())
-					if runCopy != p {
-						if _, err := os.Stat(runCopy); err == nil {
-							h.pairedPath = runCopy
-						}
+			h, ok := readOne(p, deathManifestMaxAge)
+			if !ok {
+				continue
+			}
+			matched, explicitRef := manifestMatchesScope(h.m, scope)
+			if !matched {
+				continue
+			}
+			if scope.EnforceSharedTTL && !explicitRef && time.Since(h.mod) > deathManifestSharedMaxAge {
+				continue
+			}
+			if h.m.IntentID > 0 {
+				runCopy := filepath.Join(taskDir, fmt.Sprintf("i%d", h.m.IntentID), e.Name())
+				if runCopy != p {
+					if _, err := os.Stat(runCopy); err == nil {
+						h.pairedPath = runCopy
 					}
 				}
-				shared = append(shared, h)
 			}
+			shared = append(shared, h)
 		}
 		sort.Slice(shared, func(i, j int) bool { return shared[i].mod.After(shared[j].mod) })
 		if len(shared) > 2 {

@@ -1241,28 +1241,83 @@ func compactFact(n *db.Node) map[string]any {
 }
 
 func (t *ToolSet) nodeDetail() actool.CoreTool {
-	return t.readExpTool("node_detail", "按 id 取本任务或直接关联任务的【探索图节点】完整内容。继承节点带 source_task_id/inherited=true 且只读。仅限 list_facts/list_findings/graph_overview 返回的探索节点 id；资产请用 list_assets/asset_neighbors。",
-		obj(map[string]any{"id": idp("探索图节点 id(非资产 id)")}, "id"),
+	return t.readExpTool("node_detail", "按 id（或批量 ids，最多 20 个）取本任务或直接关联任务的【探索图节点】完整内容。需查多条事实时优先传 ids 一次拉完，避免串行多轮调用。继承节点带 source_task_id/inherited=true 且只读。仅限 list_facts/list_findings/graph_overview 返回的探索节点 id；资产请用 list_assets/asset_neighbors。",
+		obj(map[string]any{
+			"id": idp("单个探索图节点 id(非资产 id)"),
+			"ids": map[string]any{
+				"type":        "array",
+				"items":       idp("探索图节点 id"),
+				"description": "批量探索图节点 id（最多 20 个；传 ids 时返回 {nodes, missing}）",
+			},
+		}),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
-				ID json.RawMessage `json:"id"`
+				ID  json.RawMessage   `json:"id"`
+				IDS []json.RawMessage `json:"ids"`
 			}
 			_ = json.Unmarshal(in, &a)
-			id := pid(a.ID)
-			if id <= 0 {
-				return actool.Errorf("id 必填"), nil
+			singleID := pid(a.ID)
+			if len(a.IDS) == 0 {
+				if singleID <= 0 {
+					return actool.Errorf("id 或 ids 必填"), nil
+				}
+				n, err := t.ts.GetNodeWithSources(singleID)
+				if err != nil {
+					return actool.Errorf(err.Error()), nil
+				}
+				if n == nil {
+					return actool.Errorf(fmt.Sprintf("未找到探索节点 %d。若你想查的是资产，请用 list_assets / asset_neighbors（资产与探索节点是不同的 id 空间，资产 id 不能传给 node_detail）。", singleID)), nil
+				}
+				if err := t.ts.PopulateFindingTrafficIDs([]*db.Node{n}); err != nil {
+					return actool.Errorf(err.Error()), nil
+				}
+				return jsonResult(n) // full payload incl. detail / evidence, plus explicit finding IDs
 			}
-			n, err := t.ts.GetNodeWithSources(id)
-			if err != nil {
-				return actool.Errorf(err.Error()), nil
+
+			const maxBatchNodeDetail = 20
+			seen := make(map[int64]bool, len(a.IDS)+1)
+			ordered := make([]int64, 0, len(a.IDS)+1)
+			if singleID > 0 {
+				seen[singleID] = true
+				ordered = append(ordered, singleID)
 			}
-			if n == nil {
-				return actool.Errorf(fmt.Sprintf("未找到探索节点 %d。若你想查的是资产，请用 list_assets / asset_neighbors（资产与探索节点是不同的 id 空间，资产 id 不能传给 node_detail）。", id)), nil
+			for _, raw := range a.IDS {
+				id := pid(raw)
+				if id <= 0 || seen[id] {
+					continue
+				}
+				seen[id] = true
+				ordered = append(ordered, id)
+				if len(ordered) >= maxBatchNodeDetail {
+					break
+				}
 			}
-			if err := t.ts.PopulateFindingTrafficIDs([]*db.Node{n}); err != nil {
-				return actool.Errorf(err.Error()), nil
+			if len(ordered) == 0 {
+				return actool.Errorf("id 或 ids 必填"), nil
 			}
-			return jsonResult(n) // full payload incl. detail / evidence, plus explicit finding IDs
+			found := make([]*db.Node, 0, len(ordered))
+			var missing []int64
+			for _, id := range ordered {
+				n, err := t.ts.GetNodeWithSources(id)
+				if err != nil {
+					return actool.Errorf(err.Error()), nil
+				}
+				if n == nil {
+					missing = append(missing, id)
+					continue
+				}
+				found = append(found, n)
+			}
+			if len(found) > 0 {
+				if err := t.ts.PopulateFindingTrafficIDs(found); err != nil {
+					return actool.Errorf(err.Error()), nil
+				}
+			}
+			resp := map[string]any{"nodes": found}
+			if len(missing) > 0 {
+				resp["missing"] = missing
+			}
+			return jsonResult(resp)
 		})
 }
 

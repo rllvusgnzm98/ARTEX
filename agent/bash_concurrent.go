@@ -48,12 +48,11 @@ func bashCommandReadOnly(command string) bool {
 }
 
 var (
-	rePythonInline     = regexp.MustCompile(`^(?:/usr/bin/|/bin/)?python3?(?:\s+-[A-Za-z]+)*\s+-c\s+`)
-	rePythonHeredoc    = regexp.MustCompile(`^(?:/usr/bin/|/bin/)?python3?(?:\s+-[A-Za-z]+)*(?:\s+-)?\s+<<-?\s*'([A-Za-z_][A-Za-z0-9_]*)'\s*(?:\r?\n|$)`)
-	rePythonOpenWrite  = regexp.MustCompile(`(?i)open\s*\([^)]*,\s*['"][wax+]`)
-	rePythonIPv4       = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}\b`)
-	reSedLineRange     = regexp.MustCompile(`^\d+(?:,\d+)?p$`)
-	reLocalCdPrefix    = regexp.MustCompile(`^cd\s+[^\n;|&` + "`" + `$<>]+?(?:\s*&&\s*|\s*;\s*|\s*\r?\n\s*)`)
+	rePythonInline    = regexp.MustCompile(`^(?:/usr/bin/|/bin/)?python3?(?:\s+-[A-Za-z]+)*\s+-c\s+`)
+	rePythonHeredoc   = regexp.MustCompile(`^(?:/usr/bin/|/bin/)?python3?(?:\s+-[A-Za-z]+)*(?:\s+-)?\s+<<-?\s*'([A-Za-z_][A-Za-z0-9_]*)'\s*(?:\r?\n|$)`)
+	rePythonOpenWrite = regexp.MustCompile(`(?i)open\s*\([^)]*,\s*['"][wax+]`)
+	reSedLineRange    = regexp.MustCompile(`^(?:\d+|\$)(?:,(?:\d+|\$))?p$`)
+	reLocalCdPrefix   = regexp.MustCompile(`^cd\s+[^\n;|&` + "`" + `$<>]+?(?:\s*&&\s*|\s*;\s*|\s*\r?\n\s*)`)
 )
 
 // isLocalReadOnlyBash reports whether command is a provably read-only local
@@ -136,8 +135,21 @@ func isOfflineReadOnlyPython(command string) bool {
 		if i >= len(rest) || rest[i] != quote {
 			return false
 		}
-		if strings.TrimSpace(rest[i+1:]) != "" {
-			return false
+		tail := strings.TrimSpace(stripSafeStderrRedirects(rest[i+1:]))
+		if tail != "" {
+			// Allow read-only post-processing pipes (e.g. `| head -50`) after python3 -c.
+			if !strings.HasPrefix(tail, "|") || strings.HasPrefix(tail, "|&") || strings.HasPrefix(tail, "||") {
+				return false
+			}
+			pipeSegs, ok := splitLocalReadOnlyPipeline(strings.TrimSpace(tail[1:]))
+			if !ok || len(pipeSegs) == 0 {
+				return false
+			}
+			for _, seg := range pipeSegs {
+				if !localReadOnlySegmentAllowed(seg) {
+					return false
+				}
+			}
 		}
 		body = rest[1:i]
 	} else {
@@ -147,14 +159,18 @@ func isOfflineReadOnlyPython(command string) bool {
 	for _, forbidden := range []string{
 		"socket", "urllib", "requests", "http.client", "httpx", "aiohttp",
 		"ftplib", "telnetlib", "paramiko", "pwn", "scapy", "subprocess",
-		"os.system", "os.popen", "os.exec", "os.spawn", "pty", "shutil",
-		".write_text", ".write_bytes", "://",
+		"os.system", "os.popen", "os.exec", "os.spawn", "os.remove", "os.unlink",
+		"os.rename", "os.mkdir", "os.makedirs", "os.rmdir", "pty", "shutil",
+		"ctypes", "__import__", "importlib", "webbrowser", "xmlrpc", "smtplib",
+		"poplib", "imaplib", "ssl", "asyncio", "multiprocessing",
+		".write_text", ".write_bytes", ".unlink(", ".rmdir(", ".mkdir(",
+		"eval(", "exec(", "compile(",
 	} {
 		if strings.Contains(lower, forbidden) {
 			return false
 		}
 	}
-	if rePythonOpenWrite.MatchString(body) || rePythonIPv4.MatchString(body) {
+	if rePythonOpenWrite.MatchString(body) {
 		return false
 	}
 	return true
@@ -406,26 +422,101 @@ func localReadOnlySegmentAllowed(seg string) bool {
 			}
 		}
 		return true
-	case "sed":
-		quiet := false
-		hasRange := false
+	case "base64", "iconv":
 		for _, w := range words[1:] {
 			arg := w.text
-			if arg == "-n" || arg == "--quiet" || arg == "--silent" {
-				quiet = true
+			if arg == "-o" || strings.HasPrefix(arg, "-o") || strings.HasPrefix(arg, "--output") {
+				return false
+			}
+		}
+		return true
+	case "sed":
+		quiet := false
+		seenScript := false
+		for _, w := range words[1:] {
+			arg := w.text
+			if !seenScript {
+				if arg == "-n" || arg == "--quiet" || arg == "--silent" {
+					quiet = true
+					continue
+				}
+				if arg == "-E" || arg == "-r" || arg == "--regexp-extended" {
+					continue
+				}
+				if strings.HasPrefix(arg, "-") {
+					return false
+				}
+				// Without -e/-f, the first positional argument is always the sed script.
+				if !isSafeSedReadOnlyScript(arg) {
+					return false
+				}
+				seenScript = true
 				continue
 			}
 			if strings.HasPrefix(arg, "-") {
 				return false
 			}
-			if !hasRange && reSedLineRange.MatchString(arg) {
-				hasRange = true
-			}
 		}
-		return quiet && hasRange
+		return quiet && seenScript
 	default:
 		return bashAllowlistWordsSafe(name, words[1:], false)
 	}
+}
+
+// isSafeSedReadOnlyScript accepts strictly read-only `sed -n` print selectors:
+// numeric ranges (`120,300p`, `1,$p`) and regex address selectors
+// (`/^==B64==$/,/^==========*$/p`, `/needle/p`) with no mutating/exec commands.
+func isSafeSedReadOnlyScript(arg string) bool {
+	if reSedLineRange.MatchString(arg) {
+		return true
+	}
+	if len(arg) < 4 || !strings.HasSuffix(arg, "p") || strings.ContainsAny(arg, "\r\n") {
+		return false
+	}
+	body := arg[:len(arg)-1]
+	consumeAddr := func(s string) (string, bool) {
+		if len(s) == 0 {
+			return "", false
+		}
+		if s[0] == '$' {
+			return s[1:], true
+		}
+		if s[0] >= '0' && s[0] <= '9' {
+			i := 0
+			for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+				i++
+			}
+			return s[i:], true
+		}
+		if s[0] != '/' {
+			return "", false
+		}
+		for i := 1; i < len(s); i++ {
+			if s[i] == '\\' {
+				i++
+				continue
+			}
+			if s[i] == '/' {
+				if i == 1 {
+					return "", false
+				}
+				return s[i+1:], true
+			}
+		}
+		return "", false
+	}
+	rest, ok := consumeAddr(body)
+	if !ok {
+		return false
+	}
+	if rest == "" {
+		return true
+	}
+	if rest[0] != ',' {
+		return false
+	}
+	rest2, ok := consumeAddr(rest[1:])
+	return ok && rest2 == ""
 }
 
 func bashCommandInAllowlist(command string, allowNetworkRecon bool) bool {
