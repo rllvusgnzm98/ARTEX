@@ -67,7 +67,7 @@ flowchart TD
 运行随 Skill 附带的高并发非破坏性探针脚本，对目标站点执行快速基线审计：
 
 ```bash
-python3 scripts/canary_scan.py <target_url>
+python3 ${SKILL_DIR}/scripts/canary_scan.py <target_url>
 ```
 
 **探针覆盖的 5 大高危类别**：

@@ -1,6 +1,7 @@
 ---
 name: playwright-cli
 description: 真实浏览器交互自动化技能：优先通过 ARTEX 内置 browser MCP（mcp__browser__*，已自动挂载平台流量捕获代理）操作无头浏览器完成 SPA 渲染、复杂登录/CSRF/前端加密交互、DOM XSS 验证与网络抓包；无 MCP 时可回退 playwright-cli 命令行。
+mcps: browser
 ---
 
 # Browser Automation（内置 browser MCP 优先 / playwright-cli 备选）
@@ -420,6 +421,13 @@ Ask the user for UI review or design feedback. The user draws boxes on the live 
 playwright-cli open https://example.com
 playwright-cli show --annotate
 ```
+
+## 异步 XSS / CSRF / 管理员机器人本地预演工作流
+
+验证客户端跨站、CSP 或复杂登录态表单时，切忌直接在远程目标盲猜响应：
+1. 先用 `mcp__browser__browser_navigate` + `browser_evaluate` 在本地/测试会话核实真实 DOM 路由、表单 `action`、隐藏 CSRF `_token` 与 Cookie 属性（`HttpOnly`/`SameSite`）；
+2. 需要验证异步浏览器跳转是否会中断请求时，搭配 `async-client-oob-chain` 技能及平台内置 `oob_allocate` / `oob_poll` 接收回调证据；
+3. 结束时务必调用 `mcp__browser__browser_close` 释放浏览器上下文。
 
 ## Specific tasks
 

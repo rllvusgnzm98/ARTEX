@@ -351,7 +351,13 @@ const workerDefaultTmpl = `你是授权安全测试与红队行动的"执行者"
 - **确认漏洞 → report_finding（传 intent_id 与简明漏洞标题 name）**：**仅限本次亲自触发、具备跨安全边界真实危害（如 RCE、SQLi/SSRF 实锤、跨租户/越权读写、核心凭据/数据泄露等）且拿到可复现请求/响应或命令输出证据时使用**。纯版本号暴露、缺安全头、无凭据 CORS 反射、Self-XSS、未证实接管的悬空解析或仅靠版本推断的疑似 CVE，**严禁调用 report_finding 充数**（有可串联价值的高潜怀疑点用 record_fact 记 inferred 交规划者）。
 
 **专项技能与扩展工具**：
-- 遇到前端 SPA/打包 JS 逆向提取隐藏 API 与签名算法、Web 业务热点审计、需真实浏览器交互、跨系统载荷编码、Java/WebLogic 评估、多层内网跳板或 Windows/AD 后渗透等场景时，先查 Skill 工具列表按需加载已装配的对应技能（如 js-api-recon / tbhm-app-analysis / playwright-cli / cross-os-payload-encoding / weblogic-java-rce / multi-hop-pivoting / windows-ad-postex / ad-exchange-relay 等）。
+- 遇到以下场景先查 Skill 工具按需加载对应技能（内置了零依赖辅助脚本与验证纪律，胜过从零手写脆弱脚本）：
+  · 目标 502/503/限速或全站同质拦截 → target-health-triage；
+  · 开源 CMS/插件（WordPress/PrestaShop/SuiteCRM/Froxlor 等）源码与补丁定位 → oss-cms-patch-audit；
+  · 存储型/盲打 XSS、CSRF、管理员机器人与 OOB 回调链 → async-client-oob-chain + playwright-cli（**带外验证直接调用 oob_allocate / oob_poll，严禁在 Bash 起 python HTTP 占 80 端口**）；
+  · 盲注 RTT 基线校准与分离度校验 → blind-oracle-extractor；
+  · 文件写/硬编码密钥/JWT/SSTI/反序列化原语升级 → web-rce-gadget-playbook；
+  · SPA/JS 逆向 → js-api-recon；应用热点测绘 → tbhm-app-analysis；外部资产测绘 → tbhm-recon；跨系统载荷/WebLogic/跳板/AD → cross-os-payload-encoding / weblogic-java-rce / multi-hop-pivoting / windows-ad-postex / ad-exchange-relay。
 - 涉及双账号/多租户越权（IDOR/BOLA）验证、立足点会话或内网端口转发/SOCKS 通道纳管时，按需检索并调用 dual_account_verify、register_session、tunnel_register 等扩展工具。
 
 完成本意图后用一句话总结你做了什么、写回了哪些核心结论。
@@ -499,7 +505,7 @@ func intentAssetIDs(intent *db.Node) []int64 {
 
 func renderIntentTask(intent *db.Node) string {
 	return fmt.Sprintf("\n\n【你领到的意图（本次唯一任务：只做这一条、只产生事实、做完即停）】：\n%s\n意图 id: %d（写回 record_fact / report_finding 时传它）", string(intent.Payload), intent.ID) +
-		chainskel.ForIntent(intent.Payload) + chainskel.RefsGuideForIntent(intent.Payload)
+		chainskel.ForIntent(intent.Payload) + chainskel.SkillGuideForIntent(intent.Payload)
 }
 
 const (
@@ -703,6 +709,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intent.ID})
 	tools, def, cleanup := AugmentTools(ctx, "worker", base)
 	defer cleanup()
+	tools = wrapToolsWithWorkDeadline(tools)
 
 	// system prompt 保持任务级静态可缓存（角色正文 + 固定红线 + 任务级操作约束），
 	// 所有 per-intent 动态块（意图正文/骨架、目标资产、蜜罐提示、进场预塞、继承凭据、全局态势）
@@ -834,12 +841,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		MaxTokens:     w.maxTokens(),            // 0 = 不发上限,由服务端默认值决定
 	}
 	AttachStableWebFetch(&opts, w.uaForTask(taskID)) // 官方 WebFetch 请求头用本任务稳定 UA，回包走 untrusted-data
-	if hooks != nil {                                // typed-nil guard: only set when concrete (avoids harness panic)
-		AttachStopLossWrites(hooks, func() (WriteCounts, bool) { return tsx.Writes(), true })
+	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
 		opts.Hooks = hooks
-		if h, ok := hooks.(stopLossHooks); ok {
-			budgetProvider.loss = h.mon
-		}
 	}
 	if w.tx != nil { // persist raw LLM conversation; one file per worked intent
 		opts.Transcript = w.tx
@@ -904,15 +907,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	}
 
 	reason, err := captureWorkerSession(ctx, s, resumeWarning+input, emitWrap)
-	if !budgetProvider.loss.Fired() {
-		if recErr := w.recoverSettlement(ctx, s, opts, settle, err, tsx, emitWrap); recErr != nil && isTransientSettlementError(recErr) {
-			err = &SettlementTransientError{BudgetErr: err, RecoveryErr: recErr}
-		}
-	} else if wroteAfter, ok := budgetProvider.loss.WritesSinceLatch(); ok && wroteAfter == 0 && ctx.Err() == nil {
-		// StopLoss latched without post-latch DB writes: run write-only settlement
-		// (or deterministic partial_progress fallback) without marking the stalled
-		// intent as a transient retryable outage.
-		_ = w.recoverSettlement(ctx, s, opts, settle, errStopLossUnsettled, tsx, emitWrap)
+	if recErr := w.recoverSettlement(ctx, s, opts, settle, err, tsx, emitWrap); recErr != nil && isTransientSettlementError(recErr) {
+		err = &SettlementTransientError{BudgetErr: err, RecoveryErr: recErr}
 	}
 	return reason, tsx.finishEvidenceWrites(), err
 }
@@ -932,6 +928,11 @@ func captureWorkerSession(ctx context.Context, s *agentcore.Session, input strin
 	}
 	if isRunBudgetError(err) {
 		return harness.ReasonTimeout, err
+	}
+	if reason == harness.ReasonTimeout && err == nil {
+		if b, ok := ctx.Value(runBudgetKey{}).(runBudget); ok && !b.recovery && !b.work.IsZero() && !time.Now().Before(b.workDeadline()) {
+			return harness.ReasonTimeout, &RunBudgetError{Deadline: b.workDeadline()}
+		}
 	}
 	return reason, err
 }

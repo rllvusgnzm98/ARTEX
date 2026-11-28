@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/norma/harness"
 )
 
 // openIntentC is an unrelated new-target intent on a third host. It is not a
@@ -103,20 +104,13 @@ func TestOrderClaimSlotsFailSoftKeepsOriginalOrder(t *testing.T) {
 }
 
 func TestYieldWhenNoMarginalProgress(t *testing.T) {
-	// Slot yield is the same stop-loss decision: once a run has no marginal
-	// progress, the intent settles exhausted and the slot can be reclaimed.
-	loss := EvaluateStopLoss(tightPolicy(), ProgressSignals{
-		FactsKnown: true, AssetsKnown: true, CommandsKnown: true,
-		IdleProbes: 2, Elapsed: time.Minute,
-	})
-	if !loss.Fired() {
-		t.Fatalf("no marginal progress should fire stop-loss: %+v", loss)
-	}
-	if got := IntentStateAfterRun("", nil, loss); got != "exhausted" {
+	// Once a run exhausts its run budget or max turns, the intent settles
+	// exhausted and the slot is reclaimed without writing target failure.
+	if got := IntentStateAfterRun(harness.ReasonTimeout, &RunBudgetError{Deadline: time.Now()}); got != "exhausted" {
 		t.Fatalf("yielded slot should settle exhausted (not done, not a goal failure), got %s", got)
 	}
-	if loss.TargetFailureWrites != 0 {
-		t.Fatal("yielding a slot must not write target failure")
+	if got := IntentStateAfterRun(harness.ReasonMaxTurns, nil); got != "exhausted" {
+		t.Fatalf("max_turns slot should settle exhausted, got %s", got)
 	}
 }
 

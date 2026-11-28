@@ -132,9 +132,9 @@ var keywordRules = []struct {
 	cat      string
 	keywords []string
 }{
-	{"patch", []string{"patch diff", "补丁差分", "补丁分析", "补丁对比", "n-day", "ghidriff", "diaphora", "bindiff", "二进制差分", "版本比对", "diffing"}},
+	{"patch", []string{"patch diff", "补丁差分", "补丁分析", "补丁对比", "n-day", "ghidriff", "diaphora", "bindiff", "二进制差分", "版本比对", "diffing", "git diff"}},
 	{"firmware", []string{"firmware", "固件", "binwalk", "squashfs", "ubifs", "嵌入式安全", "iot security", "iot pentest"}},
-	{"audit", []string{"code audit", "code-audit", "source code security", "security code review", "源码审计", "代码审计", "白盒审计", "semgrep", "codeql", "gosec", "sast"}},
+	{"audit", []string{"code audit", "code-audit", "source code security", "security code review", "源码审计", "代码审计", "白盒审计", "semgrep", "codeql", "gosec", "sast", "wp_ajax", "permission_callback"}},
 	{"ai", []string{"llm", "大模型", "大语言模型", "提示注入", "提示词注入", "prompt injection", "prompt-injection", "越狱", "jailbreak", "间接注入", "rag 投毒", "知识库投毒", "记忆投毒", "ai agent", "ai 安全", "智能体安全", "工具滥用", "mcp 工具", "模型供应链"}},
 	// hardware 置于 web 之前:其"故障注入"等含 web 泛词"注入"的复合关键词需先于 web 命中(同 ai 的"提示注入")。
 	{"hardware", []string{"硬件安全", "嵌入式接口", "jtag", "uart", "swd", "idcode", "安全启动", "secure boot", "调试接口", "调试口", "故障注入", "glitch", "侧信道", "flash 提取", "逻辑分析仪", "bus pirate"}},
@@ -143,7 +143,7 @@ var keywordRules = []struct {
 	{"identity", []string{"saml", "oidc", "openid", "oauth", "sso", "单点登录", "身份联邦", "联邦登录", "账号接管", "account takeover", "redirect_uri", "assertion 篡改", "idp 元数据", "jwt"}},
 	{"cloud", []string{"k8s", "kubernetes", "云原生", "imds", "元数据凭据", "公开桶", "存储桶", "iam 角色", "iam 权限", "过度授权", "集群 rbac", "eks", "gke", "serviceaccount", "云控制面"}},
 	{"database", []string{"数据库安全", "数据库未授权", "数据库弱口令", "redis 未授权", "mongodb 未授权", "memcached 未授权", "xp_cmdshell", "load_file", "file_priv", "copy program", "udf 提权", "数据库提权", "数据库配置审计", "rds 配置审计"}},
-	{"web", []string{"sql", "注入", "xss", "ssrf", "ssti", "xxe", "反序列化", "文件上传", "上传点", "命令注入", "命令执行", "代码执行", "rce", "waf", "逻辑漏洞", "越权", "文件包含", "目录遍历", "cms", "graphql", "bola", "bfla", "idor", "接口鉴权", "接口测试", "批量赋值", "mass assignment", "限速绕过", "rest api", "websocket", "前端加密", "前端签名", "js 加密", "sourcemap", "webpack 还原", "请求签名", "web app", "web application", "webapp", "web应用", "web 应用"}},
+	{"web", []string{"sql", "注入", "xss", "ssrf", "ssti", "xxe", "反序列化", "deserialization", "文件上传", "上传点", "任意文件", "文件删除", "类型混淆", "type juggling", "命令注入", "命令执行", "代码执行", "rce", "waf", "逻辑漏洞", "越权", "文件包含", "目录遍历", "cms", "wordpress", "prestashop", "dolibarr", "suitecrm", "froxlor", "cacti", "lollms", "stalwart", "graphql", "bola", "bfla", "idor", "接口鉴权", "接口测试", "批量赋值", "mass assignment", "限速绕过", "rest api", "websocket", "前端加密", "前端签名", "js 加密", "sourcemap", "webpack 还原", "请求签名", "web app", "web application", "webapp", "web应用", "web 应用"}},
 	// web3 置于 web 之后保留 web 优先级,但先于 pivot,避免"可升级代理/代理合约"被泛词"代理"吞掉。
 	{"web3", []string{"智能合约", "合约审计", "solidity", "evm", "web3", "defi", "闪电贷", "flash loan", "flashloan", "预言机", "可升级代理", "代理合约", "delegatecall", "erc20", "erc-20", "erc721", "erc-721", "slither", "mythril"}},
 	{"supply", []string{"供应链安全", "软件供应链", "sbom", "软件组成分析", "依赖混淆", "dependency confusion", "typosquat", "依赖投毒", "包投毒", "供应链投毒", "cosign", "制品签名", "制品完整性", "第三方 action", "osv-scanner", "dependency-track"}},

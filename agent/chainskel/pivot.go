@@ -75,4 +75,50 @@ func PivotHintsForIntent(payload json.RawMessage, max int) string {
 	return PivotHints(p.ChainTags, p.Summary, max)
 }
 
+var categorySkillHints = map[string]string{
+	"web":      "target-health-triage / oss-cms-patch-audit / async-client-oob-chain / blind-oracle-extractor / web-rce-gadget-playbook / js-api-recon / tbhm-app-analysis / playwright-cli（带外回连用 oob_allocate/oob_poll）",
+	"audit":    "oss-cms-patch-audit / web-rce-gadget-playbook / js-api-recon",
+	"patch":    "oss-cms-patch-audit",
+	"identity": "async-client-oob-chain / web-rce-gadget-playbook / playwright-cli",
+	"recon":    "tbhm-recon / js-api-recon / target-health-triage",
+	"ad":       "windows-ad-postex / ad-exchange-relay / cross-os-payload-encoding",
+	"pivot":    "multi-hop-pivoting / cross-os-payload-encoding",
+	"priv":     "web-rce-gadget-playbook / windows-ad-postex / cross-os-payload-encoding",
+}
+
 func RefsGuideForIntent(_ json.RawMessage) string { return "" }
+
+// SkillGuideForIntent emits a concise skill & managed-OOB routing hint keyed off
+// the intent's chain_tags (or summary fallback). Returns "" when no category matches.
+func SkillGuideForIntent(payload json.RawMessage) string {
+	var p struct {
+		Summary   string   `json:"summary"`
+		ChainTags []string `json:"chain_tags"`
+	}
+	if len(payload) == 0 || json.Unmarshal(payload, &p) != nil {
+		return ""
+	}
+	var cats []string
+	for _, t := range NormalizeChainTags(p.ChainTags) {
+		if Valid(t) {
+			cats = append(cats, t)
+		}
+		if len(cats) >= MaxTagsPerIntent {
+			break
+		}
+	}
+	if len(cats) == 0 {
+		cats = Match(p.Summary)
+	}
+	if len(cats) == 0 {
+		return ""
+	}
+	var lines []string
+	if hint, ok := categorySkillHints[cats[0]]; ok && hint != "" {
+		lines = append(lines, "["+cats[0]+"] 优先按需调 Skill 加载: "+hint)
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "\n\n【可用专项技能与受管工具提示（遇到对应场景先调 Skill 加载再手写脚本）】:\n- " + strings.Join(lines, "\n- ")
+}

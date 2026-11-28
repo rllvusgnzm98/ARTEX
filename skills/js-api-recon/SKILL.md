@@ -37,6 +37,10 @@ description: 统一的前端 JS 与 API 攻击面侦察技能：覆盖首屏 JS 
 4. **SPA 路由 / 多角色权限树（复杂后台按需）**：按 `${SKILL_DIR}/references/api-recon-reference.md` 运行 `scripts/spa/` 下的采集与权限树构建脚本。
 5. **可选 Caido 指纹（仅本机有 Caido 抓包时）**：先读 `${SKILL_DIR}/references/http-fingerprinting.md`，再调用 `caido_collect_api_traffic` / `http_fingerprint_probe_plan`。
 
+## 单文件 / 本地解包 Bundle 快速提取模式（Electron / Next.js / 白盒源码）
+
+当本地已有解包后的前端 JS、Electron `asar` 或单个压缩 bundle（无需建 `runs/<domain>/<ts>/` 多轮目录）时，直接用 `js_extract_endpoints`（或 `python3 ${SKILL_DIR}/scripts/regex/extract_endpoints.py <local_file_or_dir>`）提取路由与参数；若需检查隐藏 DOM XSS 汇聚点或凭据，再按需补跑 L2。
+
 ## 附加参考（按需读取）
 
 - `${SKILL_DIR}/references/surface-checklist.md`：分步交付验收清单

@@ -305,12 +305,12 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 		retries, backoffOf := sameProviderRetryPolicy(selection.retry)
 		for attempt := 0; ; attempt++ {
 			msg, sr, usage, callErr = selection.provider.Complete(ctx, req)
-			if callErr != nil && ctx.Err() == nil && !agent.ModelRetriesStopped(ctx) &&
+			if callErr != nil && ctx.Err() == nil &&
 				attempt < retries && isRetryableStreamError(callErr) {
 				backoff := sameProviderAttemptBackoff(selection.retry, backoffOf, attempt, callErr)
 				log.Printf("[task-llm] task %s 非流式调用失败,%v 后同 provider 重试 (%d/%d): %v",
 					taskID, backoff, attempt+1, retries, callErr)
-				if sleepCtx(ctx, backoff) || agent.ModelRetriesStopped(ctx) {
+				if sleepCtx(ctx, backoff) {
 					break // 退避期间 ctx 取消 → 停止重试
 				}
 				continue
@@ -330,9 +330,6 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 		}
 		if transition.Advanced && !transition.Stale && hooks.transition != nil {
 			hooks.transition(selection, transition, callErr)
-		}
-		if agent.ModelRetriesStopped(ctx) {
-			return llm.Message{}, "", llm.Usage{}, stoppedQuotaError(taskID, transition, callErr, hooks)
 		}
 		if !transition.Stale && transition.NextProfileID == nil {
 			return llm.Message{}, "", llm.Usage{}, &taskLLMError{taskID: taskID, chainExhausted: transition.ChainExhausted, revision: transition.Revision, cause: callErr}
@@ -382,12 +379,12 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 						return
 					}
 				}
-				if streamErr != nil && !committed && ctx.Err() == nil && !agent.ModelRetriesStopped(ctx) &&
+				if streamErr != nil && !committed && ctx.Err() == nil &&
 					attempt < retries && isRetryableStreamError(streamErr) {
 					backoff := sameProviderAttemptBackoff(selection.retry, backoffOf, attempt, streamErr)
 					log.Printf("[task-llm] task %s 提交前流失败,%v 后同 provider 重试 (%d/%d): %v",
 						taskID, backoff, attempt+1, retries, streamErr)
-					if sleepCtx(ctx, backoff) || agent.ModelRetriesStopped(ctx) {
+					if sleepCtx(ctx, backoff) {
 						break // 退避期间 ctx 取消 → 停止重试
 					}
 					continue
@@ -429,15 +426,6 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 			}
 			if transition.Advanced && !transition.Stale && hooks.transition != nil {
 				hooks.transition(selection, transition, streamErr)
-			}
-			if agent.ModelRetriesStopped(ctx) {
-				for _, buffered := range pending {
-					if !yield(buffered, nil) {
-						return
-					}
-				}
-				yield(llm.StreamEvent{}, stoppedQuotaError(taskID, transition, streamErr, hooks))
-				return
 			}
 			if committed {
 				// Output was already yielded, so this call cannot be replayed on the next

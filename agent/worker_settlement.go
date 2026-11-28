@@ -121,20 +121,14 @@ func isTransientSettlementError(err error) bool {
 	return false
 }
 
-var errStopLossUnsettled = errors.New("worker stop-loss latched with zero post-latch writes")
-
 func (w *Worker) recoverSettlement(ctx context.Context, previous *agentcore.Session, opts agentcore.Options, settle *harness.Settlement, runErr error, tsx *ToolSet, emit func(db.Activity)) error {
 	b, ok := ctx.Value(runBudgetKey{}).(runBudget)
-	stopLossSettling := errors.Is(runErr, errStopLossUnsettled)
-	if !ok || b.reserve <= 0 || ctx.Err() != nil || (!isRunBudgetError(runErr) && !IsCallTimeout(runErr) && !stopLossSettling) {
+	if !ok || b.reserve <= 0 || ctx.Err() != nil || (!isRunBudgetError(runErr) && !IsCallTimeout(runErr)) {
 		return nil
 	}
 	why := "run_budget"
 	hard := b.hardDeadline()
-	if stopLossSettling {
-		why = "stop_loss"
-		hard = minTime(hard, time.Now().Add(b.reserve))
-	} else if IsCallTimeout(runErr) {
+	if IsCallTimeout(runErr) {
 		why = "call_timeout"
 		hard = minTime(hard, time.Now().Add(b.reserve))
 	}
@@ -154,7 +148,11 @@ func (w *Worker) recoverSettlement(ctx context.Context, previous *agentcore.Sess
 	defer func() {
 		after := tsx.Writes()
 		writes := WriteCounts{Facts: after.Facts - before.Facts, Assets: after.Assets - before.Assets, Findings: after.Findings - before.Findings}
-		log.Printf("[worker settlement] reason=%s duration=%s turns=%d writes=%s error=%v", why, time.Since(start), calls.Load(), writes, recoveryErr)
+		errMsg := "none"
+		if recoveryErr != nil {
+			errMsg = recoveryErr.Error()
+		}
+		log.Printf("[worker settlement] reason=%s duration=%s turns=%d writes=%s err=%s", why, time.Since(start), calls.Load(), writes, errMsg)
 	}()
 
 	opts.SessionID = previous.SessionID()
@@ -187,9 +185,6 @@ func (w *Worker) recoverSettlement(ctx context.Context, previous *agentcore.Sess
 			tools = append(tools, tool)
 		}
 	}
-	if h, ok := opts.Hooks.(stopLossHooks); ok {
-		opts.Hooks = h.inner
-	}
 	opts.Tools, opts.Settlement = tools, nil
 	opts.MaxTurns, opts.MaxDuration = settle.MaxTurns, time.Until(hard)
 	innerProv := w.prov
@@ -220,7 +215,7 @@ func (w *Worker) recoverSettlement(ctx context.Context, previous *agentcore.Sess
 		snapshotMsgs = s.Messages()
 	}
 	prompt := settle.Prompt
-	if isRunBudgetError(runErr) || stopLossSettling {
+	if isRunBudgetError(runErr) {
 		if p := settle.PromptByReason[harness.ReasonTimeout]; p != "" {
 			prompt = p
 		}
@@ -368,7 +363,10 @@ func (w *Worker) recordDeterministicPartialProgress(ctx context.Context, tsx *To
 		}
 		detail.WriteByte('\n')
 	}
-	summary := fmt.Sprintf("[partial_progress] 结算阶段遭遇模型故障，已自动保存最近 %d 步工具观察进展", len(steps))
+	summary := fmt.Sprintf("[partial_progress] 结算阶段未产生新图谱写入，已自动保存最近 %d 步工具观察进展", len(steps))
+	if recoveryErr != nil {
+		summary = fmt.Sprintf("[partial_progress] 结算阶段遭遇模型故障，已自动保存最近 %d 步工具观察进展", len(steps))
+	}
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if _, err := tsx.recordOneFactCtx(writeCtx, factItem{

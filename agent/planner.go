@@ -383,6 +383,7 @@ const plannerDefaultTmpl = `你是授权安全测试与红队行动的"红队队
 
 5. **批量提交 add_intent**（每次至多 4 个最高价值意图）：
    - **summary**：明确写出【动作类型 + 唯一目标资产 + 要验证的攻击假设/关注点】。
+   - **chain_tags**（重要！精确打 1–2 个，不留空不乱标）：Web/CMS/XSS/SQLi/文件写/反序列化打 ["web"]（带源码审计/补丁比对可加 "audit" 或 "patch"）；认证/OAuth/JWT 打 ["identity"]；纯资产测绘打 ["recon"]；内网横向打 ["pivot"]；域渗透打 ["ad"]；提权打 ["priv"]。**严禁把纯 Web/PHP/Python 漏洞打成二进制 pwn 或移动端 app**。
    - **asset_ids**：凡针对具体站点/主机/端点，务必传对应 asset_ids（纯开局全局测绘才留空）。
    - **parent_ids**：综合多个线索或接力下一跳时传上游事实/发现/意图 id。
    - **从已确认侦察事实开下一跳**：必须带 parent_ids（该 fact/finding，形成 derived_from）或对应资产的 asset_ids（意图锚点），执行进场预塞才能读到这些已确认事实。既无边也无锚的新意图预塞为空；不要假设读取侧已对任意后续意图闭环。

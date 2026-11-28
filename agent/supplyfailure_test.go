@@ -220,10 +220,10 @@ func TestCallTimeoutSettlementNotSupplyOrTargetFailure(t *testing.T) {
 	if s.TargetFailureWrites != 0 || wrote != 0 {
 		t.Fatalf("TargetFailureWrites=%d wrote=%d, want 0 (≠ 目标失败)", s.TargetFailureWrites, wrote)
 	}
-	if IntentStateAfterRun(harness.ReasonModelError, err, StopLossVerdict{}) != "open" {
+	if IntentStateAfterRun(harness.ReasonModelError, err) != "open" {
 		t.Fatal("IntentStateAfterRun must keep call_timeout off the blocked path")
 	}
-	if IntentStateAfterRun(harness.ReasonModelError, context.Canceled, StopLossVerdict{}) != "blocked" {
+	if IntentStateAfterRun(harness.ReasonModelError, context.Canceled) != "blocked" {
 		t.Fatal("用户取消不得误标为墙钟超时回场")
 	}
 }

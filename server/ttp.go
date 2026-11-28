@@ -131,7 +131,7 @@ func (s *Server) wireRetro() {
 	s.engine.retroHook = func(taskID string) { go s.runRetro(taskID) }
 }
 
-// runRetro distills reusable decision experience from a just-completed task into
+// runRetro distills reusable decision experience from a task into
 // pending (unreviewed) TTP entries. Best-effort: never blocks or crashes the engine.
 func (s *Server) runRetro(taskID string) {
 	defer func() {
@@ -139,37 +139,56 @@ func (s *Server) runRetro(taskID string) {
 			log.Printf("[retro] task %s panic: %v", taskID, r)
 		}
 	}()
-	if s.m.pg == nil {
-		return
+	if _, err := s.runRetroWithResult(s.ctx, taskID); err != nil {
+		log.Printf("[retro] task %s 蒸馏失败: %v", taskID, err)
+	}
+}
+
+var (
+	errRetroNoTask     = fmt.Errorf("task not found")
+	errRetroNoProvider = fmt.Errorf("无可用模型,无法执行复盘")
+)
+
+func (s *Server) runRetroWithResult(ctx context.Context, taskID string) (int, error) {
+	if s.m == nil || s.m.pg == nil {
+		return 0, fmt.Errorf("database unavailable")
 	}
 	t, ok := s.m.Task(taskID)
 	if !ok || t.Store == nil {
-		return
+		return 0, errRetroNoTask
 	}
 	prov := s.retroProvider(t)
 	if prov == nil {
 		log.Printf("[retro] task %s: 无可用模型,跳过复盘", taskID)
-		return
+		return 0, errRetroNoProvider
 	}
 	input := s.gatherRetroInput(t)
 	if strings.TrimSpace(input) == "" {
-		return
+		return 0, nil
 	}
-	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
+	callCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	text, err := collectText(ctx, prov, retroSystemPrompt, input, 4096)
+	text, err := collectText(callCtx, prov, retroSystemPrompt, input, 4096)
 	if err != nil {
-		log.Printf("[retro] task %s 蒸馏失败: %v", taskID, err)
-		return
+		return 0, err
 	}
 	tid, _ := strconv.ParseInt(taskID, 10, 64)
 	n := 0
 	for _, p := range parseTTPJSON(text) {
-		if strings.TrimSpace(p.Scene) == "" || strings.TrimSpace(p.Criteria) == "" || strings.TrimSpace(p.Pivot) == "" {
+		scene := strings.TrimSpace(p.Scene)
+		criteria := strings.TrimSpace(p.Criteria)
+		pivot := strings.TrimSpace(p.Pivot)
+		if scene == "" || criteria == "" || pivot == "" {
 			continue
 		}
-		e := db.TTPEntry{Source: "retro", Status: "pending", Category: normCategory(p.Category),
-			Scene: p.Scene, Criteria: p.Criteria, Pivot: p.Pivot}
+		cat := normCategory(p.Category)
+		if tid > 0 {
+			if dup, derr := s.m.pg.HasTTPEntry(tid, cat, scene); derr == nil && dup {
+				continue
+			}
+		}
+		e := db.TTPEntry{Source: "retro", Status: "pending", Category: cat,
+			Scene: scene, Criteria: criteria, Pivot: pivot}
 		if tid > 0 {
 			e.TaskID = &tid
 		}
@@ -178,6 +197,74 @@ func (s *Server) runRetro(taskID string) {
 		}
 	}
 	log.Printf("[retro] task %s 复盘蒸馏出 %d 条待审 TTP", taskID, n)
+	return n, nil
+}
+
+const (
+	pauseRetroMinFindings = 5
+	pauseRetroMinRounds   = 10
+)
+
+// maybeRunPauseRetro runs a non-blocking checkpoint retro when a high-signal task
+// (>=5 findings or >=10 plan rounds) is paused by the user, without locking out
+// the final completion retro on goal met.
+func (s *Server) maybeRunPauseRetro(taskID string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[retro] pause checkpoint task %s panic: %v", taskID, r)
+		}
+	}()
+	if s == nil || s.m == nil || s.m.pg == nil {
+		return
+	}
+	t, ok := s.m.Task(taskID)
+	if !ok || t.Store == nil {
+		return
+	}
+	findings, _ := t.Store.ListByKind(db.KindFinding, 200)
+	var roundNo int
+	_ = s.m.pg.QueryRow(`SELECT COALESCE(round_no, 0) FROM explorations WHERE id=$1`, t.ExpID).Scan(&roundNo)
+	if len(findings) < pauseRetroMinFindings && roundNo < pauseRetroMinRounds {
+		return
+	}
+	milestone := fmt.Sprintf("%d:%d", len(findings), roundNo/10)
+	s.pauseRetroMu.Lock()
+	if s.pauseRetroSeen == nil {
+		s.pauseRetroSeen = map[string]string{}
+	}
+	if s.pauseRetroSeen[taskID] == milestone {
+		s.pauseRetroMu.Unlock()
+		return
+	}
+	s.pauseRetroSeen[taskID] = milestone
+	s.pauseRetroMu.Unlock()
+
+	if _, err := s.runRetroWithResult(s.ctx, taskID); err != nil {
+		log.Printf("[retro] pause checkpoint task %s failed: %v", taskID, err)
+	}
+}
+
+// triggerTaskRetro handles POST /api/tasks/{id}/retro to distill TTP entries on demand
+// for running, paused, or completed tasks.
+func (s *Server) triggerTaskRetro(w http.ResponseWriter, r *http.Request) {
+	taskID := strings.TrimSpace(r.PathValue("id"))
+	if taskID == "" {
+		writeErr(w, 400, "invalid task id")
+		return
+	}
+	n, err := s.runRetroWithResult(r.Context(), taskID)
+	if err != nil {
+		switch err {
+		case errRetroNoTask:
+			writeErr(w, 404, err.Error())
+		case errRetroNoProvider:
+			writeErr(w, 503, err.Error())
+		default:
+			writeErr(w, 502, "复盘蒸馏失败: "+err.Error())
+		}
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "queued": n})
 }
 
 func normCategory(c string) string {

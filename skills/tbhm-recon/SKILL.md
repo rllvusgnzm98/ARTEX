@@ -34,7 +34,7 @@ flowchart TD
 1. **DMARC 逆向关联**：
    - 运行配套脚本提取目标域名邮件安全策略，挖掘 `rua`/`ruf` 聚合报告邮箱关联的所有集团子公司与海外站点：
      ```bash
-     python3 scripts/live_dmarc_lookup.py <target-domain>
+     python3 ${SKILL_DIR}/scripts/live_dmarc_lookup.py <target-domain>
      ```
 2. **Microsoft 365 / Exchange 租户枚举**：
    - 若目标使用 Office 365，调用 Exchange Autodiscover API 提取租户绑定的所有关联域名：
@@ -67,9 +67,9 @@ flowchart TD
      subfinder -d <target-domain> -all -silent
      ```
 2. **OpenINTEL 5 年历史 DNS 大数据**：
-   - 离线查询 Cisco Umbrella Top 1M 历史子域库（毫秒级提取 4000万+ 离线数据）：
+   - 离线查询 Cisco Umbrella Top 1M 历史子域库（若本机已安装 `openintel-subs-linux`，可通过 `OPENINTEL_BIN` 指定路径）：
      ```bash
-     /home/skyler/下载/Telegram\ Desktop/The\ Bug\ Hunters\ Methodology\ \[Core\]\ 2026/openintel-subs-dist/openintel-subs-linux query -d <target-domain> -s
+     ${OPENINTEL_BIN:-openintel-subs-linux} query -d <target-domain> -s
      ```
 3. **GitHub 代码与子域刮取**：
    - 搜索组织代码库中暴露的内部研发子域（`internal.`, `dev-`, `stg-`, `api-`）。

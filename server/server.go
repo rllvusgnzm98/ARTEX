@@ -25,6 +25,7 @@ import (
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
+	"github.com/Autumn-27/artex/oob"
 	"github.com/Autumn-27/artex/report"
 	"github.com/Autumn-27/artex/session"
 	"github.com/Autumn-27/artex/stage"
@@ -57,6 +58,7 @@ type Server struct {
 	credStore *db.CredentialStore // 凭据落库访问层（secret AES-GCM，与 sessions 不同域标签）
 
 	stage      *stage.Manager   // 受管文件投递；nil = 未就绪（启动失败降级）
+	oob        *oob.Manager     // 托管 OOB 回调接收器；nil = 未就绪（启动失败降级）
 	tunnels    *tunnelRuntime   // 隧道台账运行时；nil = 未就绪
 	tunnelLive tunnelLiveLister // 内网变体/拓扑用的台账读口；nil-safe
 	emp3r0r    *emp3r0rRuntime  // emp3r0r cc sidecar 桥接；nil = 未启用
@@ -86,6 +88,9 @@ type Server struct {
 	chatAuto   map[string]bool
 	chatDone   map[string]chan struct{}
 	chatCancel map[string]context.CancelCauseFunc
+
+	pauseRetroMu   sync.Mutex
+	pauseRetroSeen map[string]string
 
 	// triggerQ buffers P3 trigger fires PER AGENT. A per-agent "pump" launches runs up
 	// to a concurrency limit derived from the agent's策略: serial → limit 1 (+ optional
@@ -168,6 +173,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	s.initSetupToken(keyDir)
 	s.initSideQuestions()
 	s.initStage(dataDir) // 受管文件投递暂存；失败降级为关闭，不影响启动
+	s.initOOB(dataDir)   // 托管 OOB 回调接收器；失败降级为关闭，不影响启动
 	s.initGate(dataDir)  // 伪装门控；解析失败保持 detect，不阻断启动
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
@@ -263,6 +269,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		s.seedDualVerifyTool()        // dual_account_verify 默认绑 worker
 		s.seedPatchVerifyTool()       // patch_verify 默认绑 worker
 		s.seedStageShareTool()        // stage_share 默认绑 worker
+		s.seedOOBTools()              // oob_allocate / oob_poll 默认绑 worker/pentest/mainagent/auto
 		go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
 		// 与触发器的业务节奏不同，且两者失败互不牵连——推送卡住不该影响 agent 触发。
@@ -811,6 +818,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/ttp/entries/{id}/approve", s.approveTTPEntry)
 	mux.HandleFunc("POST /api/ttp/entries/{id}/reject", s.rejectTTPEntry)
 	mux.HandleFunc("POST /api/ttp/writeups", s.importWriteup)
+	mux.HandleFunc("POST /api/tasks/{id}/retro", s.triggerTaskRetro)
 
 	// company system
 	mux.HandleFunc("GET /api/companies", s.listCompanies)
@@ -1020,6 +1028,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/stage", s.stageCreate)
 	mux.HandleFunc("GET /api/stage", s.stageList)
 	mux.HandleFunc("DELETE /api/stage/{token}", s.stageDelete)
+	mux.HandleFunc("POST /api/oob", s.oobCreate)
+	mux.HandleFunc("GET /api/oob", s.oobList)
+	mux.HandleFunc("GET /api/oob/{token}", s.oobPollHTTP)
+	mux.HandleFunc("DELETE /api/oob/{token}", s.oobDelete)
 
 	mux.HandleFunc("GET /api/intercept/pending", s.interceptListPending)
 	mux.HandleFunc("GET /api/intercept/pending/{id}", s.interceptGetOne)
@@ -1049,6 +1061,8 @@ func (s *Server) Handler() http.Handler {
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
 	root.HandleFunc("GET /s/{token}/{name}", s.stageDownload) // token 路径，无 JWT
+	root.HandleFunc("/o/{token}", s.oobCallback)              // OOB 回调路径，无 JWT，绕过伪装门控
+	root.HandleFunc("/o/{token}/{rest...}", s.oobCallback)
 	ui := s.webuiHandler()
 	if s.gate != nil {
 		ui = s.gate.WrapUI(ui)

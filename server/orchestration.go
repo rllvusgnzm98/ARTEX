@@ -53,6 +53,7 @@ func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	if t := s.stageShareTool(); t != nil {
 		tools = append(tools, t)
 	}
+	tools = append(tools, s.oobTools()...)
 	custom, err := s.customTools()
 	if err != nil {
 		log.Printf("[custom-tool] 加载失败: %v", err)

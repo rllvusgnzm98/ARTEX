@@ -239,11 +239,13 @@ func TestPromptPolishWorkerPlannerAndScopeSource(t *testing.T) {
 	PromptOverride = nil
 
 	work := workerSystem("", "", "/data", "/data/tasks/1/i9", false, DefaultFootprint())
-	if strings.Contains(work, "tbhm-recon") {
-		t.Fatalf("worker prompt must not reference unbound dead skill tbhm-recon:\n%s", work)
+	if strings.Contains(work, "scopesentry") {
+		t.Fatalf("worker prompt must not reference unbound skill scopesentry:\n%s", work)
 	}
-	if !strings.Contains(work, "按需") {
-		t.Fatalf("worker prompt should mention on-demand skills:\n%s", work)
+	for _, want := range []string{"按需", "tbhm-recon", "target-health-triage", "oob_allocate"} {
+		if !strings.Contains(work, want) {
+			t.Fatalf("worker prompt missing %q:\n%s", want, work)
+		}
 	}
 
 	plan := plannerSystem("内网域控评估", "/data", "/data/tasks/1")

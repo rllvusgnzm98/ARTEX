@@ -437,13 +437,18 @@ var builtinSkillVisibility = map[string][]string{
 	"js-api-recon":              {"worker", "mainagent", "pentest", "auto"},
 	"tbhm-app-analysis":         {"worker", "mainagent", "pentest", "auto"},
 	"playwright-cli":            {"worker", "mainagent", "pentest", "auto"},
-	"tbhm-recon":                {"mainagent", "pentest", "auto"},
+	"tbhm-recon":                {"worker", "mainagent", "pentest", "auto"},
 	"scopesentry":               {"mainagent", "pentest", "auto"},
 	"cross-os-payload-encoding": {"worker", "mainagent", "pentest", "auto"},
 	"weblogic-java-rce":         {"worker", "mainagent", "pentest", "auto"},
 	"multi-hop-pivoting":        {"worker", "mainagent", "pentest", "auto"},
 	"windows-ad-postex":         {"worker", "mainagent", "pentest", "auto"},
 	"ad-exchange-relay":         {"worker", "mainagent", "pentest", "auto"},
+	"target-health-triage":      {"worker", "mainagent", "pentest", "auto"},
+	"oss-cms-patch-audit":       {"worker", "mainagent", "pentest", "auto"},
+	"async-client-oob-chain":    {"worker", "mainagent", "pentest", "auto"},
+	"blind-oracle-extractor":    {"worker", "mainagent", "pentest", "auto"},
+	"web-rce-gadget-playbook":   {"worker", "mainagent", "pentest", "auto"},
 }
 
 // seedBuiltinSkillVisibility binds the shipped built-in skills to their default
@@ -475,7 +480,7 @@ WHERE skill_name IN (
 		if _, err := d.Exec(`
 DELETE FROM agent_skill_visibility
 WHERE agent_id = (SELECT id FROM agents WHERE key = 'worker')
-  AND skill_name IN ('tbhm-recon', 'scopesentry')`); err != nil {
+  AND skill_name IN ('scopesentry')`); err != nil {
 			return fmt.Errorf("trim worker non-target skills: %w", err)
 		}
 		for _, agentKey := range []string{"worker", "mainagent", "pentest", "auto"} {
@@ -489,6 +494,27 @@ ON CONFLICT (agent_id, resource_kind, resource_id, mcp_tool_name) DO UPDATE SET 
 			}
 		}
 		_ = d.SetSetting("skill_mcp_visibility_norm_v1", "done")
+	}
+	if v, _, _ := d.GetSetting("skill_visibility_route_b_v1"); v != "done" {
+		routeBSkills := []string{
+			"tbhm-recon",
+			"target-health-triage",
+			"oss-cms-patch-audit",
+			"async-client-oob-chain",
+			"blind-oracle-extractor",
+			"web-rce-gadget-playbook",
+		}
+		for _, skillName := range routeBSkills {
+			for _, key := range []string{"worker", "mainagent", "pentest", "auto"} {
+				if _, err := d.Exec(`
+INSERT INTO agent_skill_visibility(agent_id, skill_name, enabled)
+SELECT id, $2, true FROM agents WHERE key=$1
+ON CONFLICT (agent_id, skill_name) DO NOTHING`, key, skillName); err != nil {
+					return fmt.Errorf("route b skill %s → agent %s: %w", skillName, key, err)
+				}
+			}
+		}
+		_ = d.SetSetting("skill_visibility_route_b_v1", "done")
 	}
 	return nil
 }

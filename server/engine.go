@@ -18,7 +18,6 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
-	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
@@ -497,19 +496,6 @@ func plannerEffectiveCooldown(base time.Duration, zeroIntentStreak int) time.Dur
 		return capDur
 	}
 	return d
-}
-
-// stopLossEnabled reports whether the worker StopLossMonitor is enabled.
-// Default ON (using calibrated tiered defaults from agent.DefaultStopLossPolicy);
-// disable explicitly with ARTEX_ENABLE_STOPLOSS=0/false/no/off.
-func stopLossEnabled() bool {
-	raw := strings.ToLower(strings.TrimSpace(os.Getenv("ARTEX_ENABLE_STOPLOSS")))
-	switch raw {
-	case "0", "false", "no", "off":
-		return false
-	default:
-		return true
-	}
 }
 
 // stopOpenIntents transitions any stranded open intents on a completed ('done')
@@ -1592,21 +1578,13 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	workCtx = intercept.WithTaskContext(workCtx, t.ID, label, taskEmit)
 	// nudges 有意建在 model_error 重跑循环之外:空转续跑的上限是「这条意图」的总量，
 	// 重跑一轮不该把额度清零重来。
-	// 默认开启校准后的分级 Stop-Loss 止损钩子（IdleProbeLimit/RepeatCommandLimit 由
-	// agent.DefaultStopLossPolicy 提供）；仅当显式设 ARTEX_ENABLE_STOPLOSS=0/false 时关闭。
-	baseHooks := steerHooks{
+	hooks := steerHooks{
 		inner:   t.Guard.Hooks(),
 		drain:   func() (string, bool) { return e.drainSteer(iid) },
 		pending: func() bool { return e.hasSteer(iid) },
 		nudges:  &atomic.Int64{},
 		limit:   e.emptyTurnNudgeLimit(),
 		label:   label,
-	}
-	var loss *agent.StopLossMonitor
-	var hooks harness.HookRunner = baseHooks
-	if stopLossEnabled() {
-		loss = agent.NewStopLossMonitor(agent.DefaultStopLossPolicy())
-		hooks = agent.WrapStopLoss(baseHooks, loss)
 	}
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)
@@ -1619,7 +1597,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
 	}
 	e.EndLLMCall(t.ID)
-	if !loss.Fired() && reason == harness.ReasonModelError && agent.IsGatewayWAFBlock(err) &&
+	if reason == harness.ReasonModelError && agent.IsGatewayWAFBlock(err) &&
 		workCtx.Err() == nil && ectx.Err() == nil && !e.IsPaused(t.ID) && !e.isSettling(t.ID) && t.Store != nil {
 		if scrubbed, scrubErr := worker.SanitizeSessionForWAF(t.Store.ID(), intent.ID); scrubErr != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 网关 WAF 脱敏失败: %v", name, t.ID, intent.ID, scrubErr)
@@ -1641,7 +1619,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// 再重试,避免退避挤占其他 worker 的优雅收尾窗口)。
 	maxRetries, retryBackoff := e.modelErrorRetryPolicy()
 	for attempt := 1; attempt <= maxRetries &&
-		!loss.Fired() && retryableWorkerModelError(reason, err) &&
+		retryableWorkerModelError(reason, err) &&
 		workCtx.Err() == nil && ectx.Err() == nil && !e.IsPaused(t.ID) && !e.isSettling(t.ID); attempt++ {
 		log.Printf("[worker %s] task %s 意图 #%d model_error 收场，%v 后重试 (%d/%d)",
 			name, t.ID, intent.ID, retryBackoff, attempt, maxRetries)
@@ -1657,12 +1635,6 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		}
 		wrote = wrote.Add(attemptWrites)
 		e.EndLLMCall(t.ID)
-	}
-	// 止损锁定后的额度耗尽已由路由记账并切到备用 profile:本次不重放,按止损收场,
-	// 不把整个任务当供应故障冻结。
-	if loss.Fired() && (isTaskLLMFailoverReady(err) || llmpool.HasStoppedBackup(err) && isSupplyFailure(err)) {
-		log.Printf("[worker %s] task %s 意图 #%d 止损后额度耗尽，已切换备用 profile，按止损收场: %v", name, t.ID, intent.ID, err)
-		err = nil
 	}
 	// Capture kill state before detachWork cancels workCtx. kill = this work's
 	// ctx was cancelled (planner kill_work) while the TASK ctx kept running; a
@@ -1686,7 +1658,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	var controlErr error
 	defer func() { completeWork(controlErr) }()
 	runID := rand.Text()
-	outcome, outcomeReason := workerTerminationOutcome(reason, err, loss.Verdict(), wrote, workCause)
+	outcome, outcomeReason := workerTerminationOutcome(reason, err, wrote, workCause)
 	defer func() {
 		if controlErr != nil {
 			outcome, outcomeReason = "persistence_failed", "intent_state_write"
@@ -1697,20 +1669,15 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 			e.m.pg.Health().RecordWriteFailure(t.Store.ID(), fmt.Sprintf("evidence_write: %d failures", wrote.Failures))
 		}
 		detail := struct {
-			TaskID   string                 `json:"task_id"`
-			IntentID int64                  `json:"intent_id"`
-			RunID    string                 `json:"run_id"`
-			Class    string                 `json:"outcome_class"`
-			Reason   string                 `json:"reason"`
-			StopLoss agent.StopLossKind     `json:"stop_loss_kind,omitempty"`
-			Counters *agent.ProgressSignals `json:"counter_snapshot,omitempty"`
-			Writes   agent.WriteCounts      `json:"evidence_counts"`
+			TaskID   string            `json:"task_id"`
+			IntentID int64             `json:"intent_id"`
+			RunID    string            `json:"run_id"`
+			Class    string            `json:"outcome_class"`
+			Reason   string            `json:"reason"`
+			Writes   agent.WriteCounts `json:"evidence_counts"`
 		}{
 			TaskID: t.ID, IntentID: intent.ID, RunID: runID,
 			Class: outcome, Reason: outcomeReason, Writes: wrote,
-		}
-		if verdict := loss.Verdict(); verdict.Fired() {
-			detail.StopLoss, detail.Counters = verdict.Kind, &verdict.Signals
 		}
 		data, _ := json.Marshal(detail)
 		taskEmit(db.Activity{Kind: "termination", Summary: outcome, Metadata: data, IsError: outcome == "persistence_failed"})
@@ -1805,7 +1772,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	// 收尾阶段遇到上游 LLM 瞬时故障（非真正耗尽）：将意图回场为 open，保留已写回的
 	// partial_progress 与 transcript，供上游恢复后续跑，避免以 0 写入永久标 exhausted。
-	if agent.IsSettlementTransientError(err) && !loss.Fired() {
+	if agent.IsSettlementTransientError(err) {
 		if controlErr = transitionIntentState(t.Store, intent.ID, "running", "open"); controlErr != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 收尾瞬时故障回场 open 失败: %v", name, t.ID, intent.ID, controlErr)
 		} else {
@@ -1814,17 +1781,14 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		e.touch(t.ID)
 		return true
 	}
-	// terminal分流：撞步数上限 / 墙钟安全上限 / 止损让出槽位 ≠ 完成，也 ≠ 目标失败。
-	// max_turns 或 MaxDuration 到点、以及无新事实/无新资产/重复命令的止损 → exhausted
-	//（规划者据此知道这个方向试过但没有边际进展、需换角度，而非当成已覆盖永久跳过或目标失败）；
+	// terminal分流：撞步数上限 / 墙钟安全上限 → exhausted
+	//（规划者据此知道这个方向试过但到达预算上限，而非当成已覆盖永久跳过或目标失败）；
 	// 出错→blocked；正常→done。
-	state := agent.IntentStateAfterRun(reason, err, loss.Verdict())
+	state := agent.IntentStateAfterRun(reason, err)
 	switch {
-	case state == "exhausted" && loss.Fired():
-		log.Printf("[worker %s] intent %d 止损让出槽位(exhausted，%s)，写回 %s；不记目标失败", name, intent.ID, loss.Verdict().Kind, wrote)
 	case reason == harness.ReasonMaxTurns && state == "exhausted":
 		log.Printf("[worker %s] intent %d 撞步数上限(exhausted)，本次写回 %s", name, intent.ID, wrote)
-	case reason == harness.ReasonTimeout && state == "exhausted":
+	case (reason == harness.ReasonTimeout || state == "exhausted"):
 		log.Printf("[worker %s] intent %d 运行超时(exhausted，墙钟安全上限)，收尾后写回 %s", name, intent.ID, wrote)
 	}
 	if state == "blocked" && isTaskLLMChainExhausted(err) {
@@ -1845,14 +1809,12 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	return true
 }
 
-func workerTerminationOutcome(reason harness.TerminalReason, runErr error, verdict agent.StopLossVerdict, wrote agent.WriteCounts, cause error) (string, string) {
+func workerTerminationOutcome(reason harness.TerminalReason, runErr error, wrote agent.WriteCounts, cause error) (string, string) {
 	switch {
 	case errors.Is(runErr, context.Canceled) || cause != nil && !errors.Is(cause, context.DeadlineExceeded):
 		return "cancelled", "context_cancelled"
 	case wrote.Failures > 0:
 		return "persistence_failed", "evidence_write"
-	case verdict.Fired():
-		return "stop_loss", string(verdict.Kind)
 	case agent.IsSettlementTransientError(runErr):
 		return "settlement_transient", "settlement_llm_outage"
 	case reason == harness.ReasonMaxTurns || reason == harness.ReasonTimeout:

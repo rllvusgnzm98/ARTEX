@@ -7,6 +7,8 @@ description: Java 与 Oracle WebLogic 资产的结构化安全评估纪律：先
 
 Java 应用服务器（尤其是 Oracle WebLogic Server）通常承载核心业务并运行在受限 JVM 堆内存与线程池配额内。本技能规范评估顺序、XML 报文卫生、主机稳定性保护以及 ARTEX 平台会话/产物纳管，避免因粗暴扫描或畸形报文导致误报、服务雪崩或证据丢失。
 
+> 若目标并非 Oracle WebLogic（如 Spring / Tomcat / Netflix Genie / FastAPI / Flask / Next.js / PHP 后台），请优先加载 `web-rce-gadget-playbook` 或 `oss-cms-patch-audit`。
+
 ---
 
 ## 边界与稳定性纪律（Agent 必读）

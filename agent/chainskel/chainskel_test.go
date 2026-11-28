@@ -576,3 +576,22 @@ func TestBatch3SkeletonDiscipline(t *testing.T) {
 		}
 	}
 }
+
+func TestSkillGuideForIntentAndExpandedWebKeywords(t *testing.T) {
+	p := payload(t, map[string]any{"summary": "PrestaShop 8.1.5 漏洞利用", "chain_tags": []string{"web"}})
+	guide := SkillGuideForIntent(p)
+	for _, want := range []string{"target-health-triage", "oss-cms-patch-audit", "async-client-oob-chain", "oob_allocate"} {
+		if !strings.Contains(guide, want) {
+			t.Fatalf("SkillGuideForIntent missing %q: %s", want, guide)
+		}
+	}
+	// Summary-only CMS/OSS fallback routes to web even when chain_tags is omitted.
+	out := ForIntent(payload(t, map[string]any{"summary": "WordPress Business Directory 插件分析"}))
+	if primarySkeletonCategory(out) != "web" {
+		t.Fatalf("expected WordPress summary to route to web, got: %s", out)
+	}
+	// Irrelevant summary stays silent.
+	if empty := SkillGuideForIntent(payload(t, map[string]any{"summary": "常规巡检,无明确攻击面"})); empty != "" {
+		t.Fatalf("expected empty SkillGuideForIntent for unmatched summary, got: %s", empty)
+	}
+}

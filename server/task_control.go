@@ -135,6 +135,7 @@ func (s *Server) applyTaskControlWithCause(t *Task, action string, pauseCause er
 		s.cancelTaskChat(t.ID, agent.AbortChatPausedWithTask)
 		out.Paused, out.Status = true, "paused"
 		go s.reconcileConcurrency()
+		go s.maybeRunPauseRetro(t.ID)
 	case "resume":
 		queued, err := s.admitPausedTask(t)
 		if err != nil {

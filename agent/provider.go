@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"github.com/Autumn-27/artex/config"
 	"io"
-	"iter"
 	"log"
 	"net/http"
 	"net/url"
@@ -284,33 +283,9 @@ func (c Config) NewProvider() (llm.Provider, error) {
 	if err != nil {
 		return nil, err
 	}
-	lc.MaxRetries, lc.EmptyResponseRetries = -1, -1
-	once, err := llm.NewProvider(lc)
-	if err != nil {
-		return nil, err
-	}
-	return wrapCallTimeout(llm.RateLimited(retryGatedProvider{p, once}, llm.RateLimit{
+	return wrapCallTimeout(llm.RateLimited(p, llm.RateLimit{
 		PerSecond: c.RatePerSecond, PerMinute: c.RatePerMinute,
 	}), c), nil
-}
-
-type retryGatedProvider struct {
-	regular, single llm.Provider
-}
-
-func (p retryGatedProvider) selectProvider(ctx context.Context) llm.Provider {
-	if ModelRetriesStopped(ctx) {
-		return p.single
-	}
-	return p.regular
-}
-
-func (p retryGatedProvider) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
-	return p.selectProvider(ctx).Stream(ctx, req)
-}
-
-func (p retryGatedProvider) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
-	return p.selectProvider(ctx).Complete(ctx, req)
 }
 
 // IsQuotaExhaustedMessage deliberately recognizes only explicit balance,

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"iter"
@@ -9,21 +10,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/norma/llm"
+	actool "github.com/Autumn-27/norma/tool"
 )
 
 type runBudgetKey struct{}
-type modelRetryStopKey struct{}
-
-func WithModelRetryStop(ctx context.Context, monitor *StopLossMonitor) context.Context {
-	return llmpool.WithFailoverStop(context.WithValue(ctx, modelRetryStopKey{}, monitor), monitor.Fired)
-}
-
-func ModelRetriesStopped(ctx context.Context) bool {
-	monitor, _ := ctx.Value(modelRetryStopKey{}).(*StopLossMonitor)
-	return monitor.Fired()
-}
 
 type budgetExtension struct {
 	mu             sync.Mutex
@@ -173,23 +164,11 @@ func isRunBudgetError(err error) bool {
 }
 
 type runBudgetProvider struct {
-	inner         llm.Provider
-	calls         *atomic.Int64
-	loss          *StopLossMonitor
-	postLossCalls atomic.Int64
-}
-
-const maxPostStopLossTurns = 3
-
-func (p *runBudgetProvider) postStopLossLimitReached() bool {
-	return p.loss.Fired() && p.postLossCalls.Add(1) > maxPostStopLossTurns
+	inner llm.Provider
+	calls *atomic.Int64
 }
 
 func (p *runBudgetProvider) callContext(ctx context.Context) (context.Context, context.CancelFunc, time.Time) {
-	if p.loss != nil {
-		p.loss.BeginModelTurn()
-		ctx = WithModelRetryStop(ctx, p.loss)
-	}
 	if p.calls != nil {
 		p.calls.Add(1)
 	}
@@ -198,7 +177,7 @@ func (p *runBudgetProvider) callContext(ctx context.Context) (context.Context, c
 		return ctx, func() {}, time.Time{}
 	}
 	deadline := b.workDeadline()
-	if p.loss.Fired() || b.recovery || !time.Now().Before(deadline) {
+	if b.recovery || !time.Now().Before(deadline) {
 		deadline = b.hardDeadline()
 	}
 	callCtx, cancel := context.WithDeadline(ctx, deadline)
@@ -216,10 +195,7 @@ func (p *runBudgetProvider) Complete(ctx context.Context, req llm.CompletionRequ
 	if err := ctx.Err(); err != nil {
 		return llm.Message{}, "", llm.Usage{}, err
 	}
-	if p.postStopLossLimitReached() {
-		return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock(p.loss.Verdict().Message())}}, "end_turn", llm.Usage{}, nil
-	}
-	if b, ok := ctx.Value(runBudgetKey{}).(runBudget); ok && b.ext != nil && !b.recovery && !p.loss.Fired() {
+	if b, ok := ctx.Value(runBudgetKey{}).(runBudget); ok && b.ext != nil && !b.recovery {
 		if deadline := b.workDeadline(); !time.Now().Before(deadline) {
 			return llm.Message{}, "", llm.Usage{}, &RunBudgetError{Deadline: deadline}
 		}
@@ -236,15 +212,7 @@ func (p *runBudgetProvider) Stream(ctx context.Context, req llm.CompletionReques
 			yield(llm.StreamEvent{}, err)
 			return
 		}
-		if p.postStopLossLimitReached() {
-			if yield(llm.StreamEvent{Type: llm.SEMessageStart}, nil) &&
-				yield(llm.StreamEvent{Type: llm.SETextDelta, Text: p.loss.Verdict().Message()}, nil) &&
-				yield(llm.StreamEvent{Type: llm.SEMessageDelta, StopReason: "end_turn"}, nil) {
-				yield(llm.StreamEvent{Type: llm.SEMessageStop}, nil)
-			}
-			return
-		}
-		if b, ok := ctx.Value(runBudgetKey{}).(runBudget); ok && b.ext != nil && !b.recovery && !p.loss.Fired() {
+		if b, ok := ctx.Value(runBudgetKey{}).(runBudget) ; ok && b.ext != nil && !b.recovery {
 			if deadline := b.workDeadline(); !time.Now().Before(deadline) {
 				yield(llm.StreamEvent{}, &RunBudgetError{Deadline: deadline})
 				return
@@ -262,4 +230,40 @@ func (p *runBudgetProvider) Stream(ctx context.Context, req llm.CompletionReques
 			yield(llm.StreamEvent{}, err)
 		}
 	}
+}
+
+// workDeadlineTool clamps non-write-back tool executions (notably Bash and sleep)
+// to runBudget.workDeadline() during the main work phase so slow tools or sleeps
+// cannot overrun workDeadline and starve the settlement reserve.
+type workDeadlineTool struct {
+	actool.CoreTool
+}
+
+func wrapToolsWithWorkDeadline(tools []actool.CoreTool) []actool.CoreTool {
+	if len(tools) == 0 {
+		return tools
+	}
+	out := make([]actool.CoreTool, len(tools))
+	for i, t := range tools {
+		if t == nil || isWriteBackTool(t.Name()) {
+			out[i] = t
+			continue
+		}
+		out[i] = &workDeadlineTool{CoreTool: t}
+	}
+	return out
+}
+
+func (t *workDeadlineTool) Call(ctx context.Context, in json.RawMessage, tc *actool.ToolContext) (actool.Result, error) {
+	b, ok := ctx.Value(runBudgetKey{}).(runBudget)
+	if !ok || b.recovery || b.work.IsZero() {
+		return t.CoreTool.Call(ctx, in, tc)
+	}
+	deadline := b.workDeadline()
+	if deadline.IsZero() {
+		return t.CoreTool.Call(ctx, in, tc)
+	}
+	callCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	return t.CoreTool.Call(callCtx, in, tc)
 }

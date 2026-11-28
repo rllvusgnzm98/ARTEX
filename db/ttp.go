@@ -131,3 +131,15 @@ func (d *DB) ApprovedTTPLines(category string) ([]string, error) {
 	}
 	return out, nil
 }
+
+// HasTTPEntry reports whether a TTP entry with the same task_id, category, and
+// normalized scene already exists (used to prevent duplicate retro inserts across
+// pause checkpoints and final completion).
+func (d *DB) HasTTPEntry(taskID int64, category, scene string) (bool, error) {
+	var exists bool
+	err := d.QueryRow(`SELECT EXISTS (
+		SELECT 1 FROM ttp_entries
+		WHERE task_id = $1 AND category = $2 AND lower(trim(scene)) = lower(trim($3))
+	)`, taskID, category, scene).Scan(&exists)
+	return exists, err
+}

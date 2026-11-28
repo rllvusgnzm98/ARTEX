@@ -35,25 +35,6 @@ func TestPlannerEffectiveCooldown(t *testing.T) {
 	}
 }
 
-func TestStopLossEnabledDefaultAndOverride(t *testing.T) {
-	t.Setenv("ARTEX_ENABLE_STOPLOSS", "")
-	if !stopLossEnabled() {
-		t.Fatal("stopLossEnabled must default to true when env is unset")
-	}
-	for _, off := range []string{"0", "false", "FALSE", "no", "off"} {
-		t.Setenv("ARTEX_ENABLE_STOPLOSS", off)
-		if stopLossEnabled() {
-			t.Fatalf("stopLossEnabled(%q) must be false", off)
-		}
-	}
-	for _, on := range []string{"1", "true", "yes"} {
-		t.Setenv("ARTEX_ENABLE_STOPLOSS", on)
-		if !stopLossEnabled() {
-			t.Fatalf("stopLossEnabled(%q) must be true", on)
-		}
-	}
-}
-
 func TestShouldSkipHeartbeatPlan(t *testing.T) {
 	pg := openIntranetTestDB(t)
 	row, err := pg.CreateTask("heartbeat skip test", "verify deterministic precheck", nil, 0, 0)
@@ -122,7 +103,7 @@ func TestSettlementTransientErrorRouting(t *testing.T) {
 	if retryableWorkerModelError(harness.ReasonModelError, ste) {
 		t.Fatal("SettlementTransientError must not trigger full worker replay in runIntent")
 	}
-	cls, sig := workerTerminationOutcome(harness.ReasonTimeout, ste, agent.StopLossVerdict{}, agent.WriteCounts{}, nil)
+	cls, sig := workerTerminationOutcome(harness.ReasonTimeout, ste, agent.WriteCounts{}, nil)
 	if cls != "settlement_transient" || sig != "settlement_llm_outage" {
 		t.Fatalf("workerTerminationOutcome = (%q, %q), want (settlement_transient, settlement_llm_outage)", cls, sig)
 	}

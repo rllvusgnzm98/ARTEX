@@ -20,25 +20,22 @@ import (
 )
 
 func TestWorkerTerminationOutcome(t *testing.T) {
-	stopped := agent.StopLossVerdict{Kind: agent.StopLossNoProgress}
 	for _, tc := range []struct {
 		reason           harness.TerminalReason
 		err              error
-		verdict          agent.StopLossVerdict
 		writes           agent.WriteCounts
 		class, subreason string
 	}{
-		{harness.ReasonCompleted, nil, agent.StopLossVerdict{}, agent.WriteCounts{}, "executed", "completed"},
-		{harness.ReasonMaxTurns, nil, agent.StopLossVerdict{}, agent.WriteCounts{}, "budget_exhausted", "max_turns"},
-		{harness.ReasonStopHookPrevented, nil, stopped, agent.WriteCounts{}, "stop_loss", "no_progress"},
-		{harness.ReasonStopHookPrevented, nil, stopped, agent.WriteCounts{Facts: 1, Failures: 1}, "persistence_failed", "evidence_write"},
-		{harness.ReasonAbortedStreaming, context.Canceled, stopped, agent.WriteCounts{}, "cancelled", "context_cancelled"},
-		{harness.ReasonModelError, &agent.CallTimeoutError{Provider: "openai", Model: "m", Timeout: time.Second, Elapsed: time.Second}, agent.StopLossVerdict{}, agent.WriteCounts{}, "llm_timeout", "call_timeout"},
-		{harness.ReasonModelError, &agent.StreamIdleTimeoutError{Idle: time.Second}, agent.StopLossVerdict{}, agent.WriteCounts{}, "llm_timeout", "call_timeout"},
-		{harness.ReasonModelError, errors.New("status 402: insufficient_quota"), agent.StopLossVerdict{}, agent.WriteCounts{}, "supply_failure", "http_402"},
-		{harness.ReasonModelError, errors.New("insufficient_quota"), agent.StopLossVerdict{}, agent.WriteCounts{}, "supply_failure", "quota_exhausted"},
+		{harness.ReasonCompleted, nil, agent.WriteCounts{}, "executed", "completed"},
+		{harness.ReasonMaxTurns, nil, agent.WriteCounts{}, "budget_exhausted", "max_turns"},
+		{harness.ReasonMaxTurns, nil, agent.WriteCounts{Facts: 1, Failures: 1}, "persistence_failed", "evidence_write"},
+		{harness.ReasonAbortedStreaming, context.Canceled, agent.WriteCounts{}, "cancelled", "context_cancelled"},
+		{harness.ReasonModelError, &agent.CallTimeoutError{Provider: "openai", Model: "m", Timeout: time.Second, Elapsed: time.Second}, agent.WriteCounts{}, "llm_timeout", "call_timeout"},
+		{harness.ReasonModelError, &agent.StreamIdleTimeoutError{Idle: time.Second}, agent.WriteCounts{}, "llm_timeout", "call_timeout"},
+		{harness.ReasonModelError, errors.New("status 402: insufficient_quota"), agent.WriteCounts{}, "supply_failure", "http_402"},
+		{harness.ReasonModelError, errors.New("insufficient_quota"), agent.WriteCounts{}, "supply_failure", "quota_exhausted"},
 	} {
-		class, reason := workerTerminationOutcome(tc.reason, tc.err, tc.verdict, tc.writes, nil)
+		class, reason := workerTerminationOutcome(tc.reason, tc.err, tc.writes, nil)
 		if class != tc.class || reason != tc.subreason {
 			t.Errorf("terminal %s: got %s/%s, want %s/%s", tc.reason, class, reason, tc.class, tc.subreason)
 		}
@@ -64,12 +61,12 @@ func TestDetachedWorkCompletionReportsOnce(t *testing.T) {
 	}
 }
 
-func TestEnginePostStopLossRecordsOneTermination(t *testing.T) {
-	repeatLimit := agent.DefaultStopLossPolicy().RepeatCommandLimit
-	for _, mode := range []string{"denied", "cancelled", "link_timeout", "retry_writes"} {
+func TestEnginePostBudgetRecordsOneTermination(t *testing.T) {
+	const maxTurns = 2
+	for _, mode := range []string{"max_turns", "cancelled", "link_timeout", "retry_writes"} {
 		t.Run(mode, func(t *testing.T) {
 			pg := openTestPG(t)
-			row, err := pg.CreateTask("stop-loss fixture", "", nil, 0, 0)
+			row, err := pg.CreateTask("budget termination fixture", "", nil, 0, 0)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -113,7 +110,7 @@ func TestEnginePostStopLossRecordsOneTermination(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			dir := t.TempDir()
-			fixture, blocked := filepath.Join(dir, "fixture.txt"), filepath.Join(dir, "blocked.txt")
+			fixture := filepath.Join(dir, "fixture.txt")
 			lock, err := pg.Begin()
 			if err != nil {
 				t.Fatal(err)
@@ -149,55 +146,54 @@ func TestEnginePostStopLossRecordsOneTermination(t *testing.T) {
 						return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("done")}}, "end_turn", llm.Usage{}, nil
 					}
 				}
-				path := fixture
-				if calls > repeatLimit {
-					if mode == "cancelled" {
-						cancel()
-						return llm.Message{}, "", llm.Usage{}, ctx.Err()
-					}
-					if mode == "link_timeout" {
-						if calls > repeatLimit+1 {
-							return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("done")}}, "end_turn", llm.Usage{}, nil
-						}
-						input, _ := json.Marshal(map[string]any{"summary": "checkpoint", "intent_id": iid})
-						return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
-							{Type: llm.BlockToolUse, ID: "fact", Name: "record_fact", Input: input},
-						}}, "tool_use", llm.Usage{}, nil
-					}
-					path = blocked
+				if mode == "cancelled" && calls > 1 {
+					cancel()
+					return llm.Message{}, "", llm.Usage{}, ctx.Err()
 				}
-				input, _ := json.Marshal(map[string]string{"file_path": path, "content": "fixture"})
+				if mode == "link_timeout" {
+					if calls > 1 {
+						return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("done")}}, "end_turn", llm.Usage{}, nil
+					}
+					input, _ := json.Marshal(map[string]any{"summary": "checkpoint", "intent_id": iid})
+					return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
+						{Type: llm.BlockToolUse, ID: "fact", Name: "record_fact", Input: input},
+					}}, "tool_use", llm.Usage{}, nil
+				}
+				if mode == "max_turns" && calls > maxTurns {
+					return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.TextBlock("done")}}, "end_turn", llm.Usage{}, nil
+				}
+				input, _ := json.Marshal(map[string]string{"file_path": fixture, "content": "fixture"})
 				return llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
 					{Type: llm.BlockToolUse, ID: strconv.Itoa(calls), Name: "Write", Input: input},
 				}}, "tool_use", llm.Usage{}, nil
 			}}
-			worker := agent.NewWorker(provider, "test", dir, nil, 0, 0)
+			workerMaxTurns := 0
+			if mode == "max_turns" {
+				workerMaxTurns = maxTurns
+			}
+			worker := agent.NewWorker(provider, "test", dir, nil, 0, workerMaxTurns)
 			worker.SetNonStreaming(func() bool { return true })
 			worker.SetRunTimeout(5 * time.Second)
 			task := &Task{ID: strconv.FormatInt(row.ID, 10), ExpID: row.ExplorationID, Guard: guard.New(), Store: store}
 			engine := NewEngine(&Manager{})
 			engine.runIntent(ctx, task, "test", worker, intent, "", "")
-			if mode != "retry_writes" {
+			if mode == "max_turns" || mode == "cancelled" {
 				if _, err := os.Stat(fixture); err != nil {
 					t.Fatalf("trigger fixture was not executed: %v", err)
 				}
-			}
-			if _, err := os.Stat(blocked); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("post-latch operation was not blocked: %v", err)
 			}
 
 			rows, _, err := store.ActivityList(&iid, 0, 100)
 			if err != nil {
 				t.Fatal(err)
 			}
-			wantClass, wantCalls := "stop_loss", repeatLimit+3
-			wantKind := "repeated_command"
+			wantClass, wantReason, wantCalls := "budget_exhausted", "max_turns", maxTurns+1
 			wantWrites := agent.WriteCounts{}
 			if mode == "cancelled" {
-				wantClass, wantCalls = "cancelled", repeatLimit+1
+				wantClass, wantReason, wantCalls = "cancelled", "context_cancelled", 2
 			}
 			if mode == "link_timeout" {
-				wantClass, wantCalls = "persistence_failed", repeatLimit+2
+				wantClass, wantReason, wantCalls = "persistence_failed", "evidence_write", 2
 				wantWrites.Failures = 1
 				triggers := task.drainTriggers()
 				if len(triggers) != 1 || triggers[0].Kind != "done" || triggers[0].IntentID != iid {
@@ -205,7 +201,7 @@ func TestEnginePostStopLossRecordsOneTermination(t *testing.T) {
 				}
 			}
 			if mode == "retry_writes" {
-				wantClass, wantKind = "persistence_failed", ""
+				wantClass, wantReason = "persistence_failed", "evidence_write"
 				wantCalls = 5
 				wantWrites = agent.WriteCounts{Facts: 2, Failures: 1}
 			}
@@ -213,12 +209,6 @@ func TestEnginePostStopLossRecordsOneTermination(t *testing.T) {
 			toolOutcomes := 0
 			var audit db.Activity
 			for _, a := range rows {
-				if a.Kind == "tool_result" && strings.Contains(string(a.Metadata), "policy_blocked") {
-					if a.IsError {
-						t.Fatal("stored policy denial is an error")
-					}
-					toolOutcomes++
-				}
 				if mode == "link_timeout" && a.Kind == "tool_result" && a.Tool == "record_fact" {
 					if !a.IsError || !strings.Contains(string(a.Metadata), "tool_error") || !strings.Contains(a.Summary, "link fact to intent") || !strings.Contains(a.Summary, "55P03") {
 						t.Fatalf("record_fact did not report the link timeout: %+v", a)
@@ -232,18 +222,18 @@ func TestEnginePostStopLossRecordsOneTermination(t *testing.T) {
 				terminations++
 				var terminal struct {
 					Class  string            `json:"outcome_class"`
+					Reason string            `json:"reason"`
 					RunID  string            `json:"run_id"`
-					Kind   string            `json:"stop_loss_kind"`
 					Writes agent.WriteCounts `json:"evidence_counts"`
 				}
-				if err := json.Unmarshal(a.Metadata, &terminal); err != nil || terminal.Class != wantClass || terminal.RunID == "" || terminal.Kind != wantKind || terminal.Writes != wantWrites {
+				if err := json.Unmarshal(a.Metadata, &terminal); err != nil || terminal.Class != wantClass || terminal.Reason != wantReason || terminal.RunID == "" || terminal.Writes != wantWrites {
 					t.Fatalf("termination metadata = %s, error = %v", a.Metadata, err)
 				}
 			}
 			if terminations != 1 || calls != wantCalls {
 				t.Fatalf("persisted terminations=%d, calls=%d; want 1 termination and %d calls", terminations, calls, wantCalls)
 			}
-			if mode == "denied" && toolOutcomes != 3 || mode == "link_timeout" && toolOutcomes != 1 {
+			if mode == "link_timeout" && toolOutcomes != 1 {
 				t.Fatalf("persisted tool outcomes=%d", toolOutcomes)
 			}
 			if mode == "cancelled" {
